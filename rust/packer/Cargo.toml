@@ -1,0 +1,17 @@
+[package]
+name = "packer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+windows = { workspace = true }
+
+[[bin]]
+name = "exe-lock"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "stub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+windows = { workspace = true }
