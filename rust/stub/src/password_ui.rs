@@ -216,14 +216,19 @@ struct DialogState {
 }
 
 /// 调试日志（写入文件）。
-fn ui_log(msg: &str) {
+/// UI 相关日志已关闭（噪声太大），需要时把 0 改成 1。
+fn ui_log(_msg: &str) {
+    const UI_LOG_ENABLED: u32 = 0;
+    if UI_LOG_ENABLED == 0 {
+        return;
+    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(r"C:\Home\Projects\applocker\temp\stub_debug.log")
     {
-        let _ = writeln!(f, "[ui] {}", msg);
+        let _ = writeln!(f, "[ui] {}", _msg);
         let _ = f.flush();
     }
 }

@@ -1,8 +1,8 @@
-//! 图标资源复制：从原 EXE 提取图标资源写入到加密后的输出文件。
+//! 图标/资源复制：从原 EXE 提取图标、版本、manifest 资源写入到加密后的输出文件。
 //!
 //! 使用 Windows 资源 API（通过 FFI 直接调用，不依赖 windows-rs 的 feature 配置）：
 //! - `LoadLibraryExW(LOAD_LIBRARY_AS_DATAFILE)` 加载原 EXE 作为数据文件
-//! - `EnumResourceNamesW` 枚举 RT_ICON / RT_GROUP_ICON / RT_VERSION
+//! - `EnumResourceNamesW` 枚举 RT_ICON / RT_GROUP_ICON / RT_VERSION / RT_MANIFEST
 //! - `BeginUpdateResourceW` / `UpdateResourceW` / `EndUpdateResourceW` 写入输出文件
 
 use std::ffi::OsStr;
@@ -14,6 +14,7 @@ const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
 const RT_ICON: u32 = 3;
 const RT_GROUP_ICON: u32 = 14;
 const RT_VERSION: u32 = 16;
+const RT_MANIFEST: u32 = 24;
 const LANG_NEUTRAL: u16 = 0;
 
 // Windows API 类型
@@ -49,8 +50,16 @@ extern "system" {
     fn EndUpdateResourceW(hUpdate: HANDLE, fDiscard: BOOL) -> BOOL;
 }
 
+/// 资源名称：字符串 或 整数 ID（MAKEINTRESOURCE）。
+enum ResName {
+    /// 整数 ID（MAKEINTRESOURCE）。
+    Id(u16),
+    /// 字符串名称（UTF-16，含结尾 0）。
+    Str(Vec<u16>),
+}
+
 /// 收集到的资源条目：(类型, 名称, 数据)
-type ResourceEntry = (u32, Vec<u16>, Vec<u8>);
+type ResourceEntry = (u32, ResName, Vec<u8>);
 
 /// 从 `src_exe` 提取图标和版本资源，写入 `dst_exe`。
 ///
@@ -69,7 +78,7 @@ pub fn copy_icon_and_version_resources(src_exe: &Path, dst_exe: &Path) -> Result
     // 2. 收集所有需要复制的资源
     let mut resources: Vec<ResourceEntry> = Vec::new();
 
-    for rt in [RT_ICON, RT_GROUP_ICON, RT_VERSION] {
+    for rt in [RT_ICON, RT_GROUP_ICON, RT_VERSION, RT_MANIFEST] {
         let mut collector = Collector { resources: &mut resources, hsrc };
         unsafe {
             EnumResourceNamesW(
@@ -96,15 +105,20 @@ pub fn copy_icon_and_version_resources(src_exe: &Path, dst_exe: &Path) -> Result
     }
 
     for (rt, name, data) in &resources {
-        // 资源名称需要以 0 结尾
-        let mut name_buf = name.clone();
-        name_buf.push(0);
+        // 资源名称：整数 ID 用 MAKEINTRESOURCE，字符串用原始指针
+        let name_ptr: *const u16 = match name {
+            ResName::Id(id) => {
+                // MAKEINTRESOURCE：直接用 ID 作为指针
+                *id as usize as *const u16
+            }
+            ResName::Str(s) => s.as_ptr(),
+        };
 
         let result = unsafe {
             UpdateResourceW(
                 hupdate,
                 *rt,
-                name_buf.as_ptr(),
+                name_ptr,
                 LANG_NEUTRAL,
                 data.as_ptr(),
                 data.len() as u32,
@@ -130,6 +144,12 @@ struct Collector<'a> {
     hsrc: HMODULE,
 }
 
+/// 判断指针是否为 MAKEINTRESOURCE（整数资源 ID）。
+/// Windows SDK: #define IS_INTRESOURCE(_r) ((((ULONG_PTR)(_r)) >> 16) == 0)
+fn is_int_resource(ptr: *const u16) -> bool {
+    (ptr as usize >> 16) == 0
+}
+
 /// EnumResourceNamesW 回调。
 unsafe extern "system" fn enum_callback(
     hmodule: HMODULE,
@@ -139,25 +159,28 @@ unsafe extern "system" fn enum_callback(
 ) -> BOOL {
     let collector = &mut *(lparam as *mut Collector);
 
-    // 读取资源名称（以 0 结尾的 UTF-16 字符串）
-    let mut name_vec: Vec<u16> = Vec::new();
-    let mut ptr = name;
-    loop {
-        let ch = *ptr;
-        if ch == 0 {
-            break;
+    // 读取资源名称：可能是整数 ID（MAKEINTRESOURCE）或 UTF-16 字符串
+    let res_name = if is_int_resource(name) {
+        // 整数 ID：name 本身就是 MAKEINTRESOURCE(id)
+        let id = name as usize as u16;
+        ResName::Id(id)
+    } else {
+        // 字符串名称：以 0 结尾的 UTF-16 字符串
+        let mut name_vec: Vec<u16> = Vec::new();
+        let mut ptr = name;
+        loop {
+            let ch = *ptr;
+            if ch == 0 {
+                break;
+            }
+            name_vec.push(ch);
+            ptr = ptr.add(1);
         }
-        name_vec.push(ch);
-        ptr = ptr.add(1);
-    }
+        name_vec.push(0); // 保留结尾 0 方便后续使用
+        ResName::Str(name_vec)
+    };
 
-    // 查找并加载资源
-    // 资源名称：如果是数字（如 "#1"），需要用 MAKEINTRESOURCE 方式
-    // 但 EnumResourceNamesW 回调中，name 直接就是可用的指针
-    let mut name_buf = name_vec.clone();
-    name_buf.push(0);
-
-    // 使用回调中的 name 指针（而不是 name_buf），因为 FindResourceW 需要原始指针
+    // 查找并加载资源（name 原始指针可直接用于 FindResourceW）
     let hinfo = FindResourceW(hmodule, name, _rt);
     if hinfo == 0 {
         return 1; // 继续枚举
@@ -173,7 +196,7 @@ unsafe extern "system" fn enum_callback(
 
     if size > 0 && !data_ptr.is_null() {
         let data = std::slice::from_raw_parts(data_ptr, size).to_vec();
-        collector.resources.push((_rt, name_vec, data));
+        collector.resources.push((_rt, res_name, data));
     }
 
     1 // TRUE - 继续枚举

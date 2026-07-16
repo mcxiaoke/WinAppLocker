@@ -192,26 +192,35 @@ pub fn pack(opts: &PackOptions, mut progress: Option<ProgressFn>) -> Result<Pack
     let payload = builder.build();
     report_progress(0.90);
 
-    // 8. 写入输出文件：stub + payload
-    let mut out = Vec::with_capacity(stub_template.bytes.len() + payload.len());
-    out.extend_from_slice(&stub_template.bytes);
-    out.extend_from_slice(&payload);
-    std::fs::write(&opts.output_path, &out).map_err(PackError::WriteOutput)?;
-    report_progress(0.95);
+    // 8. 写入输出文件：先写 stub，再复制图标资源，最后追加 payload
+    //    顺序很重要：UpdateResourceW 会重写 PE 资源段，可能截断尾部数据，
+    //    所以 payload 必须在资源更新之后追加。
+    std::fs::write(&opts.output_path, &stub_template.bytes)
+        .map_err(PackError::WriteOutput)?;
 
-    // 9. 复制原 EXE 的图标和版本资源到输出文件
-    // 如果失败不影响主流程（图标缺失不影响功能）
+    // 9. 复制原 EXE 的图标和版本资源到输出文件（修改 stub 的资源段）
+    //    如果失败不影响主流程（图标缺失不影响功能）
     let _ = crate::icon::copy_icon_and_version_resources(
         &opts.input_path,
         &opts.output_path,
     );
+
+    // 10. 追加 payload 到文件末尾（在资源更新之后，避免被截断）
+    use std::io::Write;
+    let mut out_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&opts.output_path)
+        .map_err(PackError::WriteOutput)?;
+    out_file.write_all(&payload).map_err(PackError::WriteOutput)?;
+    out_file.flush().map_err(PackError::WriteOutput)?;
+    drop(out_file);
     report_progress(1.0);
 
     Ok(PackReport {
         original_size: original_bytes.len(),
         output_size: std::fs::metadata(&opts.output_path)
             .map(|m| m.len() as usize)
-            .unwrap_or(out.len()),
+            .unwrap_or(stub_template.bytes.len() + payload.len()),
         stub_subsystem: stub_template.subsystem,
         original_subsystem: pe_info.subsystem,
         algorithm_id: opts.algorithm_id,

@@ -5,4 +5,4 @@ DontSleep.exe = win gui
 hellogui.exe = vs gui
 hellocli.exe = vs cli
 hellomingw.exe = mingw64 cli
-helloucrt.exe = ucrt64 gui
+helloucrt.exe = ucrt64 cli
