@@ -1,17 +1,25 @@
 [package]
-name = "packer"
+name = "exelock-packer"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-aes-gcm = { workspace = true }
-pbkdf2 = { workspace = true }
-sha2 = { workspace = true }
-rand = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-windows = { workspace = true }
+[lib]
+name = "exelock_packer"
+path = "src/lib.rs"
 
 [[bin]]
-name = "exe-lock"
+name = "exelock"
 path = "src/main.rs"
+
+[dependencies]
+exelock-crypto = { path = "../crates/exelock-crypto" }
+exelock-payload = { path = "../crates/exelock-payload" }
+exelock-pe = { path = "../crates/exelock-pe" }
+eframe = { workspace = true }
+rfd = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }

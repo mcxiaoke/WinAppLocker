@@ -1,31 +1,41 @@
 [workspace]
 members = [
+    "crates/exelock-crypto",
+    "crates/exelock-payload",
+    "crates/exelock-pe",
     "packer",
-    "stub",
 ]
 resolver = "2"
 
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
 
 [workspace.dependencies]
+# 密码学
 aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
+# 随机数
 rand = "0.8"
+# 安全清零
+zeroize = { version = "1.7", features = ["derive"] }
+# PE 解析
+goblin = "0.8"
+# 校验
+crc32fast = "1.4"
+# 错误处理
 anyhow = "1.0"
 thiserror = "1.0"
-windows = { version = "0.51", features = [
-    "Win32_Foundation",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Threading",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Security_Cryptography",
-    "Win32_System_Console",
-] }
+# GUI（packer 专用）
+eframe = "0.29"
+rfd = "0.15"
+# Windows API（packer 与 stub 都用）
+windows = { version = "0.51", features = [] }
+# 线程通信
+crossbeam-channel = "0.5"

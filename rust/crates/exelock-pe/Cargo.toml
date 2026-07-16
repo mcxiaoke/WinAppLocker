@@ -1,0 +1,13 @@
+[package]
+name = "exelock-pe"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# RunPE 内存加载器（beta1 阶段实现，stub 专用）
+loader = []
+
+[dependencies]
+goblin = { workspace = true }
+thiserror = { workspace = true }

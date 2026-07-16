@@ -1,0 +1,9 @@
+[package]
+name = "exelock-payload"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exelock-crypto = { path = "../exelock-crypto" }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
