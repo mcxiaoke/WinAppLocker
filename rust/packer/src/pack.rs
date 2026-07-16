@@ -114,7 +114,7 @@ pub fn pack(opts: &PackOptions, mut progress: Option<ProgressFn>) -> Result<Pack
 
     // 3. 选择 stub
     let (stub_template, _chosen_subsystem) =
-        select_stub(pe_info.subsystem, opts.stub_preference);
+        select_stub(pe_info.subsystem, opts.stub_preference.clone());
     report_progress(0.30);
 
     // 4. 生成 salt / nonce
@@ -197,11 +197,21 @@ pub fn pack(opts: &PackOptions, mut progress: Option<ProgressFn>) -> Result<Pack
     out.extend_from_slice(&stub_template.bytes);
     out.extend_from_slice(&payload);
     std::fs::write(&opts.output_path, &out).map_err(PackError::WriteOutput)?;
+    report_progress(0.95);
+
+    // 9. 复制原 EXE 的图标和版本资源到输出文件
+    // 如果失败不影响主流程（图标缺失不影响功能）
+    let _ = crate::icon::copy_icon_and_version_resources(
+        &opts.input_path,
+        &opts.output_path,
+    );
     report_progress(1.0);
 
     Ok(PackReport {
         original_size: original_bytes.len(),
-        output_size: out.len(),
+        output_size: std::fs::metadata(&opts.output_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(out.len()),
         stub_subsystem: stub_template.subsystem,
         original_subsystem: pe_info.subsystem,
         algorithm_id: opts.algorithm_id,

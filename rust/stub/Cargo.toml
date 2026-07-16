@@ -1,0 +1,32 @@
+[package]
+name = "exelock-stub"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "exelock_stub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stub_gui"
+path = "src/bin/stub_gui.rs"
+
+[[bin]]
+name = "stub_console"
+path = "src/bin/stub_console.rs"
+
+[[bin]]
+name = "stub_test"
+path = "src/bin/stub_test.rs"
+
+[dependencies]
+exelock-crypto = { path = "../crates/exelock-crypto" }
+exelock-payload = { path = "../crates/exelock-payload" }
+exelock-pe = { path = "../crates/exelock-pe", features = ["loader"] }
+windows = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+
+[features]
+default = ["erase-payload"]
+erase-payload = []

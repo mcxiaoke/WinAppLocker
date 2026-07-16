@@ -1,11 +1,7 @@
-//! EXELock PE 解析库。
+//! EXELock PE 解析与加载库。
 //!
-//! MVP 只实现 parser（packer 与 stub 都用）：
-//! - 读取 PE 头、提取 Subsystem / Machine
-//! - 检测 .NET CLR header
-//! - 校验 PE 有效性
-//!
-//! RunPE loader（stub 专用）将在 beta1 阶段加入，用 feature = "loader" 控制。
+//! - `parser` 模块（packer + stub 都用）：PE 解析、子系统提取、.NET 检测
+//! - `loader` 模块（仅 stub 用，feature = "loader"）：RunPE 内存加载
 
 pub mod parser;
 
@@ -15,4 +11,4 @@ pub use parser::{PeInfo, PeError, Subsystem, Machine};
 pub mod loader;
 
 #[cfg(feature = "loader")]
-pub use loader::run_pe_in_place;
+pub use loader::{run_pe, LoaderError};

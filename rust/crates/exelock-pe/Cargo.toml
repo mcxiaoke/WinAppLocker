@@ -5,9 +5,10 @@ edition = "2021"
 
 [features]
 default = []
-# RunPE 内存加载器（beta1 阶段实现，stub 专用）
-loader = []
+# RunPE 内存加载器（stub 专用，packer 不需要）
+loader = ["dep:windows"]
 
 [dependencies]
 goblin = { workspace = true }
 thiserror = { workspace = true }
+windows = { workspace = true, optional = true }

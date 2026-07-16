@@ -4,6 +4,7 @@ members = [
     "crates/exelock-payload",
     "crates/exelock-pe",
     "packer",
+    "stub",
 ]
 resolver = "2"
 
@@ -36,6 +37,19 @@ thiserror = "1.0"
 eframe = "0.29"
 rfd = "0.15"
 # Windows API（packer 与 stub 都用）
-windows = { version = "0.51", features = [] }
+windows = { version = "0.51", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Performance",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_System_Kernel",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+] }
 # 线程通信
 crossbeam-channel = "0.5"

@@ -20,6 +20,7 @@ rfd = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 crossbeam-channel = { workspace = true }
+windows = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

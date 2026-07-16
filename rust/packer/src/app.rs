@@ -118,7 +118,7 @@ impl AppModel {
             salt_len: self.salt_len,
             use_aad: self.use_aad,
             erase_payload: self.erase_payload,
-            stub_preference: self.stub_pref,
+            stub_preference: self.stub_pref.clone(),
             custom_extensions: Vec::new(),
         }
     }
@@ -228,13 +228,11 @@ impl eframe::App for AppModel {
                         .pick_file()
                     {
                         self.input_path = path.display().to_string();
-                        // 自动填充输出路径：原名_locked.exe
-                        if self.output_path.trim().is_empty() {
-                            let mut out = path.clone();
-                            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-                            out.set_file_name(format!("{}_locked.exe", stem));
-                            self.output_path = out.display().to_string();
-                        }
+                        // 自动填充输出路径：原名_locked.exe（总是更新）
+                        let mut out = path.clone();
+                        let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+                        out.set_file_name(format!("{}_locked.exe", stem));
+                        self.output_path = out.display().to_string();
                     }
                 }
             });
@@ -341,7 +339,7 @@ impl eframe::App for AppModel {
                 ui.horizontal(|ui| {
                     ui.label("Stub:");
                     egui::ComboBox::from_id_salt("stub_combo")
-                        .selected_text(stub_pref_label(self.stub_pref))
+                        .selected_text(stub_pref_label(&self.stub_pref))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.stub_pref, StubPreference::Auto, "Auto（自动）");
                             ui.selectable_value(&mut self.stub_pref, StubPreference::Gui, "GUI");
@@ -413,19 +411,20 @@ impl eframe::App for AppModel {
 
             ui.add_space(12.0);
             ui.label(
-                egui::RichText::new("提示：MVP 阶段 stub 尚未实现，生成的 locked 文件可被 payload reader 解析但暂无法运行原 EXE。")
+                egui::RichText::new("提示：生成的 locked 文件已包含完整 RunPE stub，可直接运行。")
                     .small()
-                    .color(egui::Color32::from_rgb(0xB0, 0x80, 0x20)),
+                    .color(egui::Color32::from_rgb(0x60, 0x90, 0x60)),
             );
         });
     }
 }
 
-fn stub_pref_label(p: StubPreference) -> &'static str {
+fn stub_pref_label(p: &StubPreference) -> &'static str {
     match p {
         StubPreference::Auto => "Auto（自动）",
         StubPreference::Gui => "GUI",
         StubPreference::Console => "Console",
+        StubPreference::Custom(_) => "Custom（自定义）",
     }
 }
 
