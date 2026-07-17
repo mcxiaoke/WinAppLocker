@@ -101,4 +101,4 @@ temp*
 packer/stubs/
 
 # 但测试样本 EXE 需要跟踪
-tests/samples/*.exe
+tests/samples/

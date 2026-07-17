@@ -1,27 +1,69 @@
-//! EXELock packer GUI 入口。
+//! WinAppLocker packer GUI 入口。
 
 // 隐藏控制台窗口（GUI 子系统）。必须在 crate 根部、所有其他项之前。
 #![windows_subsystem = "windows"]
 
 use exelock_packer::app::AppModel;
 use eframe::egui;
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 fn main() -> eframe::Result<()> {
+    let win_w = 640.0_f32;
+    let win_h = 480.0_f32;
+
+    // 计算窗口居中位置（基于主屏幕工作区）
+    let pos = center_pos(win_w, win_h);
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([win_w, win_h])
+        .with_min_inner_size([560.0, 400.0])
+        .with_position(pos)
+        .with_title("WinAppLocker - EXE加锁工具");
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 560.0])
-            .with_min_inner_size([560.0, 480.0])
-            .with_title("EXELock"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
-        "EXELock",
+        "WinAppLocker",
         options,
         Box::new(|cc| {
             setup_cjk_fonts(&cc.egui_ctx);
             Ok(Box::new(AppModel::new()))
         }),
     )
+}
+
+/// 加载并解码 packer 自身的图标（assets/app.ico）。
+///
+/// 返回 RGBA 像素数据，用于设置窗口标题栏 / 任务栏图标，
+/// 使其与 exe 文件图标（由 winres 嵌入）保持一致。
+fn load_app_icon() -> Option<egui::IconData> {
+    let icon_bytes = include_bytes!("../assets/app.ico");
+    let img = image::load_from_memory_with_format(icon_bytes, image::ImageFormat::Ico).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    })
+}
+
+/// 计算窗口在主屏幕居中的位置。
+fn center_pos(win_w: f32, win_h: f32) -> egui::Pos2 {
+    unsafe {
+        let sw = GetSystemMetrics(SM_CXSCREEN) as f32;
+        let sh = GetSystemMetrics(SM_CYSCREEN) as f32;
+        egui::Pos2::new(
+            ((sw - win_w) / 2.0).max(0.0),
+            ((sh - win_h) / 2.0).max(0.0),
+        )
+    }
 }
 
 /// 配置中文字体（egui 默认字体不含 CJK 字符，会显示方框）。

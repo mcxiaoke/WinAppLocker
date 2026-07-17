@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use exelock_crypto::{algorithm_by_id, kdf_by_id, CryptoAlgorithm, Kdf, KdfParams};
+use exelock_crypto::{algorithm_by_id, kdf_by_id, KdfParams};
 use exelock_payload::writer::{crc32_of, default_aad};
 use exelock_payload::PayloadBuilder;
 use exelock_pe::{PeError, PeInfo, Subsystem};
 use thiserror::Error;
 
-use crate::stub_selector::{select_stub, StubPreference};
+use crate::stub_selector::{select_stub, StubPreference, StubLoadError};
 
 /// packer 加密选项。
 #[derive(Debug, Clone)]
@@ -67,6 +67,8 @@ pub enum PackError {
     EmptyPassword,
     #[error("密码长度过短（最少 {0} 字符）")]
     PasswordTooShort(usize),
+    #[error("Stub 加载失败: {0}")]
+    StubLoad(StubLoadError),
 }
 
 const MIN_PASSWORD_LEN: usize = 4;
@@ -114,7 +116,8 @@ pub fn pack(opts: &PackOptions, mut progress: Option<ProgressFn>) -> Result<Pack
 
     // 3. 选择 stub
     let (stub_template, _chosen_subsystem) =
-        select_stub(pe_info.subsystem, opts.stub_preference.clone());
+        select_stub(pe_info.subsystem, opts.stub_preference.clone())
+            .map_err(PackError::StubLoad)?;
     report_progress(0.30);
 
     // 4. 生成 salt / nonce

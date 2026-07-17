@@ -50,6 +50,13 @@ windows = { version = "0.51", features = [
     "Win32_System_Kernel",
     "Win32_System_SystemServices",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
 ] }
 # 线程通信
 crossbeam-channel = "0.5"
+# 构建时版本信息
+chrono = "0.4"
+# Windows 资源嵌入（图标、版本信息）
+winres = "0.1"
+# 图像处理（packer 加载 .ico 设置窗口图标）
+image = { version = "0.25", default-features = false, features = ["ico"] }

@@ -24,20 +24,32 @@ use crc32fast::Hasher as Crc32;
 
 mod password_ui;
 
-/// 调试日志：写入文件（用于排查启动崩溃）。
+/// 版本信息（由 build.rs 注入）。
+/// packer 通过在 stub 二进制中搜索 "EXELOCK_VER|" 标记来读取这些信息。
+#[used]
+static VERSION_BLOB: &str = concat!(
+    "EXELOCK_VER|",
+    env!("STUB_VERSION"),
+    "|",
+    env!("STUB_BUILD_TIME"),
+    "|",
+    env!("STUB_GIT_HASH"),
+    "|EXELOCK_END"
+);
+
+/// 调试日志：设环境变量 EXELOCK_DEBUG=1 写入 %TEMP%\exelock_debug.log
 fn dbg_log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(r"C:\Home\Projects\applocker\temp\stub_debug.log")
-    {
-        let _ = writeln!(f, "{}", msg);
-        let _ = f.flush();
+    if std::env::var("EXELOCK_DEBUG").is_err() { return; }
+    if let Some(path) = std::env::temp_dir().join("exelock_debug.log").to_str() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        }
     }
 }
 
-/// 密码错误时的最大重试次数。
-const MAX_PASSWORD_RETRIES: usize = 5;
+/// 密码错误时的最大尝试次数（输错一次直接退出，避免暴力破解）。
+const MAX_PASSWORD_RETRIES: usize = 1;
 
 /// stub 返回的错误。
 #[derive(Debug)]

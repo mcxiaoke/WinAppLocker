@@ -2,6 +2,7 @@
 name = "exelock-stub"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [lib]
 name = "exelock_stub"
@@ -26,6 +27,9 @@ exelock-pe = { path = "../crates/exelock-pe", features = ["loader"] }
 windows = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
+
+[build-dependencies]
+chrono = { workspace = true }
 
 [features]
 default = ["erase-payload"]

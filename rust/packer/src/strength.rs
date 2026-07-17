@@ -66,6 +66,11 @@ impl StrengthSpec {
             },
         }
     }
+
+    /// 默认参数（Balanced）。UI 不再暴露强度选择，统一使用此预设。
+    pub fn balanced() -> Self {
+        Self::for_strength(Strength::Balanced)
+    }
 }
 
 /// 算法 ID → 人类可读名称（GUI 下拉框显示）。
