@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>WinAppLocker.Stub</RootNamespace>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>stub_gui</AssemblyName>
+  </PropertyGroup>
+
+  <!-- 嵌入 DPI 感知 manifest，避免 150% 缩放屏幕上模糊 -->
+  <ItemGroup>
+    <ApplicationManifest Include="app.manifest" />
+  </ItemGroup>
+
+  <!-- 生成 VersionInfo.cs：从 Directory.Build.props 的属性生成 const 字符串，
+       使 WAL_VER 标记在编译期嵌入 stub 字节，packer 通过 ByteSearch 读取。
+       关键点：
+       1. 写入 $(BaseIntermediateOutputPath)Generated\ 目录，SDK 自动 glob 不扫描 obj/，
+          避免重复 Include 警告 CS2002。
+       2. WriteLinesToFile 的 Lines 是 ITaskItem[]，会把属性值按 ';' 分隔。
+          因此 C# 语句末尾的 ';' 必须转义为 %3B（MSBuild 属性转义）。 -->
+  <Target Name="GenerateStubVersionInfo"
+          DependsOnTargets="GenerateCustomVersion"
+          BeforeTargets="BeforeBuild;CoreCompile">
+    <PropertyGroup>
+      <StubVersionInfoDir>$(MSBuildProjectDirectory)\$(BaseIntermediateOutputPath)Generated</StubVersionInfoDir>
+      <StubVersionInfoFile>$(StubVersionInfoDir)\VersionInfo.cs</StubVersionInfoFile>
+      <StubVersionInfoLines>
+namespace WinAppLocker.Stub
+{
+    public static class VersionInfo
+    {
+        public const string Version = "$(VersionPrefix)"%3B
+        public const string GitHash = "$(GitCommitHash)"%3B
+        public const string BuildTime = "$(BuildTimeStamp)"%3B
+        public const string Blob = "WAL_VER|$(VersionPrefix)|$(BuildTimeStamp)|$(GitCommitHash)|WAL_END"%3B
+    }
+}
+      </StubVersionInfoLines>
+    </PropertyGroup>
+    <MakeDir Directories="$(StubVersionInfoDir)" Condition="!Exists('$(StubVersionInfoDir)')" />
+    <WriteLinesToFile File="$(StubVersionInfoFile)"
+                      Lines="$(StubVersionInfoLines)"
+                      Overwrite="true"
+                      Encoding="UTF-8" />
+    <ItemGroup>
+      <Compile Include="$(StubVersionInfoFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

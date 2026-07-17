@@ -1,0 +1,9 @@
+<Project>
+  <!-- 链入上级 Directory.Build.props（版本号、GitHash 等公共属性） -->
+  <!-- 用 PropertyGroup 先求值路径，避免 Condition 中嵌套单引号导致 MSB4092 -->
+  <PropertyGroup>
+    <ParentDirectoryBuildProps>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))</ParentDirectoryBuildProps>
+  </PropertyGroup>
+  <Import Project="$(ParentDirectoryBuildProps)"
+          Condition="'$(ParentDirectoryBuildProps)' != ''" />
+</Project>

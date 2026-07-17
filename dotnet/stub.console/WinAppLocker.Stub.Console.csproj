@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>WinAppLocker.Stub</RootNamespace>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>stub_console</AssemblyName>
+    <!-- Console stub 不需要 WinForms（避免 WinExe 启动控制台闪烁），自己实现密码输入 -->
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <!-- 共享源码：通过 Link 引用 stub/ 下的文件 -->
+  <ItemGroup>
+    <Compile Include="..\stub\CryptoUtil.cs" Link="CryptoUtil.cs" />
+    <Compile Include="..\stub\NativeMethods.cs" Link="NativeMethods.cs" />
+    <Compile Include="..\stub\PayloadReader.cs" Link="PayloadReader.cs" />
+    <Compile Include="..\stub\ProcessLauncher.cs" Link="ProcessLauncher.cs" />
+    <Compile Include="..\stub\SharedFormat.cs" Link="SharedFormat.cs" />
+    <Compile Include="..\stub\StubEntry.cs" Link="StubEntry.cs" />
+  </ItemGroup>
+
+  <!-- 生成 VersionInfo.cs（与 stub_gui 共享逻辑） -->
+  <Target Name="GenerateStubVersionInfo"
+          DependsOnTargets="GenerateCustomVersion"
+          BeforeTargets="BeforeBuild;CoreCompile">
+    <PropertyGroup>
+      <StubVersionInfoDir>$(MSBuildProjectDirectory)\$(BaseIntermediateOutputPath)Generated</StubVersionInfoDir>
+      <StubVersionInfoFile>$(StubVersionInfoDir)\VersionInfo.cs</StubVersionInfoFile>
+      <StubVersionInfoLines>
+namespace WinAppLocker.Stub
+{
+    public static class VersionInfo
+    {
+        public const string Version = "$(VersionPrefix)"%3B
+        public const string GitHash = "$(GitCommitHash)"%3B
+        public const string BuildTime = "$(BuildTimeStamp)"%3B
+        public const string Blob = "WAL_VER|$(VersionPrefix)|$(BuildTimeStamp)|$(GitCommitHash)|WAL_END"%3B
+    }
+}
+      </StubVersionInfoLines>
+    </PropertyGroup>
+    <MakeDir Directories="$(StubVersionInfoDir)" Condition="!Exists('$(StubVersionInfoDir)')" />
+    <WriteLinesToFile File="$(StubVersionInfoFile)"
+                      Lines="$(StubVersionInfoLines)"
+                      Overwrite="true"
+                      Encoding="UTF-8" />
+    <ItemGroup>
+      <Compile Include="$(StubVersionInfoFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

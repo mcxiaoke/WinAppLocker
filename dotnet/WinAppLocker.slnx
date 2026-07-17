@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="shared\WinAppLocker.Shared.csproj" />
+    <Project Path="stub\WinAppLocker.Stub.csproj" />
+    <Project Path="stub.console\WinAppLocker.Stub.Console.csproj" />
+    <Project Path="stub.test\WinAppLocker.Stub.Test.csproj" />
+    <Project Path="packer\WinAppLocker.Packer.csproj" />
+  </Folder>
+</Solution>

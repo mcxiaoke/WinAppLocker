@@ -1,0 +1,83 @@
+<Project>
+
+  <!-- ============================================================ -->
+  <!-- 统一版本号管理：所有项目共享同一份版本定义                     -->
+  <!-- 参考: C:\Home\Projects\pwtool\vault\Directory.Build.props     -->
+  <!--                                                              -->
+  <!-- 方案：Major.Minor.Patch + 基准日起算天数                      -->
+  <!--   - VersionPrefix   = Major.Minor.Patch（手填，语义版本）     -->
+  <!--   - AssemblyVersion  = Major.Minor.DaysSinceEpoch.0           -->
+  <!--   - FileVersion      = Major.Minor.DaysSinceEpoch.HHmm        -->
+  <!--   - Version          = VersionPrefix-<suffix>                 -->
+  <!--     → Release: yyyyMMdd-gitshort；Debug: debug                -->
+  <!-- ============================================================ -->
+
+  <PropertyGroup>
+    <Major>0</Major>
+    <Minor>1</Minor>
+    <Patch>0</Patch>
+    <VersionPrefix>$(Major).$(Minor).$(Patch)</VersionPrefix>
+    <!-- 基准日：DaysSinceEpoch = today.Subtract(epoch).Days -->
+    <FileVersionEpoch>2026-01-01</FileVersionEpoch>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <!-- 共享程序集元数据 -->
+    <Company>mcxiaoke</Company>
+    <Product>WinAppLocker</Product>
+    <Authors>$(Company)</Authors>
+    <Copyright>Copyright © $(Company) 2026</Copyright>
+  </PropertyGroup>
+
+  <!--
+    GenerateCustomVersion: 计算并填充版本号 + 注入 AssemblyMetadata。
+    BeforeTargets 选择 GetAssemblyVersion 以保证 AssemblyVersion/FileVersion
+    在生成 AssemblyInfo 之前已就位。
+  -->
+  <Target Name="GenerateCustomVersion"
+          BeforeTargets="GetAssemblyVersion;GenerateNuspec;GetPackageVersion">
+
+    <!-- 1. 获取 Git short commit（失败不致命） -->
+    <Exec Command="git rev-parse --short HEAD"
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="low"
+          IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitHash" />
+    </Exec>
+
+    <!-- 2. 计算构建时间 + DaysSinceEpoch（跨年自动继续递增） -->
+    <PropertyGroup>
+      <BuildDate>$([System.DateTime]::Now.ToString('yyyyMMdd'))</BuildDate>
+      <BuildTimeStamp>$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))</BuildTimeStamp>
+      <BuildTimeNumeric>$([System.DateTime]::Now.ToString('HHmm'))</BuildTimeNumeric>
+      <DaysSinceEpoch>$([System.DateTime]::Now.Subtract($([System.DateTime]::Parse('$(FileVersionEpoch)'))).Days)</DaysSinceEpoch>
+      <GitCommitHash Condition="'$(GitCommitHash)' == ''">unknown</GitCommitHash>
+    </PropertyGroup>
+
+    <!-- 3. Debug / Release 后缀 -->
+    <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+      <VersionSuffix>debug</VersionSuffix>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+      <VersionSuffix>$(BuildDate)-$(GitCommitHash)</VersionSuffix>
+    </PropertyGroup>
+
+    <!-- 4. 核心版本号（统一设置） -->
+    <PropertyGroup>
+      <Version>$(VersionPrefix)-$(VersionSuffix)</Version>
+      <InformationalVersion>$(Version)</InformationalVersion>
+      <AssemblyVersion>$(Major).$(Minor).$(DaysSinceEpoch).0</AssemblyVersion>
+      <FileVersion>$(Major).$(Minor).$(DaysSinceEpoch).$(BuildTimeNumeric)</FileVersion>
+    </PropertyGroup>
+
+    <!-- 5. 注入 AssemblyMetadata，运行时通过反射读取（packer About 页面使用） -->
+    <ItemGroup>
+      <AssemblyMetadata Include="GitCommit" Value="$(GitCommitHash)" />
+      <AssemblyMetadata Include="BuildTime" Value="$(BuildTimeStamp)" />
+      <AssemblyMetadata Include="DaysSinceEpoch" Value="$(DaysSinceEpoch)" />
+    </ItemGroup>
+
+    <Message Importance="high"
+             Text="=== [WinAppLocker 编译信息] Version=$(Version) | AssemblyVersion=$(AssemblyVersion) | FileVersion=$(FileVersion) (天数=$(DaysSinceEpoch)) ===" />
+  </Target>
+
+</Project>
