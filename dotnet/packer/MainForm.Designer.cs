@@ -65,25 +65,28 @@ namespace WinAppLocker.Packer
             // lblInputPath
             // 
             this.lblInputPath.AutoSize = true;
-            this.lblInputPath.Location = new System.Drawing.Point(15, 20);
+            this.lblInputPath.Location = new System.Drawing.Point(18, 23);
+            this.lblInputPath.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblInputPath.Name = "lblInputPath";
-            this.lblInputPath.Size = new System.Drawing.Size(64, 24);
+            this.lblInputPath.Size = new System.Drawing.Size(75, 28);
             this.lblInputPath.TabIndex = 0;
             this.lblInputPath.Text = "输入：";
             // 
             // txtInputPath
             // 
-            this.txtInputPath.Location = new System.Drawing.Point(95, 17);
+            this.txtInputPath.Location = new System.Drawing.Point(112, 20);
+            this.txtInputPath.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.txtInputPath.Name = "txtInputPath";
-            this.txtInputPath.Size = new System.Drawing.Size(420, 30);
+            this.txtInputPath.Size = new System.Drawing.Size(496, 34);
             this.txtInputPath.TabIndex = 1;
             this.txtInputPath.TextChanged += new System.EventHandler(this.txt_TextChanged);
             // 
             // btnBrowseInput
             // 
-            this.btnBrowseInput.Location = new System.Drawing.Point(525, 15);
+            this.btnBrowseInput.Location = new System.Drawing.Point(620, 18);
+            this.btnBrowseInput.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.btnBrowseInput.Name = "btnBrowseInput";
-            this.btnBrowseInput.Size = new System.Drawing.Size(75, 32);
+            this.btnBrowseInput.Size = new System.Drawing.Size(89, 37);
             this.btnBrowseInput.TabIndex = 2;
             this.btnBrowseInput.Text = "浏览…";
             this.btnBrowseInput.Click += new System.EventHandler(this.btnBrowseInput_Click);
@@ -91,25 +94,28 @@ namespace WinAppLocker.Packer
             // lblOutputPath
             // 
             this.lblOutputPath.AutoSize = true;
-            this.lblOutputPath.Location = new System.Drawing.Point(15, 60);
+            this.lblOutputPath.Location = new System.Drawing.Point(18, 70);
+            this.lblOutputPath.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblOutputPath.Name = "lblOutputPath";
-            this.lblOutputPath.Size = new System.Drawing.Size(64, 24);
+            this.lblOutputPath.Size = new System.Drawing.Size(75, 28);
             this.lblOutputPath.TabIndex = 3;
             this.lblOutputPath.Text = "输出：";
             // 
             // txtOutputPath
             // 
-            this.txtOutputPath.Location = new System.Drawing.Point(95, 57);
+            this.txtOutputPath.Location = new System.Drawing.Point(112, 66);
+            this.txtOutputPath.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.txtOutputPath.Name = "txtOutputPath";
-            this.txtOutputPath.Size = new System.Drawing.Size(420, 30);
+            this.txtOutputPath.Size = new System.Drawing.Size(496, 34);
             this.txtOutputPath.TabIndex = 4;
             this.txtOutputPath.TextChanged += new System.EventHandler(this.txt_TextChanged);
             // 
             // btnBrowseOutput
             // 
-            this.btnBrowseOutput.Location = new System.Drawing.Point(525, 55);
+            this.btnBrowseOutput.Location = new System.Drawing.Point(620, 64);
+            this.btnBrowseOutput.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.btnBrowseOutput.Name = "btnBrowseOutput";
-            this.btnBrowseOutput.Size = new System.Drawing.Size(75, 32);
+            this.btnBrowseOutput.Size = new System.Drawing.Size(89, 37);
             this.btnBrowseOutput.TabIndex = 5;
             this.btnBrowseOutput.Text = "浏览…";
             this.btnBrowseOutput.Click += new System.EventHandler(this.btnBrowseOutput_Click);
@@ -117,56 +123,63 @@ namespace WinAppLocker.Packer
             // lblPassword
             // 
             this.lblPassword.AutoSize = true;
-            this.lblPassword.Location = new System.Drawing.Point(15, 100);
+            this.lblPassword.Location = new System.Drawing.Point(18, 117);
+            this.lblPassword.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblPassword.Name = "lblPassword";
-            this.lblPassword.Size = new System.Drawing.Size(64, 24);
+            this.lblPassword.Size = new System.Drawing.Size(75, 28);
             this.lblPassword.TabIndex = 6;
             this.lblPassword.Text = "密码：";
             // 
             // txtPassword
             // 
-            this.txtPassword.Location = new System.Drawing.Point(95, 97);
+            this.txtPassword.Location = new System.Drawing.Point(112, 113);
+            this.txtPassword.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.txtPassword.MaxLength = 256;
             this.txtPassword.Name = "txtPassword";
             this.txtPassword.PasswordChar = '*';
-            this.txtPassword.Size = new System.Drawing.Size(420, 30);
+            this.txtPassword.Size = new System.Drawing.Size(496, 34);
             this.txtPassword.TabIndex = 7;
             this.txtPassword.TextChanged += new System.EventHandler(this.txt_TextChanged);
-            // 
+            //
             // btnTogglePassword
-            // 
-            this.btnTogglePassword.Location = new System.Drawing.Point(525, 95);
+            //
+            this.btnTogglePassword.Location = new System.Drawing.Point(620, 111);
+            this.btnTogglePassword.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.btnTogglePassword.Name = "btnTogglePassword";
-            this.btnTogglePassword.Size = new System.Drawing.Size(75, 32);
+            this.btnTogglePassword.Size = new System.Drawing.Size(89, 37);
             this.btnTogglePassword.TabIndex = 8;
+            this.btnTogglePassword.TabStop = false;
             this.btnTogglePassword.Text = "显示";
             this.btnTogglePassword.Click += new System.EventHandler(this.btnTogglePassword_Click);
             // 
             // lblConfirm
             // 
             this.lblConfirm.AutoSize = true;
-            this.lblConfirm.Location = new System.Drawing.Point(15, 140);
+            this.lblConfirm.Location = new System.Drawing.Point(18, 163);
+            this.lblConfirm.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblConfirm.Name = "lblConfirm";
-            this.lblConfirm.Size = new System.Drawing.Size(64, 24);
+            this.lblConfirm.Size = new System.Drawing.Size(75, 28);
             this.lblConfirm.TabIndex = 9;
             this.lblConfirm.Text = "确认：";
             // 
             // txtConfirm
             // 
-            this.txtConfirm.Location = new System.Drawing.Point(95, 137);
+            this.txtConfirm.Location = new System.Drawing.Point(112, 160);
+            this.txtConfirm.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.txtConfirm.MaxLength = 256;
             this.txtConfirm.Name = "txtConfirm";
             this.txtConfirm.PasswordChar = '*';
-            this.txtConfirm.Size = new System.Drawing.Size(420, 30);
+            this.txtConfirm.Size = new System.Drawing.Size(496, 34);
             this.txtConfirm.TabIndex = 10;
             this.txtConfirm.TextChanged += new System.EventHandler(this.txt_TextChanged);
             // 
             // lblStubPref
             // 
             this.lblStubPref.AutoSize = true;
-            this.lblStubPref.Location = new System.Drawing.Point(15, 180);
+            this.lblStubPref.Location = new System.Drawing.Point(18, 210);
+            this.lblStubPref.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubPref.Name = "lblStubPref";
-            this.lblStubPref.Size = new System.Drawing.Size(68, 24);
+            this.lblStubPref.Size = new System.Drawing.Size(79, 28);
             this.lblStubPref.TabIndex = 11;
             this.lblStubPref.Text = "Stub：";
             // 
@@ -178,23 +191,26 @@ namespace WinAppLocker.Packer
             "GUI",
             "Console",
             "Test"});
-            this.cbStubPreference.Location = new System.Drawing.Point(95, 177);
+            this.cbStubPreference.Location = new System.Drawing.Point(112, 206);
+            this.cbStubPreference.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.cbStubPreference.Name = "cbStubPreference";
-            this.cbStubPreference.Size = new System.Drawing.Size(150, 32);
+            this.cbStubPreference.Size = new System.Drawing.Size(177, 36);
             this.cbStubPreference.TabIndex = 12;
             // 
             // lblIterations
             // 
             this.lblIterations.AutoSize = true;
-            this.lblIterations.Location = new System.Drawing.Point(260, 180);
+            this.lblIterations.Location = new System.Drawing.Point(307, 210);
+            this.lblIterations.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblIterations.Name = "lblIterations";
-            this.lblIterations.Size = new System.Drawing.Size(50, 24);
+            this.lblIterations.Size = new System.Drawing.Size(75, 28);
             this.lblIterations.TabIndex = 13;
-            this.lblIterations.Text = "迭代:";
+            this.lblIterations.Text = "迭代：";
             // 
             // numIterations
             // 
-            this.numIterations.Location = new System.Drawing.Point(305, 177);
+            this.numIterations.Location = new System.Drawing.Point(393, 206);
+            this.numIterations.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.numIterations.Maximum = new decimal(new int[] {
             5000000,
             0,
@@ -206,7 +222,7 @@ namespace WinAppLocker.Packer
             0,
             0});
             this.numIterations.Name = "numIterations";
-            this.numIterations.Size = new System.Drawing.Size(120, 30);
+            this.numIterations.Size = new System.Drawing.Size(142, 34);
             this.numIterations.TabIndex = 14;
             this.numIterations.ThousandsSeparator = true;
             this.numIterations.Value = new decimal(new int[] {
@@ -217,27 +233,30 @@ namespace WinAppLocker.Packer
             // 
             // progressBar
             // 
-            this.progressBar.Location = new System.Drawing.Point(15, 225);
+            this.progressBar.Location = new System.Drawing.Point(18, 262);
+            this.progressBar.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.progressBar.Name = "progressBar";
-            this.progressBar.Size = new System.Drawing.Size(585, 18);
+            this.progressBar.Size = new System.Drawing.Size(691, 21);
             this.progressBar.TabIndex = 15;
             this.progressBar.Visible = false;
             // 
             // lblResult
             // 
             this.lblResult.AutoSize = true;
-            this.lblResult.Location = new System.Drawing.Point(15, 250);
+            this.lblResult.Location = new System.Drawing.Point(18, 292);
+            this.lblResult.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblResult.Name = "lblResult";
-            this.lblResult.Size = new System.Drawing.Size(0, 24);
+            this.lblResult.Size = new System.Drawing.Size(0, 28);
             this.lblResult.TabIndex = 16;
             // 
             // btnPack
             // 
             this.btnPack.Enabled = false;
-            this.btnPack.Font = new System.Drawing.Font("Microsoft YaHei UI", 11F, System.Drawing.FontStyle.Bold);
-            this.btnPack.Location = new System.Drawing.Point(19, 276);
+            this.btnPack.Font = new System.Drawing.Font("Microsoft YaHei UI", 11F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
+            this.btnPack.Location = new System.Drawing.Point(22, 322);
+            this.btnPack.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.btnPack.Name = "btnPack";
-            this.btnPack.Size = new System.Drawing.Size(581, 40);
+            this.btnPack.Size = new System.Drawing.Size(687, 47);
             this.btnPack.TabIndex = 17;
             this.btnPack.Text = "执行加密操作";
             this.btnPack.Click += new System.EventHandler(this.btnPack_Click);
@@ -246,17 +265,20 @@ namespace WinAppLocker.Packer
             // 
             this.lblHint.AutoSize = true;
             this.lblHint.ForeColor = System.Drawing.Color.Gray;
-            this.lblHint.Location = new System.Drawing.Point(15, 340);
+            this.lblHint.Location = new System.Drawing.Point(18, 397);
+            this.lblHint.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblHint.Name = "lblHint";
-            this.lblHint.Size = new System.Drawing.Size(322, 24);
+            this.lblHint.Size = new System.Drawing.Size(377, 28);
             this.lblHint.TabIndex = 18;
             this.lblHint.Text = "提示：加密后的 EXE 需放在原目录运行";
             // 
             // lblPackerVersion
             // 
             this.lblPackerVersion.AutoSize = true;
+            this.lblPackerVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblPackerVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblPackerVersion.Location = new System.Drawing.Point(15, 380);
+            this.lblPackerVersion.Location = new System.Drawing.Point(18, 443);
+            this.lblPackerVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblPackerVersion.Name = "lblPackerVersion";
             this.lblPackerVersion.Size = new System.Drawing.Size(67, 24);
             this.lblPackerVersion.TabIndex = 19;
@@ -265,8 +287,10 @@ namespace WinAppLocker.Packer
             // lblStubGuiVersion
             // 
             this.lblStubGuiVersion.AutoSize = true;
+            this.lblStubGuiVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubGuiVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubGuiVersion.Location = new System.Drawing.Point(15, 400);
+            this.lblStubGuiVersion.Location = new System.Drawing.Point(18, 467);
+            this.lblStubGuiVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubGuiVersion.Name = "lblStubGuiVersion";
             this.lblStubGuiVersion.Size = new System.Drawing.Size(86, 24);
             this.lblStubGuiVersion.TabIndex = 20;
@@ -275,8 +299,10 @@ namespace WinAppLocker.Packer
             // lblStubConsoleVersion
             // 
             this.lblStubConsoleVersion.AutoSize = true;
+            this.lblStubConsoleVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubConsoleVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubConsoleVersion.Location = new System.Drawing.Point(15, 420);
+            this.lblStubConsoleVersion.Location = new System.Drawing.Point(18, 490);
+            this.lblStubConsoleVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubConsoleVersion.Name = "lblStubConsoleVersion";
             this.lblStubConsoleVersion.Size = new System.Drawing.Size(123, 24);
             this.lblStubConsoleVersion.TabIndex = 21;
@@ -285,8 +311,10 @@ namespace WinAppLocker.Packer
             // lblStubTestVersion
             // 
             this.lblStubTestVersion.AutoSize = true;
+            this.lblStubTestVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubTestVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubTestVersion.Location = new System.Drawing.Point(15, 440);
+            this.lblStubTestVersion.Location = new System.Drawing.Point(18, 513);
+            this.lblStubTestVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubTestVersion.Name = "lblStubTestVersion";
             this.lblStubTestVersion.Size = new System.Drawing.Size(90, 24);
             this.lblStubTestVersion.TabIndex = 22;
@@ -294,9 +322,9 @@ namespace WinAppLocker.Packer
             // 
             // MainForm
             // 
-            this.AutoScaleDimensions = new System.Drawing.SizeF(11F, 24F);
+            this.AutoScaleDimensions = new System.Drawing.SizeF(13F, 28F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(620, 490);
+            this.ClientSize = new System.Drawing.Size(737, 551);
             this.Controls.Add(this.lblInputPath);
             this.Controls.Add(this.txtInputPath);
             this.Controls.Add(this.btnBrowseInput);
@@ -320,8 +348,9 @@ namespace WinAppLocker.Packer
             this.Controls.Add(this.lblStubGuiVersion);
             this.Controls.Add(this.lblStubConsoleVersion);
             this.Controls.Add(this.lblStubTestVersion);
-            this.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
+            this.Font = new System.Drawing.Font("Microsoft YaHei UI", 10.5F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
+            this.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.Name = "MainForm";

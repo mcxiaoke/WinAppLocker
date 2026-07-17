@@ -15,6 +15,20 @@ namespace WinAppLocker.Stub
             {
                 Text = title;
             }
+            // 加载嵌入的 app.ico（和 packer 同款加载方式）。
+            // 不再尝试从原 exe 提取图标——WinForms 标题栏图标渲染对 ICO 流格式挑剔，
+            // 从 PE 资源拼装的 ICO 流虽然能加载但渲染效果不佳（图标偏小、不居中）。
+            // app.ico 是项目自带的标准多尺寸 ICO，加载后清晰。
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = asm.GetManifestResourceStream("WinAppLocker.Stub.app.ico"))
+                {
+                    if (stream != null)
+                        this.Icon = new System.Drawing.Icon(stream);
+                }
+            }
+            catch { }
         }
 
         private void btnOk_Click(object sender, EventArgs e)

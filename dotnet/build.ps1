@@ -68,12 +68,14 @@ if ($LASTEXITCODE -ne 0) { throw "packer build failed" }
 
 if ($Release) {
     New-Item -ItemType Directory -Path "$root\dist" -Force | Out-Null
-    # 清空 dist 避免残留旧 DLL（Costura 模式下只需 WinAppLocker.exe 单文件）
+    # 清空 dist 避免残留旧文件
     Get-ChildItem "$root\dist" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    # Costura 已将所有依赖 DLL 嵌入 exe，只需复制单个 WinAppLocker.exe
+    # Costura 已将所有依赖 DLL 嵌入 exe，只需复制 WinAppLocker.exe + exe.config
+    # exe.config 不能内嵌，WinForms 高 DPI 配置必须在 CLR 初始化前从外部 config 读取
     Copy-Item "$root\packer\bin\$config\WinAppLocker.exe" "$root\dist\WinAppLocker.exe" -Force
+    Copy-Item "$root\packer\bin\$config\WinAppLocker.exe.config" "$root\dist\WinAppLocker.exe.config" -Force
 
-    Write-Host "==> dist/WinAppLocker.exe 准备就绪（单文件，无外部 DLL）" -ForegroundColor Green
+    Write-Host "==> dist/WinAppLocker.exe 准备就绪（单文件 exe + .config）" -ForegroundColor Green
     Get-ChildItem "$root\dist" | Format-Table Name, Length
 } else {
     Write-Host "==> packer/bin/$config/WinAppLocker.exe 准备就绪" -ForegroundColor Green

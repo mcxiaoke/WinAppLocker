@@ -18,6 +18,11 @@
     <ApplicationManifest Include="app.manifest" />
   </ItemGroup>
 
+  <!-- 嵌入 app.ico 资源（运行时用 GetManifestResourceStream 读取，作为密码框图标）-->
+  <ItemGroup>
+    <EmbeddedResource Include="app.ico" />
+  </ItemGroup>
+
   <!-- 生成 VersionInfo.cs：从 Directory.Build.props 的属性生成 const 字符串，
        使 WAL_VER 标记在编译期嵌入 stub 字节，packer 通过 ByteSearch 读取。
        关键点：

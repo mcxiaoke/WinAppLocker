@@ -28,22 +28,21 @@ namespace WinAppLocker.Stub
             // txtPassword
             // 
             this.errorProvider.SetIconAlignment(this.txtPassword, System.Windows.Forms.ErrorIconAlignment.MiddleLeft);
-            this.txtPassword.Location = new System.Drawing.Point(13, 12);
-            this.txtPassword.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
+            this.txtPassword.Location = new System.Drawing.Point(19, 19);
+            this.txtPassword.Margin = new System.Windows.Forms.Padding(6, 5, 6, 5);
             this.txtPassword.MaxLength = 256;
             this.txtPassword.Name = "txtPassword";
             this.txtPassword.PasswordChar = '*';
-            this.txtPassword.Size = new System.Drawing.Size(436, 28);
+            this.txtPassword.Size = new System.Drawing.Size(628, 34);
             this.txtPassword.TabIndex = 0;
             this.txtPassword.KeyDown += new System.Windows.Forms.KeyEventHandler(this.txtPassword_KeyDown);
             // 
             // btnOk
             // 
-            this.btnOk.Location = new System.Drawing.Point(234, 56);
-            this.btnOk.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
+            this.btnOk.Location = new System.Drawing.Point(311, 72);
+            this.btnOk.Margin = new System.Windows.Forms.Padding(6, 5, 6, 5);
             this.btnOk.Name = "btnOk";
-            this.btnOk.Padding = new System.Windows.Forms.Padding(4);
-            this.btnOk.Size = new System.Drawing.Size(96, 40);
+            this.btnOk.Size = new System.Drawing.Size(120, 40);
             this.btnOk.TabIndex = 1;
             this.btnOk.Text = "确定";
             this.btnOk.UseVisualStyleBackColor = true;
@@ -52,11 +51,10 @@ namespace WinAppLocker.Stub
             // btnCancel
             // 
             this.btnCancel.DialogResult = System.Windows.Forms.DialogResult.Cancel;
-            this.btnCancel.Location = new System.Drawing.Point(353, 56);
-            this.btnCancel.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
+            this.btnCancel.Location = new System.Drawing.Point(443, 72);
+            this.btnCancel.Margin = new System.Windows.Forms.Padding(6, 5, 6, 5);
             this.btnCancel.Name = "btnCancel";
-            this.btnCancel.Padding = new System.Windows.Forms.Padding(4);
-            this.btnCancel.Size = new System.Drawing.Size(96, 40);
+            this.btnCancel.Size = new System.Drawing.Size(120, 40);
             this.btnCancel.TabIndex = 2;
             this.btnCancel.Text = "取消";
             this.btnCancel.UseVisualStyleBackColor = true;
@@ -70,15 +68,16 @@ namespace WinAppLocker.Stub
             // PasswordForm
             // 
             this.AcceptButton = this.btnOk;
-            this.AutoScaleDimensions = new System.Drawing.SizeF(9F, 18F);
+            this.AutoScaleDimensions = new System.Drawing.SizeF(13F, 28F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.CancelButton = this.btnCancel;
-            this.ClientSize = new System.Drawing.Size(458, 112);
+            this.ClientSize = new System.Drawing.Size(578, 129);
             this.Controls.Add(this.txtPassword);
             this.Controls.Add(this.btnOk);
             this.Controls.Add(this.btnCancel);
+            this.Font = new System.Drawing.Font("Microsoft YaHei UI", 10.5F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
-            this.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
+            this.Margin = new System.Windows.Forms.Padding(6, 5, 6, 5);
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.Name = "PasswordForm";

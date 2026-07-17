@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="0.1.0.0" name="WinAppLocker.Stub" />
+  <assemblyIdentity version="1.0.0.0" name="MyApplication.app"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -8,18 +8,11 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
-  <!-- DPI 感知：System DPI Aware（.NET Framework 4.7.2 最可靠的方式）
-       PerMonitorV2 需要额外的 app.config 配置才能在 WinForms 中正确工作，
-       System DPI Aware 已足够避免 150% 缩放屏幕上的模糊问题 -->
-  <application xmlns="urn:schemas-microsoft-com:asm.v3">
-    <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
-    </windowsSettings>
-  </application>
-  <!-- 兼容性：Win10/11 -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-6fd9794f1297}" /> <!-- Windows 10/11 -->
+      <!-- Windows 10 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
+
 </assembly>
