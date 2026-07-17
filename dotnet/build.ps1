@@ -34,7 +34,7 @@ if ($Clean) {
 
 # 版本信息由 Directory.Build.props 的 GenerateCustomVersion Target 自动注入。
 # 此处仅显示用于日志。
-$version = "0.1.0"
+$version = "1.0.0"
 $gitHash = "dev"
 try {
     $gitOut = git rev-parse --short HEAD 2>$null
