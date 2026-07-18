@@ -809,9 +809,10 @@ void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
     /* 5. 调用原 PE 的 TLS callbacks
      *    stub_data.orig_tls_callbacks 是原 PE 的 callbacks 数组 VA
      *    （builder 填入，实际加载后该地址已正确）
-     *    数组以 NULL 结尾 */
+     *    数组以 NULL 结尾。
+     *    用 uintptr_t 中转避免 int-to-pointer-cast 警告（x86 上 uint64_t -> ptr）。 */
     if (stub_data.orig_tls_callbacks) {
-        TLS_CALLBACK* callbacks = (TLS_CALLBACK*)stub_data.orig_tls_callbacks;
+        TLS_CALLBACK* callbacks = (TLS_CALLBACK*)(uintptr_t)stub_data.orig_tls_callbacks;
         while (*callbacks) {
             (*callbacks)(hModule, reason, reserved);
             callbacks++;

@@ -187,6 +187,207 @@ static size_t find_stub_tls_cb_offset(const uint8_t* stub, size_t stub_size) {
     return 0;
 }
 
+/* ---- 辅助：从 stub_xXX.exe 提取 .reloc 节信息（x86 需要） ----
+ *
+ * x86 stub 用绝对地址引用静态数据（非 PIC），必须读 stub_x86.exe 的 .reloc 节，
+ * builder 据此预 patch stub.bin 的绝对地址到目标加载位置。
+ *
+ * 参数：
+ *   exe_data        - stub_xXX.exe 完整文件数据
+ *   exe_size        - exe 文件大小
+ *   out_lock_rva    - 输出：stub .lock 节的 RVA
+ *   out_lock_size   - 输出：stub .lock 节的 VirtualSize
+ *   out_reloc_off   - 输出：.reloc 节在 exe 文件中的 raw offset
+ *   out_reloc_size  - 输出：.reloc 节的 raw size
+ *   out_image_base  - 输出：stub 编译时 ImageBase
+ *
+ * 返回 0 成功，-1 失败。 */
+static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
+                                   uint32_t* out_lock_rva, uint32_t* out_lock_size,
+                                   uint32_t* out_reloc_off, size_t* out_reloc_size,
+                                   uint64_t* out_image_base) {
+    if (exe_size < sizeof(IMAGE_DOS_HEADER)) return -1;
+    IMAGE_DOS_HEADER* s_dos = (IMAGE_DOS_HEADER*)exe_data;
+    if (s_dos->e_magic != IMAGE_DOS_SIGNATURE) return -1;
+    if ((size_t)s_dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > exe_size) return -1;
+
+    /* 按签名 + FileHeader 布局一致，先用 NT_HEADERS64 读 Machine */
+    IMAGE_NT_HEADERS64* s_nt = (IMAGE_NT_HEADERS64*)(exe_data + s_dos->e_lfanew);
+    if (s_nt->Signature != IMAGE_NT_SIGNATURE) return -1;
+
+    int s_is_x64 = (s_nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64);
+    uint64_t image_base;
+    WORD n_sec;
+    IMAGE_SECTION_HEADER* s_sec;
+
+    if (s_is_x64) {
+        image_base = s_nt->OptionalHeader.ImageBase;
+        n_sec = s_nt->FileHeader.NumberOfSections;
+        s_sec = (IMAGE_SECTION_HEADER*)((uint8_t*)s_nt + sizeof(DWORD)
+                + sizeof(IMAGE_FILE_HEADER) + s_nt->FileHeader.SizeOfOptionalHeader);
+    } else {
+        IMAGE_NT_HEADERS32* s_nt32 = (IMAGE_NT_HEADERS32*)s_nt;
+        image_base = s_nt32->OptionalHeader.ImageBase;
+        n_sec = s_nt32->FileHeader.NumberOfSections;
+        s_sec = (IMAGE_SECTION_HEADER*)((uint8_t*)s_nt + sizeof(DWORD)
+                + sizeof(IMAGE_FILE_HEADER) + s_nt32->FileHeader.SizeOfOptionalHeader);
+    }
+
+    uint32_t lock_rva = 0, lock_size = 0;
+    uint32_t reloc_off = 0, reloc_size = 0;
+    for (WORD i = 0; i < n_sec; i++) {
+        char name[9] = {0};
+        memcpy(name, s_sec[i].Name, 8);
+        if (strcmp(name, ".lock") == 0) {
+            lock_rva = s_sec[i].VirtualAddress;
+            lock_size = s_sec[i].Misc.VirtualSize;
+            if (lock_size == 0) lock_size = s_sec[i].SizeOfRawData;
+        } else if (strcmp(name, ".reloc") == 0) {
+            reloc_off = s_sec[i].PointerToRawData;
+            reloc_size = s_sec[i].SizeOfRawData;
+        }
+    }
+
+    if (lock_rva == 0) return -1;
+    *out_lock_rva = lock_rva;
+    *out_lock_size = lock_size;
+    *out_reloc_off = reloc_off;
+    *out_reloc_size = reloc_size;
+    *out_image_base = image_base;
+    return 0;
+}
+
+/* ---- 辅助：预 patch stub.bin 的绝对地址到目标加载位置（x86） ----
+ *
+ * x86 stub 编译时用绝对地址引用 .lock 内的静态数据（如 STR_KERNEL32 的 VA）。
+ * 编译时绝对地址 = stub_image_base + stub_lock_rva + offset_in_lock。
+ * 目标绝对地址 = target_image_base + target_lock_rva + offset_in_lock。
+ * delta = (target_image_base + target_lock_rva) - (stub_image_base + stub_lock_rva)。
+ *
+ * 遍历 stub 的 .reloc 表，对每个在 .lock 范围内的 patch 位置加上 delta。
+ * patch 后 stub.bin 在目标位置加载时，所有绝对地址都指向正确位置。
+ *
+ * 前提：目标 PE 必须禁用 ASLR（加载到固定 ImageBase），否则 stub 绝对地址
+ * 会因基址随机化而再次错位（builder 已对 x86 强制禁用 ASLR）。
+ *
+ * 参数：
+ *   stub_buf          - stub.bin 数据（可写，通常已拷贝到 out 缓冲区）
+ *   stub_size         - stub.bin 大小（.lock 节大小）
+ *   reloc_data        - stub 的 .reloc 节数据
+ *   reloc_size        - .reloc 节大小
+ *   stub_image_base   - stub 编译时 ImageBase
+ *   stub_lock_rva      - stub .lock 节在 stub exe 中的 RVA
+ *   target_image_base - 目标 PE 的 ImageBase
+ *   target_lock_rva   - 新 .lock 节在目标 PE 中的 RVA
+ *
+ * 返回：patch 的条目数，-1 表示错误。 */
+static int patch_stub_relocations(uint8_t* stub_buf, size_t stub_size,
+                                  const uint8_t* reloc_data, size_t reloc_size,
+                                  uint64_t stub_image_base, uint32_t stub_lock_rva,
+                                  uint64_t target_image_base, uint32_t target_lock_rva) {
+    if (reloc_size == 0) return 0;  /* 无 reloc 表，无需 patch（x64 PIC 走此路径）*/
+
+    uint64_t stub_base = stub_image_base + stub_lock_rva;
+    uint64_t target_base = target_image_base + target_lock_rva;
+    int64_t delta = (int64_t)(target_base - stub_base);
+
+    if (delta == 0) return 0;  /* 无需 patch */
+
+    const uint8_t* reloc = reloc_data;
+    const uint8_t* reloc_end = reloc_data + reloc_size;
+    IMAGE_BASE_RELOCATION* block = (IMAGE_BASE_RELOCATION*)reloc;
+    int patch_count = 0;
+
+    while ((uint8_t*)block + sizeof(IMAGE_BASE_RELOCATION) <= reloc_end
+           && block->SizeOfBlock > 0) {
+        DWORD block_rva = block->VirtualAddress;
+        DWORD block_size = block->SizeOfBlock;
+        if (block_size < sizeof(IMAGE_BASE_RELOCATION)) break;
+
+        DWORD n_entries = (block_size - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        WORD* entries = (WORD*)(block + 1);
+
+        for (DWORD i = 0; i < n_entries; i++) {
+            WORD type = entries[i] >> 12;
+            WORD offset = entries[i] & 0xFFF;
+            DWORD patch_rva = block_rva + offset;
+
+            /* 只 patch .lock 范围内的条目
+             * （其他节如 .rdata 被 /DISCARD/ 了，不应有 reloc 条目）*/
+            if (patch_rva < stub_lock_rva
+                || patch_rva >= stub_lock_rva + stub_size) {
+                continue;
+            }
+
+            DWORD off_in_lock = patch_rva - stub_lock_rva;
+            uint8_t* patch_addr = stub_buf + off_in_lock;
+
+            switch (type) {
+                case IMAGE_REL_BASED_ABSOLUTE:
+                    break;  /* padding，跳过 */
+                case IMAGE_REL_BASED_HIGHLOW:
+                    /* x86 32 位绝对地址 */
+                    *(uint32_t*)patch_addr += (uint32_t)delta;
+                    patch_count++;
+                    break;
+                case IMAGE_REL_BASED_DIR64:
+                    /* x64 64 位绝对地址（x64 stub 通常无此条目，因为 PIC）*/
+                    *(uint64_t*)patch_addr += (uint64_t)delta;
+                    patch_count++;
+                    break;
+                default:
+                    /* 其他类型（HIGH/LOW）罕见，跳过 */
+                    break;
+            }
+        }
+
+        block = (IMAGE_BASE_RELOCATION*)((uint8_t*)block + block_size);
+    }
+
+    return patch_count;
+}
+
+/* ---- 双架构 PE 访问层 ----
+ * builder 自身是 x64，IMAGE_NT_HEADERS 默认 = IMAGE_NT_HEADERS64。
+ * 输入 PE 可能是 PE32 (x86) 或 PE32+ (x64)，需要按架构分别解析。
+ *
+ * FileHeader 在两种 NT_HEADERS 中布局一致（紧跟 Signature 之后），
+ * 可以共用 (IMAGE_FILE_HEADER*)((uint8_t*)nt + 4)。
+ *
+ * OptionalHeader 字段：多数字段类型相同但偏移不同（PE32 vs PE32+）。
+ * 用 g_nt64 / g_nt32 两个指针 + 宏 OH() / OH_U64() 分派。
+ *
+ * DataDirectory 在两种结构中布局一致（每项 8 字节 RVA+Size），
+ * 只是起始偏移不同（PE32=0x60，PE32+=0x70），通过宏 OH_DATA_DIR(idx) 访问。 */
+static int g_is_x64 = 1;                    /* 1=x64/PE32+，0=x86/PE32 */
+static IMAGE_NT_HEADERS64* g_nt64 = NULL;   /* is_x64 时有效 */
+static IMAGE_NT_HEADERS32* g_nt32 = NULL;   /* !is_x64 时有效 */
+
+/* 访问 OptionalHeader 中同类型字段（DWORD/WORD 等）。
+ * 用 *(cond ? &a : &b) 形式让三元表达式可作为 lvalue（C 标准不支持三元作为 lvalue，
+ * 但通过指针解引用绕过；同时保持 OH(field) 既能读也能写）。 */
+#define OH(field) (*(g_is_x64 ? &g_nt64->OptionalHeader.field : &g_nt32->OptionalHeader.field))
+/* 访问 ImageBase（PE32 是 DWORD，PE32+ 是 ULONGLONG），统一转 uint64_t */
+#define OH_IMG_BASE() (g_is_x64 \
+    ? (uint64_t)g_nt64->OptionalHeader.ImageBase \
+    : (uint64_t)g_nt32->OptionalHeader.ImageBase)
+/* 访问 DataDirectory[idx]（两种结构布局一致，仅起始偏移不同） */
+#define OH_DATA_DIR(idx) (g_is_x64 \
+    ? &g_nt64->OptionalHeader.DataDirectory[idx] \
+    : &g_nt32->OptionalHeader.DataDirectory[idx])
+/* FileHeader（两种结构布局一致，可共用） */
+#define OH_FILE() (g_is_x64 ? &g_nt64->FileHeader : &g_nt32->FileHeader)
+/* 取 nt 指针（uint8_t* 基址，用于计算 sec 表偏移） */
+#define OH_NT_BASE() (g_is_x64 ? (uint8_t*)g_nt64 : (uint8_t*)g_nt32)
+/* OptionalHeader 大小（sizeof 在编译期已知） */
+#define OH_SIZE() (g_is_x64 ? sizeof(IMAGE_OPTIONAL_HEADER64) : sizeof(IMAGE_OPTIONAL_HEADER32))
+/* TLS directory 中 AddressOfCallBacks 字段偏移
+ *   PE32:  IMAGE_TLS_DIRECTORY32.AddressOfCallBacks @ offset 12 (DWORD VA)
+ *   PE32+: IMAGE_TLS_DIRECTORY64.AddressOfCallBacks @ offset 24 (ULONGLONG VA) */
+#define TLS_AOC_OFFSET() (g_is_x64 ? 24 : 12)
+/* callbacks 数组元素大小（x86 4 字节指针，x64 8 字节指针） */
+#define TLS_CB_ELEM_SIZE() (g_is_x64 ? 8 : 4)
+
 /* ---- 辅助：从输入路径生成默认输出路径 <dir>/<base>_locked.exe ----
  * 例：C:\Tools\Bandizip\Bandizip.x64.exe -> C:\Tools\Bandizip\Bandizip.x64_locked.exe
  * 这样带依赖的 exe 加壳后仍在源目录测试，能找到同目录的 DLL */
@@ -325,32 +526,48 @@ int main(int argc, char* argv[]) {
     if (!pe) return 1;
     printf("[*] Loaded %s (%zu bytes = 0x%zX)\n", in_path, in_size, in_size);
 
-    /* 2. 验证 PE */
+    /* 2. 验证 PE + 检测架构 */
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)pe;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
         printf("[-] Bad DOS magic\n"); return 1;
     }
-    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(pe + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+    /* 先按 IMAGE_NT_HEADERS64 读 Signature + FileHeader（前 4+20 字节布局与 PE32 一致） */
+    IMAGE_NT_HEADERS64* nt_probe = (IMAGE_NT_HEADERS64*)(pe + dos->e_lfanew);
+    if (nt_probe->Signature != IMAGE_NT_SIGNATURE) {
         printf("[-] Bad NT signature\n"); return 1;
     }
-    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        printf("[-] Only x64 PE supported (got 0x%04X)\n",
-               nt->FileHeader.Machine);
+    /* 按 Machine 字段判断架构 */
+    WORD machine = nt_probe->FileHeader.Machine;
+    if (machine == IMAGE_FILE_MACHINE_AMD64) {
+        g_is_x64 = 1;
+        g_nt64 = nt_probe;
+        g_nt32 = NULL;
+    } else if (machine == IMAGE_FILE_MACHINE_I386) {
+        g_is_x64 = 0;
+        g_nt64 = NULL;
+        g_nt32 = (IMAGE_NT_HEADERS32*)(pe + dos->e_lfanew);
+    } else {
+        printf("[-] Unsupported Machine 0x%04X (only x86 and x64)\n", machine);
         return 1;
     }
-    if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) {
+    printf("[*] Architecture: %s (Machine=0x%04X)\n",
+           g_is_x64 ? "x64 (PE32+)" : "x86 (PE32)", machine);
+
+    IMAGE_FILE_HEADER* file_hdr = OH_FILE();
+    if (file_hdr->Characteristics & IMAGE_FILE_DLL) {
         printf("[-] DLL not supported (use EXE)\n");
         return 1;
     }
 
-    WORD n_sec = nt->FileHeader.NumberOfSections;
+    WORD n_sec = file_hdr->NumberOfSections;
+    /* 节表紧接 OptionalHeader 之后；按架构用对应的 NT_HEADERS 大小 */
     IMAGE_SECTION_HEADER* sec =
-        (IMAGE_SECTION_HEADER*)((uint8_t*)nt + sizeof(IMAGE_NT_HEADERS));
+        (IMAGE_SECTION_HEADER*)(OH_NT_BASE() + sizeof(DWORD) /*Signature*/
+                                + sizeof(IMAGE_FILE_HEADER)
+                                + OH_SIZE());
 
     /* 检查 TLS 回调（v3：不再拒绝，保存原 callback 列表用于 stub_tls_callback 代理）*/
-    IMAGE_DATA_DIRECTORY* tls_dir =
-        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    IMAGE_DATA_DIRECTORY* tls_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_TLS);
 
     /* TLS 信息结构 */
     struct {
@@ -369,31 +586,52 @@ int main(int argc, char* argv[]) {
         /* 找 TLS directory 的 raw 指针 */
         DWORD tls_raw = rva_to_raw(sec, n_sec, tls_dir->VirtualAddress);
         if (tls_raw != 0) {
-            IMAGE_TLS_DIRECTORY64* tls =
-                (IMAGE_TLS_DIRECTORY64*)(pe + tls_raw);
-            /* AddressOfCallBacks 字段在 IMAGE_TLS_DIRECTORY64 中的偏移 = 24 */
-            tls_info.aoc_field_rva = tls_dir->VirtualAddress + 24;
+            /* AddressOfCallBacks 字段在 TLS directory 中的偏移：
+             *   PE32:  IMAGE_TLS_DIRECTORY32 @ offset 12 (DWORD VA)
+             *   PE32+: IMAGE_TLS_DIRECTORY64 @ offset 24 (ULONGLONG VA) */
+            tls_info.aoc_field_rva = tls_dir->VirtualAddress + TLS_AOC_OFFSET();
 
-            if (tls->AddressOfCallBacks) {
-                ULONGLONG img_base = nt->OptionalHeader.ImageBase;
-                ULONGLONG cb_va = tls->AddressOfCallBacks;
-                ULONGLONG cb_rva = cb_va - img_base;
+            /* 读 AddressOfCallBacks VA（按架构） */
+            uint64_t cb_va = 0;
+            if (g_is_x64) {
+                IMAGE_TLS_DIRECTORY64* tls =
+                    (IMAGE_TLS_DIRECTORY64*)(pe + tls_raw);
+                cb_va = tls->AddressOfCallBacks;
+            } else {
+                IMAGE_TLS_DIRECTORY32* tls =
+                    (IMAGE_TLS_DIRECTORY32*)(pe + tls_raw);
+                cb_va = (uint64_t)tls->AddressOfCallBacks;
+            }
+
+            if (cb_va) {
+                uint64_t img_base = OH_IMG_BASE();
+                uint64_t cb_rva = cb_va - img_base;
                 tls_info.orig_callbacks_array_va = cb_va;
 
                 DWORD cb_raw = rva_to_raw(sec, n_sec, (DWORD)cb_rva);
                 if (cb_raw != 0) {
-                    uint64_t* callbacks = (uint64_t*)(pe + cb_raw);
+                    /* callbacks 数组：x86 是 4 字节指针，x64 是 8 字节指针 */
+                    size_t elem_size = TLS_CB_ELEM_SIZE();
+                    uint8_t* cb_bytes = pe + cb_raw;
                     /* 复制原 callbacks（最多 63 个，留一个 NULL） */
-                    while (tls_info.orig_callback_count < 63 &&
-                           callbacks[tls_info.orig_callback_count] != 0) {
-                        tls_info.orig_callbacks[tls_info.orig_callback_count] =
-                            callbacks[tls_info.orig_callback_count];
+                    while (tls_info.orig_callback_count < 63) {
+                        uint64_t cb = 0;
+                        if (g_is_x64) {
+                            cb = *(uint64_t*)(cb_bytes
+                                + tls_info.orig_callback_count * 8);
+                        } else {
+                            cb = (uint64_t)*(uint32_t*)(cb_bytes
+                                + tls_info.orig_callback_count * 4);
+                        }
+                        if (cb == 0) break;
+                        tls_info.orig_callbacks[tls_info.orig_callback_count] = cb;
                         tls_info.orig_callback_count++;
                     }
                     tls_info.orig_callbacks[tls_info.orig_callback_count] = 0;
                     if (tls_info.orig_callback_count > 0) {
                         tls_info.has_callbacks = 1;
                     }
+                    (void)elem_size;
                 }
             }
         }
@@ -413,8 +651,7 @@ int main(int argc, char* argv[]) {
     }
 
     /* 检查 .NET CLR */
-    IMAGE_DATA_DIRECTORY* clr_dir =
-        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
+    IMAGE_DATA_DIRECTORY* clr_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR);
     if (clr_dir->VirtualAddress != 0 && clr_dir->Size != 0) {
         printf("[-] .NET CLR detected. Cannot pack managed PE.\n");
         return 1;
@@ -422,12 +659,12 @@ int main(int argc, char* argv[]) {
 
     printf("[*] PE: %u sections, ImageBase=0x%llX, EP RVA=0x%lX, SizeOfImage=0x%lX\n",
            n_sec,
-           (unsigned long long)nt->OptionalHeader.ImageBase,
-           (unsigned long)nt->OptionalHeader.AddressOfEntryPoint,
-           (unsigned long)nt->OptionalHeader.SizeOfImage);
+           (unsigned long long)OH_IMG_BASE(),
+           (unsigned long)OH(AddressOfEntryPoint),
+           (unsigned long)OH(SizeOfImage));
     printf("[*] DllCharacteristics=0x%04X, Subsystem=%u\n",
-           nt->OptionalHeader.DllCharacteristics,
-           nt->OptionalHeader.Subsystem);
+           OH(DllCharacteristics),
+           OH(Subsystem));
 
     /* 打印所有节 */
     printf("[*] Sections:\n");
@@ -456,8 +693,7 @@ int main(int argc, char* argv[]) {
            (unsigned long)overlay_off, overlay_size);
 
     /* 检查 Authenticode 签名 */
-    IMAGE_DATA_DIRECTORY* sec_dir =
-        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    IMAGE_DATA_DIRECTORY* sec_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_SECURITY);
     if (sec_dir->VirtualAddress != 0 && sec_dir->Size != 0) {
         printf("[!] Authenticode signature present (off=0x%lX size=0x%lX). Will strip.\n",
                (unsigned long)sec_dir->VirtualAddress,
@@ -505,7 +741,7 @@ int main(int argc, char* argv[]) {
            (unsigned long)text_sec->PointerToRawData);
 
     /* 4. 保存原 EP / .text 信息 */
-    uint64_t oep_rva      = nt->OptionalHeader.AddressOfEntryPoint;
+    uint64_t oep_rva      = OH(AddressOfEntryPoint);
     uint64_t text_rva     = text_sec->VirtualAddress;
     uint32_t text_raw_sz  = text_sec->SizeOfRawData;
     uint32_t text_virt_sz = text_sec->Misc.VirtualSize;
@@ -569,24 +805,87 @@ int main(int argc, char* argv[]) {
     printf("[*] Encrypting %u bytes (RawData) with XTEA\n", enc_size);
     xtea_encrypt_buf(pe + text_sec->PointerToRawData, enc_size, key);
 
-    /* 7. 读 stub.bin */
+    /* 7. 读 stub.bin（按输入 PE 架构选择 stub_x64.bin 或 stub_x86.bin；
+     *    向后兼容：x64 时也尝试 stub.bin） */
+    const char* stub_candidates[4];
+    int n_candidates = 0;
+    if (g_is_x64) {
+        stub_candidates[n_candidates++] = "stub/stub_x64.bin";
+        stub_candidates[n_candidates++] = "stub_x64.bin";
+        stub_candidates[n_candidates++] = "stub/stub.bin";  /* 向后兼容 */
+        stub_candidates[n_candidates++] = "stub.bin";
+    } else {
+        stub_candidates[n_candidates++] = "stub/stub_x86.bin";
+        stub_candidates[n_candidates++] = "stub_x86.bin";
+    }
     size_t stub_size = 0;
-    uint8_t* stub = read_file("stub/stub.bin", &stub_size);
-    if (!stub) {
-        stub = read_file("stub.bin", &stub_size);
+    uint8_t* stub = NULL;
+    for (int i = 0; i < n_candidates && !stub; i++) {
+        stub = read_file(stub_candidates[i], &stub_size);
     }
     if (!stub) {
-        /* 尝试相对路径 */
+        /* 尝试基于 argv[0] 的相对路径 */
         char path[512];
-        snprintf(path, sizeof(path), "%s/stub/stub.bin",
-                 argc > 0 ? argv[0] : ".");
+        snprintf(path, sizeof(path), "%s/stub/stub_%s.bin",
+                 argc > 0 ? argv[0] : ".", g_is_x64 ? "x64" : "x86");
         stub = read_file(path, &stub_size);
     }
     if (!stub) {
-        printf("[-] Cannot read stub.bin (run 'make stub/stub.bin' first)\n");
+        printf("[-] Cannot read stub_%s.bin (run 'make%s' first)\n",
+               g_is_x64 ? "x64" : "x86",
+               g_is_x64 ? "" : " all-x86");
         return 1;
     }
-    printf("[*] Loaded stub.bin (%zu bytes = 0x%zX)\n", stub_size, stub_size);
+    printf("[*] Loaded stub_%s.bin (%zu bytes = 0x%zX)\n",
+           g_is_x64 ? "x64" : "x86", stub_size, stub_size);
+
+    /* 7b. x86: 额外读 stub_x86.exe 获取 .reloc 节
+     *   x86 stub 用绝对地址引用静态数据（非 PIC），必须预 patch 到目标位置。
+     *   stub_x86.bin 是 objcopy 导出的 .lock raw bytes，没有 .reloc 节，
+     *   所以需要从 stub_x86.exe 读取 .reloc 节 + .lock 节 RVA + ImageBase。
+     *   x64 stub 用 RIP-relative 是 PIC，不需要 .reloc，跳过此步。 */
+    uint8_t* stub_exe = NULL;
+    size_t stub_exe_size = 0;
+    uint8_t* stub_reloc_data = NULL;
+    size_t stub_reloc_size = 0;
+    uint64_t stub_image_base = 0;
+    uint32_t stub_lock_rva = 0;
+    uint32_t stub_lock_size = 0;
+    if (!g_is_x64) {
+        const char* exe_candidates[2] = {"stub/stub_x86.exe", "stub_x86.exe"};
+        for (int i = 0; i < 2 && !stub_exe; i++) {
+            stub_exe = read_file(exe_candidates[i], &stub_exe_size);
+        }
+        if (!stub_exe) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/stub/stub_x86.exe",
+                     argc > 0 ? argv[0] : ".");
+            stub_exe = read_file(path, &stub_exe_size);
+        }
+        if (!stub_exe) {
+            printf("[-] Cannot read stub_x86.exe (needed for .reloc, run 'make all-x86')\n");
+            return 1;
+        }
+        uint32_t reloc_off = 0;
+        if (extract_stub_reloc_info(stub_exe, stub_exe_size,
+                                    &stub_lock_rva, &stub_lock_size,
+                                    &reloc_off, &stub_reloc_size,
+                                    &stub_image_base) != 0) {
+            printf("[-] Failed to parse stub_x86.exe PE structure\n");
+            free(stub_exe);
+            return 1;
+        }
+        if (stub_reloc_size == 0 || reloc_off == 0) {
+            printf("[-] stub_x86.exe has no .reloc section (stub.ld 或 Makefile 配置错误)\n");
+            free(stub_exe);
+            return 1;
+        }
+        stub_reloc_data = stub_exe + reloc_off;
+        printf("[*] stub_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
+               (unsigned long long)stub_image_base,
+               (unsigned long)stub_lock_rva, (unsigned long)stub_lock_size,
+               stub_reloc_size);
+    }
 
     /* 8. 在 stub.bin 中搜索 STUB_DATA_MAGIC */
     stub_data_t* sd = NULL;
@@ -621,8 +920,11 @@ int main(int argc, char* argv[]) {
     }
     if (tls_info.has_callbacks) {
         sd->flags    |= STUB_FLAG_TLS_PROXY;  /* TLS callback 代理模式 */
-    } else if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
-        sd->flags    |= STUB_FLAG_ASLR;        /* 保留 ASLR，stub 重应用 reloc */
+    } else if (g_is_x64 && (OH(DllCharacteristics) & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)) {
+        /* x64: 保留 ASLR，stub 用 RIP-relative + 重应用 .text reloc。
+         * x86: 不设置 ASLR flag，绝对地址由 builder 预 patch（见 step 14b），
+         *      目标 PE 的 ASLR 在 step 15 被强制禁用。 */
+        sd->flags    |= STUB_FLAG_ASLR;
     }
     sd->max_retries   = STUB_DEFAULT_MAX_RETRIES;
     sd->reserved16    = 0;
@@ -640,10 +942,9 @@ int main(int argc, char* argv[]) {
     wcsncpy(sd->password, password, 63);  /* 保留明文兼容（生产应清零） */
     sd->password[63] = 0;
     /* v3 字段：重定位信息（始终填充，stub 根据 STUB_FLAG_ASLR 决定是否使用）*/
-    sd->image_base = nt->OptionalHeader.ImageBase;
+    sd->image_base = OH_IMG_BASE();
     {
-        IMAGE_DATA_DIRECTORY* reloc_dir =
-            &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        IMAGE_DATA_DIRECTORY* reloc_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_BASERELOC);
         sd->reloc_rva  = reloc_dir->VirtualAddress;
         sd->reloc_size = reloc_dir->Size;
     }
@@ -671,15 +972,16 @@ int main(int argc, char* argv[]) {
      *   callbacks 数组 = [stub_tls_callback_VA, NULL]
      *   stub_tls_callback_VA = ImageBase + new_va + stub_tls_cb_offset
      *   callbacks_array_VA   = ImageBase + new_va + cb_array_offset_in_lock */
-    DWORD file_align = nt->OptionalHeader.FileAlignment;
-    DWORD sec_align = nt->OptionalHeader.SectionAlignment;
+    DWORD file_align = OH(FileAlignment);
+    DWORD sec_align = OH(SectionAlignment);
 
-    /* callbacks 数组在 .lock 中的偏移（stub.bin 之后，8 字节对齐）*/
-    size_t cb_array_offset_in_lock = (stub_size + 7) & ~((size_t)7);
-    /* callbacks 数组大小：[stub_tls_callback_VA, NULL] = 2 * 8 字节
+    /* callbacks 数组在 .lock 中的偏移（按架构对齐：x86 4 字节，x64 8 字节）*/
+    size_t cb_align = TLS_CB_ELEM_SIZE();
+    size_t cb_array_offset_in_lock = (stub_size + cb_align - 1) & ~(cb_align - 1);
+    /* callbacks 数组大小：[stub_tls_callback_VA, NULL] = 2 * elem_size 字节
      *   （stub_tls_callback 调用原 callbacks via stub_data.orig_tls_callbacks，
      *    所以新数组只需要 stub_tls_callback + NULL，原 callbacks 不会被 loader 二次调用）*/
-    size_t cb_array_size = tls_info.has_callbacks ? (2 * 8) : 0;
+    size_t cb_array_size = tls_info.has_callbacks ? (2 * cb_align) : 0;
     size_t total_lock_size = cb_array_offset_in_lock + cb_array_size;
     if (!tls_info.has_callbacks) {
         total_lock_size = stub_size;  /* 不需要追加 callbacks 数组 */
@@ -697,10 +999,8 @@ int main(int argc, char* argv[]) {
     uint64_t stub_tls_cb_va = 0;
     uint64_t new_cb_array_va = 0;
     if (tls_info.has_callbacks) {
-        stub_tls_cb_va   = (uint64_t)nt->OptionalHeader.ImageBase
-                         + new_va + stub_tls_cb_offset;
-        new_cb_array_va  = (uint64_t)nt->OptionalHeader.ImageBase
-                         + new_va + (uint64_t)cb_array_offset_in_lock;
+        stub_tls_cb_va   = OH_IMG_BASE() + new_va + stub_tls_cb_offset;
+        new_cb_array_va  = OH_IMG_BASE() + new_va + (uint64_t)cb_array_offset_in_lock;
         printf("[*] stub_tls_callback VA = 0x%llX (ImageBase + 0x%lX + 0x%zX)\n",
                (unsigned long long)stub_tls_cb_va,
                (unsigned long)new_va, stub_tls_cb_offset);
@@ -730,23 +1030,35 @@ int main(int argc, char* argv[]) {
     if (copy_size > in_size) copy_size = in_size;
     memcpy(out, pe, copy_size);
 
-    /* 重新解析指针 */
+    /* 重新解析指针（在 out 缓冲区中重新设置 g_nt64/g_nt32） */
     dos = (IMAGE_DOS_HEADER*)out;
-    nt  = (IMAGE_NT_HEADERS*)(out + dos->e_lfanew);
-    sec = (IMAGE_SECTION_HEADER*)((uint8_t*)nt + sizeof(IMAGE_NT_HEADERS));
+    if (g_is_x64) {
+        g_nt64 = (IMAGE_NT_HEADERS64*)(out + dos->e_lfanew);
+    } else {
+        g_nt32 = (IMAGE_NT_HEADERS32*)(out + dos->e_lfanew);
+    }
+    sec = (IMAGE_SECTION_HEADER*)(OH_NT_BASE() + sizeof(DWORD) /*Signature*/
+                                   + sizeof(IMAGE_FILE_HEADER)
+                                   + OH_SIZE());
 
     /* 11. 剥离 Authenticode 签名（清零 DataDirectory[4]） */
-    if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress != 0) {
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = 0;
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 0;
-        printf("[+] Stripped Authenticode signature directory entry\n");
+    {
+        IMAGE_DATA_DIRECTORY* d = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_SECURITY);
+        if (d->VirtualAddress != 0) {
+            d->VirtualAddress = 0;
+            d->Size = 0;
+            printf("[+] Stripped Authenticode signature directory entry\n");
+        }
     }
 
     /* 12. 清零 Bound Imports（避免 loader 走捷径跳过 IAT 解析） */
-    if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress != 0) {
-        printf("[!] Bound Imports detected, clearing\n");
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
+    {
+        IMAGE_DATA_DIRECTORY* d = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT);
+        if (d->VirtualAddress != 0) {
+            printf("[!] Bound Imports detected, clearing\n");
+            d->VirtualAddress = 0;
+            d->Size = 0;
+        }
     }
 
     /* 13. 添加新 .lock 节头 */
@@ -764,51 +1076,98 @@ int main(int argc, char* argv[]) {
 
     /* 14. 拷贝 stub.bin 到新节，追加 callbacks 数组（TLS_PROXY 模式） */
     memcpy(out + new_raw_off, stub, stub_size);
+
+    /* 14b. x86: 预 patch stub 的绝对地址到目标加载位置
+     *   x86 stub 用绝对地址引用静态数据（非 PIC），编译时绝对地址基于
+     *   stub_image_base + stub_lock_rva。嵌入目标 PE 后实际加载位置是
+     *   target_image_base + new_va，必须遍历 stub 的 .reloc 表把所有
+     *   绝对地址引用加上 delta = (target_base - stub_base)。
+     *   patch 后 stub 在目标 PE 加载到固定 ImageBase 时绝对地址全部正确。
+     *   注意：patch 必须在 callbacks 数组写入之前（callbacks 数组本身不是
+     *   stub 的 .reloc 条目，是 builder 独立写入的，不需要 patch）。 */
+    if (!g_is_x64 && stub_reloc_data) {
+        uint64_t target_base = OH_IMG_BASE() + new_va;
+        uint64_t stub_base = stub_image_base + stub_lock_rva;
+        int n_patched = patch_stub_relocations(out + new_raw_off, stub_size,
+                                               stub_reloc_data, stub_reloc_size,
+                                               stub_image_base, stub_lock_rva,
+                                               OH_IMG_BASE(), new_va);
+        if (n_patched < 0) {
+            printf("[-] Failed to patch stub relocations\n");
+            free(stub_exe);
+            return 1;
+        }
+        printf("[+] Patched %d stub relocations: delta=0x%llX (stub_base=0x%llX -> target_base=0x%llX)\n",
+               n_patched,
+               (unsigned long long)(int64_t)(target_base - stub_base),
+               (unsigned long long)stub_base,
+               (unsigned long long)target_base);
+    }
     if (tls_info.has_callbacks) {
         /* 在 .lock 末尾追加新 callbacks 数组：[stub_tls_callback_VA, NULL]
          * Windows loader 会遍历此数组调用每个 callback。
          * stub_tls_callback 在 DLL_PROCESS_ATTACH 时解密 .text + 调原 callbacks。
          * 数组以 NULL 结尾，所以原 callbacks 不会被 loader 二次调用
-         * （由 stub_tls_callback 通过 stub_data.orig_tls_callbacks 调用）。 */
-        uint64_t* cb_array = (uint64_t*)(out + new_raw_off + cb_array_offset_in_lock);
-        cb_array[0] = stub_tls_cb_va;  /* stub_tls_callback 入口 VA */
-        cb_array[1] = 0;                /* NULL 结尾 */
-        printf("[+] Wrote new callbacks array at .lock+0x%zX: [0x%llX, NULL]\n",
-               cb_array_offset_in_lock, (unsigned long long)stub_tls_cb_va);
+         * （由 stub_tls_callback 通过 stub_data.orig_tls_callbacks 调用）。
+         * x86 callbacks 数组元素是 4 字节（DWORD VA），x64 是 8 字节（ULONGLONG VA）。 */
+        uint8_t* cb_addr = out + new_raw_off + cb_array_offset_in_lock;
+        if (g_is_x64) {
+            uint64_t* cb_array = (uint64_t*)cb_addr;
+            cb_array[0] = stub_tls_cb_va;  /* stub_tls_callback 入口 VA */
+            cb_array[1] = 0;                /* NULL 结尾 */
+        } else {
+            uint32_t* cb_array = (uint32_t*)cb_addr;
+            cb_array[0] = (uint32_t)stub_tls_cb_va;
+            cb_array[1] = 0;
+        }
+        printf("[+] Wrote new callbacks array at .lock+0x%zX: [0x%llX, NULL] (%zu-bit)\n",
+               cb_array_offset_in_lock, (unsigned long long)stub_tls_cb_va,
+               cb_align * 8);
     }
     /* 剩余填充由 calloc 自动清零 */
 
     /* 15. 更新 PE 头 */
-    nt->FileHeader.NumberOfSections++;
-    nt->OptionalHeader.SizeOfImage = new_va + new_vsize_aligned;
-    nt->OptionalHeader.AddressOfEntryPoint = new_va;
-    nt->OptionalHeader.CheckSum = 0;
+    OH_FILE()->NumberOfSections++;
+    OH(SizeOfImage) = new_va + new_vsize_aligned;
+    OH(AddressOfEntryPoint) = new_va;
+    OH(CheckSum) = 0;
 
     /* ASLR 处理（v3 条件化）：
-     * - TLS_PROXY 模式：禁用 ASLR。原因：新 callbacks 数组中的 stub_tls_callback_VA
-     *   是绝对 VA，若 ASLR 启用需要 .reloc 覆盖此地址，但 .lock 节无 reloc 条目。
-     *   禁用 ASLR 让 PE 加载到 preferred ImageBase，所有 VA 直接生效。
-     *   绝大多数带 TLS callbacks 的程序（CRT 初始化等）不依赖 ASLR，禁用无影响。
-     * - 非 TLS_PROXY 模式 + ASLR 启用：保留 ASLR，stub 解密 .text 后重新应用
-     *   relocations（仅 patch .text 范围，避免对其他节双重 reloc）。
+     * - x86（无论是否 TLS_PROXY）：强制禁用 ASLR。原因：x86 stub 用绝对地址
+     *   引用静态数据（非 PIC），builder 在 step 14b 预 patch stub 绝对地址到
+     *   目标 ImageBase + new_va。若 ASLR 启用，加载基址随机化，预 patch 的
+     *   绝对地址会错位。禁用 ASLR 让 PE 加载到 preferred ImageBase，
+     *   预 patch 的绝对地址直接生效。
+     *   副作用：原 PE 的 .text 等 reloc 条目不再被 loader 应用；但 stub
+     *   解密 .text 后不重应用 reloc（x86 不设 STUB_FLAG_ASLR），所以 .text
+     *   里的绝对地址回到 preferred ImageBase 基准，与实际加载基址一致。正确。
+     * - x64 + TLS_PROXY：禁用 ASLR。原因：新 callbacks 数组中的
+     *   stub_tls_callback_VA 是绝对 VA，.lock 节无 reloc 条目覆盖。
+     * - x64 + 非 TLS_PROXY + ASLR：保留 ASLR，stub 解密 .text 后重新应用
+     *   relocations（仅 patch .text 范围，避免双重 reloc）。
      *   STUB_FLAG_ASLR 已在 stub_data.flags 中设置。 */
-    if (tls_info.has_callbacks) {
-        if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
-            WORD old = nt->OptionalHeader.DllCharacteristics;
-            nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-            nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+    if (!g_is_x64) {
+        /* x86: 强制禁用 ASLR（stub 绝对地址已预 patch 到 preferred ImageBase）*/
+        if (OH(DllCharacteristics) & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+            WORD old_dc = OH(DllCharacteristics);
+            WORD new_dc = old_dc & ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+            new_dc &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+            OH(DllCharacteristics) = new_dc;
+            printf("[!] ASLR disabled (x86 stub uses absolute addresses, DllChar 0x%04X -> 0x%04X)\n",
+                   old_dc, new_dc);
+        }
+    } else if (tls_info.has_callbacks) {
+        /* x64 + TLS_PROXY：禁用 ASLR */
+        if (OH(DllCharacteristics) & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+            WORD old_dc = OH(DllCharacteristics);
+            WORD new_dc = old_dc & ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+            new_dc &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+            OH(DllCharacteristics) = new_dc;
             printf("[!] ASLR disabled (TLS_PROXY mode, DllChar 0x%04X -> 0x%04X)\n",
-                   old, nt->OptionalHeader.DllCharacteristics);
+                   old_dc, new_dc);
         }
     } else if (sd->flags & STUB_FLAG_ASLR) {
         printf("[+] ASLR preserved (stub will re-apply .text relocations)\n");
-    } else if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
-        /* 这一支本不该触发（非 TLS_PROXY 时 DYNAMIC_BASE 应该走 STUB_FLAG_ASLR 路径）*/
-        WORD old = nt->OptionalHeader.DllCharacteristics;
-        nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-        nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
-        printf("[!] ASLR disabled (fallback, DllChar 0x%04X -> 0x%04X)\n",
-               old, nt->OptionalHeader.DllCharacteristics);
     }
 
     /* 15b. CFG (Control Flow Guard) 处理：
@@ -820,11 +1179,12 @@ int main(int argc, char* argv[]) {
      *   副作用：原 PE 中 CFG 保护的间接调用目标不再被 loader 校验；
      *   但原 .text 已被 XTEA 加密，CFG 本来就保护不了密文，影响可忽略。
      *   参考：pe-packer 项目同样处理 CFG（patch GFIDS 表或禁用）。 */
-    if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) {
-        WORD old = nt->OptionalHeader.DllCharacteristics;
-        nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
+    if (OH(DllCharacteristics) & IMAGE_DLLCHARACTERISTICS_GUARD_CF) {
+        WORD old_dc = OH(DllCharacteristics);
+        WORD new_dc = old_dc & ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
+        OH(DllCharacteristics) = new_dc;
         printf("[!] CFG disabled (DllChar 0x%04X -> 0x%04X); stub_entry not in GFIDS table\n",
-               old, nt->OptionalHeader.DllCharacteristics);
+               old_dc, new_dc);
     }
 
     /* 16. TLS_PROXY 模式：修改原 TLS directory 的 AddressOfCallBacks 字段
@@ -841,13 +1201,21 @@ int main(int argc, char* argv[]) {
             printf("[-] Cannot locate AddressOfCallBacks field in output PE\n");
             return 1;
         }
-        uint64_t* aoc_field = (uint64_t*)(out + aoc_raw);
-        uint64_t old_aoc = *aoc_field;
-        *aoc_field = new_cb_array_va;
-        printf("[+] TLS directory AddressOfCallBacks: 0x%llX -> 0x%llX (file off 0x%lX)\n",
+        /* 按架构写入：x86 是 4 字节 VA (DWORD)，x64 是 8 字节 VA (ULONGLONG) */
+        uint64_t old_aoc;
+        if (g_is_x64) {
+            uint64_t* aoc_field = (uint64_t*)(out + aoc_raw);
+            old_aoc = *aoc_field;
+            *aoc_field = new_cb_array_va;
+        } else {
+            uint32_t* aoc_field = (uint32_t*)(out + aoc_raw);
+            old_aoc = *aoc_field;
+            *aoc_field = (uint32_t)new_cb_array_va;
+        }
+        printf("[+] TLS directory AddressOfCallBacks: 0x%llX -> 0x%llX (file off 0x%lX, %zu-bit)\n",
                (unsigned long long)old_aoc,
                (unsigned long long)new_cb_array_va,
-               (unsigned long)aoc_raw);
+               (unsigned long)aoc_raw, cb_align * 8);
     }
 
     /* 17. 写输出文件 */
@@ -859,14 +1227,15 @@ int main(int argc, char* argv[]) {
     printf("\n[+] ===== Pack complete =====\n");
     printf("[+] Output: %s (%zu bytes = 0x%zX)\n", out_path, out_size, out_size);
     printf("[+] New EP RVA = 0x%lX (was 0x%llX)\n",
-           (unsigned long)nt->OptionalHeader.AddressOfEntryPoint,
+           (unsigned long)OH(AddressOfEntryPoint),
            (unsigned long long)oep_rva);
-    printf("[+] SizeOfImage = 0x%lX\n", (unsigned long)nt->OptionalHeader.SizeOfImage);
-    printf("[+] Sections   = %u (added .lock)\n", nt->FileHeader.NumberOfSections);
+    printf("[+] SizeOfImage = 0x%lX\n", (unsigned long)OH(SizeOfImage));
+    printf("[+] Sections   = %u (added .lock)\n", OH_FILE()->NumberOfSections);
     printf("[+] Password   : %ls\n", sd->password);
     printf("[+] Run        : %s\n", out_path);
 
     free(stub);
+    free(stub_exe);  /* x86 时分配，x64 时为 NULL */
     free(pe);
     free(out);
     return 0;

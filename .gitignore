@@ -98,6 +98,7 @@ build-linux/
 *.log
 temp*
 
+test/
 # packer 内嵌的预编译 stub（build 产物，不跟踪）
 packer/stubs/
 

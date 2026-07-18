@@ -486,7 +486,7 @@ e2e_test.py：8/8 PASS
 
 ---
 
-## 阶段 7: x86 (PE32) 支持
+## 阶段 7: x86 (PE32) 支持 ✅
 
 > 目标：让 builder + stub 支持 32 位 PE，覆盖 QQ / FreeFileSync / ShutterEncoder 等。
 
@@ -501,22 +501,46 @@ e2e_test.py：8/8 PASS
 - stub_data 字段类型保持 uint64_t（统一），stub 内部按架构截断使用
 - builder 在 PE32 上修改的字段偏移不同（OptionalHeader 32 vs 64）
 
-### 7.2 实施步骤
+### 7.2 核心难点：x86 stub 非 PIC
 
-- [ ] **S7.1** 把 stub.c 中所有 `__readgsqword(0x60)` / `PEBX` / `LDRENT` 等
+x64 stub 是 PIC（RIP-relative），与 ImageBase 无关。x86 mingw32 gcc 生成绝对地址代码
+（如 `mov DWORD PTR [esp], 0x2990`），stub 被加载到与编译时不同的地址时所有绝对引用
+都会错位，访问无效地址（如 dump 显示的 `edx=0x2990`）崩溃。
+
+**解决方案**：builder 预 patch stub 的绝对地址到目标加载位置。
+
+1. `stub.ld` 保留 `.reloc` 节（之前 `/DISCARD/` 丢弃了），让 ld 生成重定位目录
+2. `stub.ld` 修正 VMA：`0x1000` → `0x11000`，避免 RVA 溢出为 `0xFFFF1000`
+   （`--image-base=0x10000` + `. = 0x1000` 让 RVA = 负数溢出）
+3. builder 新增 `extract_stub_reloc_info()`：从 `stub_x86.exe` 读 `.reloc` 节
+4. builder 新增 `patch_stub_relocations()`：遍历 reloc 表，对 `.lock` 范围内的条目加 delta：
+   `delta = (target_image_base + target_lock_rva) - (stub_image_base + stub_lock_rva)`
+   - `IMAGE_REL_BASED_HIGHLOW` (3)：x86 32 位绝对地址
+   - `IMAGE_REL_BASED_DIR64` (10)：x64 64 位绝对地址
+5. x86 PE 强制禁用 ASLR（预 patch 只在固定 ImageBase 下有效）
+
+### 7.3 实施步骤
+
+- [x] **S7.1** 把 stub.c 中所有 `__readgsqword(0x60)` / `PEBX` / `LDRENT` 等
       x64 专用代码用 `#ifdef WINLOCK_X64` / `WINLOCK_X86` 分开
-- [ ] **S7.2** 写 `stub_x86.ld` 链接脚本（同 stub.ld，image-base 改 0x10000）
-- [ ] **S7.3** 在 stub.c 内 `apply_relocations` 增加 HIGHLOW 类型处理
-- [ ] **S7.4** stub_entry / stub_tls_callback 的"跳 OEP"按架构分开
-- [ ] **S7.5** Makefile 增加 `stub_x86.bin` 目标
-- [ ] **S7.6** builder 检测 Machine，按架构选 stub.bin
-- [ ] **S7.7** builder 处理 PE32 OptionalHeader（32 位字段：ImageBase 是 DWORD）
-- [ ] **S7.8** 测试样本：找 1-2 个 x86 PE 加壳并运行
+- [x] **S7.2** stub.ld 增加 `.reloc` 节定义（之前 `/DISCARD/` 丢弃）
+- [x] **S7.3** 在 stub.c 内 `apply_relocations` 增加 HIGHLOW 类型处理
+- [x] **S7.4** stub_entry / stub_tls_callback 的"跳 OEP"按架构分开
+- [x] **S7.5** Makefile 增加 `stub_x86.bin` 目标 + `check-x86-toolchain` 前置检查
+- [x] **S7.6** builder 检测 Machine，按架构选 stub.bin
+- [x] **S7.7** builder 处理 PE32 OptionalHeader（双架构宏 `OH()` / `OH_U64()`）
+- [x] **S7.8** builder 实现 `extract_stub_reloc_info()` + `patch_stub_relocations()`
+- [x] **S7.9** x86 PE 强制禁用 ASLR
+- [x] **S7.10** 测试样本：
+  - `helloguix86.exe` (VS2026 x86，无 TLS) - 密码模式 ✅
+  - `hellox86.exe` (mingw32 x86 + TLS callbacks) - 密码模式 ✅
+  - `hellogui.exe` (x64) - 回归测试 ✅
 
 ---
 
-## 阶段 8: 文档更新
+## 阶段 8: 文档更新 ✅
 
-- [ ] **S8.1** 更新 README.md：v3 架构、ASLR/TLS/CFG 处理、CLI 用法
-- [ ] **S8.2** 更新 PLAN.md（本文档）：阶段 6/7 完成情况
-- [ ] **S8.3** 整理 tools/ 下的诊断脚本（pe_diag.py 等保留，废弃的删掉）
+- [x] **S8.1** 更新 README.md：v3 架构、x86/x64 双架构、ASLR/TLS/CFG 处理、CLI 用法
+- [x] **S8.2** 更新 PLAN.md（本文档）：阶段 6/7 完成情况
+- [x] **S8.3** Makefile 增加 `check-x86-toolchain` 友好错误，工具链路径可覆盖
+- [ ] **S8.4** 整理 tools/ 下的诊断脚本（pe_diag.py 等保留，废弃的删掉）—— 待办
