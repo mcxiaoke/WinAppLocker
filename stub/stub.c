@@ -590,6 +590,47 @@ static int decrypt_text_and_reloc(void) {
 }
 
 /* ============================================================
+ * 弹密码框（stub_entry / stub_tls_callback 共用）
+ *   返回：1 成功；0 失败（Cancel 或超限时内部已 ExitProcess，不会真正返回 0）
+ * ============================================================ */
+__attribute__((section(".lock.text"), used, noinline))
+static int prompt_password(void) {
+    HMODULE u32 = fn.LoadLibraryA(STR_USER32_A);
+    if (!u32) return 0;
+    fn.DialogBoxIndirectParamW = (FnDialogBoxIndirectParamW)
+        fn.GetProcAddress(u32, STR_FN_DLGBOXINDIRECTPARAMW);
+    fn.EndDialog          = (FnEndDialog)
+        fn.GetProcAddress(u32, STR_FN_ENDDIALOG);
+    fn.GetDlgItemTextW    = (FnGetDlgItemTextW)
+        fn.GetProcAddress(u32, STR_FN_GETDLGITEMTEXTW);
+    fn.MessageBoxW        = (FnMessageBoxW)
+        fn.GetProcAddress(u32, STR_FN_MESSAGEBOXW);
+    if (!fn.DialogBoxIndirectParamW || !fn.EndDialog
+        || !fn.GetDlgItemTextW || !fn.MessageBoxW)
+        return 0;
+
+    uint8_t dlg_buf[1024];
+    size_t  dlg_size = build_dialog(dlg_buf);
+    (void)dlg_size;
+
+    INT_PTR r = 0;
+    uint16_t retries = 0;
+    uint16_t max_retries = stub_data.max_retries;
+    if (max_retries == 0) max_retries = STUB_DEFAULT_MAX_RETRIES;
+
+    do {
+        r = fn.DialogBoxIndirectParamW(
+            NULL, (LPCDLGTEMPLATEW)dlg_buf, NULL, dlg_proc, 0);
+        if (r == 1) return 1;        /* 成功 */
+        if (r == 0) fn.ExitProcess(1); /* Cancel */
+        retries++;
+    } while (retries < max_retries);
+
+    fn.ExitProcess(2);  /* 超过最大重试次数 */
+    return 0;  /* never reach */
+}
+
+/* ============================================================
  * stub 入口
  *   链接脚本保证 stub_entry 在 .lock 节起始（offset 0）
  *   builder 设置 AddressOfEntryPoint = .lock_RVA + 0
@@ -614,7 +655,7 @@ void stub_entry(void) {
         || !fn.VirtualProtect || !fn.ExitProcess)
         goto fail;
 
-    /* TLS 代理模式：解密已在 stub_tls_callback 完成，直接跳 OEP */
+    /* TLS 代理模式：解密 + 密码校验已在 stub_tls_callback 完成，直接跳 OEP */
     if (stub_data.flags & STUB_FLAG_TLS_PROXY) {
         PEBX* peb = WINLOCK_PEB();
         uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
@@ -626,60 +667,17 @@ void stub_entry(void) {
     /* 3. 密码校验
      *    - 测试模式（flags & STUB_FLAG_TEST_MODE）：跳过弹框，
      *      直接用硬编码 L"test123" 走 verify_password，验证 v2 hash 路径
-     *    - 正常模式：加载 user32，弹 DialogBox 让用户输入 */
-    int pwd_ok = 0;
+     *    - 正常模式：弹 DialogBox 让用户输入 */
     if (stub_data.flags & STUB_FLAG_TEST_MODE) {
-        /* 测试模式：不加载 user32，直接用硬编码密码 */
-        pwd_ok = verify_password(STR_TEST_PWD);
+        if (!verify_password(STR_TEST_PWD)) goto fail;
     } else {
-        /* 正常模式：加载 user32 并弹对话框 */
-        HMODULE u32 = fn.LoadLibraryA(STR_USER32_A);
-        if (!u32) goto fail;
-        fn.DialogBoxIndirectParamW = (FnDialogBoxIndirectParamW)
-            fn.GetProcAddress(u32, STR_FN_DLGBOXINDIRECTPARAMW);
-        fn.EndDialog          = (FnEndDialog)
-            fn.GetProcAddress(u32, STR_FN_ENDDIALOG);
-        fn.GetDlgItemTextW    = (FnGetDlgItemTextW)
-            fn.GetProcAddress(u32, STR_FN_GETDLGITEMTEXTW);
-        fn.MessageBoxW        = (FnMessageBoxW)
-            fn.GetProcAddress(u32, STR_FN_MESSAGEBOXW);
-        if (!fn.DialogBoxIndirectParamW || !fn.EndDialog
-            || !fn.GetDlgItemTextW || !fn.MessageBoxW)
-            goto fail;
-
-        /* 4. 在栈上构建对话框模板并显示，密码错误重试 */
-        uint8_t dlg_buf[1024];
-        size_t  dlg_size = build_dialog(dlg_buf);
-        (void)dlg_size;
-
-        INT_PTR r = 0;
-        uint16_t retries = 0;
-        uint16_t max_retries = stub_data.max_retries;
-        if (max_retries == 0) max_retries = STUB_DEFAULT_MAX_RETRIES;
-
-        do {
-            r = fn.DialogBoxIndirectParamW(
-                NULL, (LPCDLGTEMPLATEW)dlg_buf, NULL, dlg_proc, 0);
-            if (r == 1) break;          /* 成功 */
-            if (r == 0) {                /* Cancel */
-                fn.ExitProcess(1);
-            }
-            /* r == 2: 密码错误，dlg_proc 已弹错误框，重试 */
-            retries++;
-        } while (retries < max_retries);
-
-        if (r != 1) {
-            /* 超过最大重试次数 */
-            fn.ExitProcess(2);
-        }
-        pwd_ok = 1;
+        if (!prompt_password()) goto fail;
     }
-    (void)pwd_ok;
 
-    /* 5. 解密 .text 节 + 应用 relocations（如果 ASLR 启用） */
+    /* 4. 解密 .text 节 + 应用 relocations（如果 ASLR 启用） */
     if (!decrypt_text_and_reloc()) goto fail;
 
-    /* 6. 跳原 OEP */
+    /* 5. 跳原 OEP */
     {
         PEBX* peb = WINLOCK_PEB();
         uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
@@ -769,38 +767,7 @@ void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
     if (stub_data.flags & STUB_FLAG_TEST_MODE) {
         if (!verify_password(STR_TEST_PWD)) goto fail;
     } else {
-        HMODULE u32 = fn.LoadLibraryA(STR_USER32_A);
-        if (!u32) goto fail;
-        fn.DialogBoxIndirectParamW = (FnDialogBoxIndirectParamW)
-            fn.GetProcAddress(u32, STR_FN_DLGBOXINDIRECTPARAMW);
-        fn.EndDialog          = (FnEndDialog)
-            fn.GetProcAddress(u32, STR_FN_ENDDIALOG);
-        fn.GetDlgItemTextW    = (FnGetDlgItemTextW)
-            fn.GetProcAddress(u32, STR_FN_GETDLGITEMTEXTW);
-        fn.MessageBoxW        = (FnMessageBoxW)
-            fn.GetProcAddress(u32, STR_FN_MESSAGEBOXW);
-        if (!fn.DialogBoxIndirectParamW || !fn.EndDialog
-            || !fn.GetDlgItemTextW || !fn.MessageBoxW)
-            goto fail;
-
-        uint8_t dlg_buf[1024];
-        size_t  dlg_size = build_dialog(dlg_buf);
-        (void)dlg_size;
-
-        INT_PTR r = 0;
-        uint16_t retries = 0;
-        uint16_t max_retries = stub_data.max_retries;
-        if (max_retries == 0) max_retries = STUB_DEFAULT_MAX_RETRIES;
-
-        do {
-            r = fn.DialogBoxIndirectParamW(
-                NULL, (LPCDLGTEMPLATEW)dlg_buf, NULL, dlg_proc, 0);
-            if (r == 1) break;
-            if (r == 0) fn.ExitProcess(1);
-            retries++;
-        } while (retries < max_retries);
-
-        if (r != 1) fn.ExitProcess(2);
+        if (!prompt_password()) goto fail;
     }
 
     /* 4. 解密 .text + 应用 relocations */

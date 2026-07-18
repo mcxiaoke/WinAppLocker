@@ -424,14 +424,13 @@ static void print_usage(const char* prog) {
     printf("\n");
     printf("Usage:\n");
     printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t]\n", prog);
-    printf("  %s <input.exe> <output.exe> [password] [--test]   (legacy)\n", prog);
     printf("\n");
     printf("Options:\n");
-    printf("  -i, --input <file>    Input PE EXE (x64)\n");
-    printf("  -o, --output <file>   Output path (default: <dir>/<base>_locked.exe)\n");
+    printf("  -i, --input <file>    Input PE EXE (x86 or x64)\n");
+    printf("  -o, --output <file>   Output path (default: <input_dir>/<base>_locked.exe)\n");
     printf("  -p, --password <pwd>  Password (default: %ls)\n", WINLOCK_DEFAULT_PASSWORD);
     printf("  -t, --test            Test mode: stub uses hardcoded 'test123', no dialog\n");
-    printf("                        (overrides -p; output defaults to source dir)\n");
+    printf("                        (overrides -p)\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -441,59 +440,34 @@ int main(int argc, char* argv[]) {
     const char* pwd_arg = NULL;
     int test_mode = 0;
 
-    /* 检测是否带 '-' 参数（新式语法）*/
-    int has_new_style = 0;
+    /* 参数解析：只支持 -i/-o/-p/-t/-h，不再支持位置参数 */
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-' && argv[i][1] != 0) {
-            has_new_style = 1;
-            break;
-        }
-    }
-
-    if (has_new_style) {
-        /* 新式参数：-i/-o/-p/-t */
-        for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
-                if (i + 1 >= argc) { printf("[-] -i requires argument\n"); return 1; }
-                in_path = argv[++i];
-            } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
-                if (i + 1 >= argc) { printf("[-] -o requires argument\n"); return 1; }
-                out_path = argv[++i];
-            } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
-                if (i + 1 >= argc) { printf("[-] -p requires argument\n"); return 1; }
-                pwd_arg = argv[++i];
-            } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
-                test_mode = 1;
-            } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-                print_usage(argv[0]);
-                return 0;
-            } else {
-                printf("[-] Unknown option: %s\n", argv[i]);
-                print_usage(argv[0]);
-                return 1;
-            }
-        }
-        if (!in_path) {
+        if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
+            if (i + 1 >= argc) { printf("[-] -i requires argument\n"); return 1; }
+            in_path = argv[++i];
+        } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+            if (i + 1 >= argc) { printf("[-] -o requires argument\n"); return 1; }
+            out_path = argv[++i];
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
+            if (i + 1 >= argc) { printf("[-] -p requires argument\n"); return 1; }
+            pwd_arg = argv[++i];
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
+            test_mode = 1;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            printf("[-] Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
-    } else {
-        /* 旧式位置参数（向后兼容） */
-        const char* positional[3] = {NULL, NULL, NULL};
-        int npos = 0;
-        for (int i = 1; i < argc; i++) {
-            if (npos < 3) positional[npos++] = argv[i];
-        }
-        if (npos < 2) {
-            print_usage(argv[0]);
-            return 1;
-        }
-        in_path  = positional[0];
-        out_path = positional[1];
-        if (npos >= 3) pwd_arg = positional[2];
+    }
+    if (!in_path) {
+        print_usage(argv[0]);
+        return 1;
     }
 
-    /* 默认输出路径：<dir>/<base>_locked.exe（确保带依赖的 exe 在源目录可运行）*/
+    /* 默认输出路径：<input_dir>/<base>_locked.exe（确保带依赖的 exe 在源目录可运行）*/
     char auto_out_path[1024];
     if (!out_path) {
         make_default_output_path(in_path, auto_out_path, sizeof(auto_out_path));

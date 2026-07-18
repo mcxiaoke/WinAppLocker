@@ -1,0 +1,4 @@
+sxe -c "kn 30; .ecxr; kn 30; qd" av
+sxe -c "kn 30; qd" ch
+sxe -c "kn 30; qd" 0xC0000005
+g
