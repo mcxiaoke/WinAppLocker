@@ -423,7 +423,7 @@ static void print_usage(const char* prog) {
     printf("WinLock v2 - PE Password Gate Packer\n");
     printf("\n");
     printf("Usage:\n");
-    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t]\n", prog);
+    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t] [-d]\n", prog);
     printf("\n");
     printf("Options:\n");
     printf("  -i, --input <file>    Input PE EXE (x86 or x64)\n");
@@ -431,6 +431,8 @@ static void print_usage(const char* prog) {
     printf("  -p, --password <pwd>  Password (default: %ls)\n", WINLOCK_DEFAULT_PASSWORD);
     printf("  -t, --test            Test mode: stub uses hardcoded 'test123', no dialog\n");
     printf("                        (overrides -p)\n");
+    printf("  -d, --antidebug       Enable PEB anti-debug (default OFF for dev)\n");
+    printf("                        Checks BeingDebugged / NtGlobalFlag / KdDebuggerEnabled\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -439,8 +441,9 @@ int main(int argc, char* argv[]) {
     const char* out_path = NULL;
     const char* pwd_arg = NULL;
     int test_mode = 0;
+    int antidebug = 0;
 
-    /* 参数解析：只支持 -i/-o/-p/-t/-h，不再支持位置参数 */
+    /* 参数解析：只支持 -i/-o/-p/-t/-d/-h，不再支持位置参数 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
             if (i + 1 >= argc) { printf("[-] -i requires argument\n"); return 1; }
@@ -453,6 +456,8 @@ int main(int argc, char* argv[]) {
             pwd_arg = argv[++i];
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
             test_mode = 1;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--antidebug") == 0) {
+            antidebug = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -900,6 +905,9 @@ int main(int argc, char* argv[]) {
          *      目标 PE 的 ASLR 在 step 15 被强制禁用。 */
         sd->flags    |= STUB_FLAG_ASLR;
     }
+    if (antidebug) {
+        sd->flags    |= STUB_FLAG_ANTIDEBUG;  /* P1-2: PEB 反调试（默认关闭）*/
+    }
     sd->max_retries   = STUB_DEFAULT_MAX_RETRIES;
     sd->reserved16    = 0;
     sd->oep_rva       = oep_rva;
@@ -926,6 +934,57 @@ int main(int argc, char* argv[]) {
     /* TLS_PROXY 模式：保存原 callbacks 数组 VA，stub_tls_callback 调用它们 */
     sd->orig_tls_callbacks = tls_info.has_callbacks
         ? tls_info.orig_callbacks_array_va : 0;
+    /* v4 新增：读取 LOAD_CONFIG.SecurityCookie VA 并转换为 RVA
+     *   - SecurityCookie 在 PE 文件里存的是基于 preferred ImageBase 的绝对地址
+     *   - stub 运行时 img_base (PEB.ImageBaseAddress) 可能 != preferred，
+     *     所以存 RVA，stub 用 img_base + rva 计算 cookie 实际位置
+     *   - 这样 ASLR 模式也能正确工作（cookie 在 .data，由 OS loader patch，
+     *     但 stub 用 img_base + rva 计算的地址就是 cookie 的实际位置）
+     *   - SecurityCookie 字段在 LOAD_CONFIG 结构中的偏移：
+     *       PE32+ (64 位): 0x58 (ULONGLONG)
+     *       PE32  (32 位): 0x40 (DWORD)
+     *     （winnt.h 的 IMAGE_LOAD_CONFIG_DIRECTORY32/64）
+     *   - lc->Size 必须 >= 该偏移 + 字段大小，否则无 SecurityCookie 字段
+     *   - 借鉴 AlushPacker：仅当 cookie 为 MSVC 默认值时 stub 才覆盖 */
+    {
+        IMAGE_DATA_DIRECTORY* lc_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG);
+        sd->security_cookie_rva = 0;
+        if (lc_dir->VirtualAddress != 0 && lc_dir->Size != 0) {
+            DWORD lc_raw = rva_to_raw(sec, n_sec, lc_dir->VirtualAddress);
+            if (lc_raw != 0) {
+                uint8_t* lc = pe + lc_raw;
+                DWORD lc_size = *(DWORD*)lc;  /* Size 字段（首 4 字节）*/
+                uint64_t cookie_va = 0;
+                int have_cookie = 0;
+                if (g_is_x64) {
+                    /* IMAGE_LOAD_CONFIG_DIRECTORY64.SecurityCookie @ 0x58, 8 字节 */
+                    if (lc_size >= 0x60) {
+                        cookie_va = *(uint64_t*)(lc + 0x58);
+                        have_cookie = 1;
+                    }
+                } else {
+                    /* IMAGE_LOAD_CONFIG_DIRECTORY32.SecurityCookie @ 0x40, 4 字节 */
+                    if (lc_size >= 0x44) {
+                        cookie_va = *(uint32_t*)(lc + 0x40);
+                        have_cookie = 1;
+                    }
+                }
+                if (have_cookie && cookie_va != 0) {
+                    uint64_t img_base = OH_IMG_BASE();
+                    if (cookie_va >= img_base) {
+                        sd->security_cookie_rva = cookie_va - img_base;
+                        printf("[*] SecurityCookie VA=0x%llX RVA=0x%llX\n",
+                               (unsigned long long)cookie_va,
+                               (unsigned long long)sd->security_cookie_rva);
+                    } else {
+                        printf("[!] SecurityCookie VA=0x%llX < ImageBase=0x%llX, skip\n",
+                               (unsigned long long)cookie_va,
+                               (unsigned long long)img_base);
+                    }
+                }
+            }
+        }
+    }
     /* 计算 checksum（XOR 所有 8 字节字段） */
     uint64_t* p = (uint64_t*)sd;
     uint64_t cs = 0;
@@ -934,12 +993,13 @@ int main(int argc, char* argv[]) {
     for (qi = 0; qi < sd_qwords; qi++) cs ^= p[qi];
     sd->checksum = cs;
     printf("[*] Password set to: '%ls' (stored as SHA-256 hash)\n", sd->password);
-    printf("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d)\n",
+    printf("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d ANTIDEBUG=%d)\n",
            sd->flags,
            (sd->flags & STUB_FLAG_HASH)        ? 1 : 0,
            (sd->flags & STUB_FLAG_TEST_MODE)  ? 1 : 0,
            (sd->flags & STUB_FLAG_TLS_PROXY)  ? 1 : 0,
-           (sd->flags & STUB_FLAG_ASLR)        ? 1 : 0);
+           (sd->flags & STUB_FLAG_ASLR)        ? 1 : 0,
+           (sd->flags & STUB_FLAG_ANTIDEBUG)  ? 1 : 0);
 
     /* 9. 计算新 .lock 节位置（保留 overlay）
      *   .lock 节内容 = stub.bin + (TLS_PROXY 模式时追加 callbacks 数组)

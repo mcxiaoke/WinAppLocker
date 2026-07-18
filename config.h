@@ -59,6 +59,22 @@
 /* ---- 控件 ID ---- */
 #define IDC_PWD_EDIT  1001
 
+/* ---- API / 模块名 DJB15 hash 常量（P1-1，借鉴 peldr） ----
+ * 算法：h = 1993; for c in s: c = tolower(c); h = ((h<<4) - h) + c; h &= 0xFFFFFFFF
+ * 大小写不敏感；用 tools/gen_api_hash.py 重新生成
+ * 目的：避免在 .lock.rdata 中存明文 API 名（防 strings 抓取） */
+#define WINLOCK_HASH_SEED 1993U
+#define HASH_GETPROCADDRESS          0xAACF4941U
+#define HASH_LOADLIBRARYA            0x124FBF05U
+#define HASH_VIRTUALPROTECT           0x35051E8DU
+#define HASH_EXITPROCESS              0x15AC1C58U
+#define HASH_DIALOGBOXINDIRECTPARAMW  0x07C854A2U
+#define HASH_ENDDIALOG                0xDB84676AU
+#define HASH_GETDLGITEMTEXTW          0x08517DF5U
+#define HASH_MESSAGEBOXW              0x000F09EAU
+#define HASH_MOD_KERNEL32_DLL         0x6022D7CBU
+#define HASH_MOD_USER32_DLL           0x20180C79U
+
 /* ---- stub_data 结构 v2（builder 写入 / stub 读取） ----
  * 注意：所有 RVA 字段都是相对虚拟地址，stub 运行时加 PEB.ImageBaseAddress
  *
@@ -70,6 +86,12 @@
  *   - checksum: 简单 XOR 校验和（防 stub_data 被篡改）
  *   - password[] 保留（兼容 v1，flags.bit0=1 时忽略）
  *
+ * v4 新增：
+ *   - security_cookie_rva: LOAD_CONFIG.SecurityCookie 的 RVA（0 = 无）
+ *     stub 在解密 .text 后、跳 OEP 前用它初始化 cookie 为随机值
+ *     （借鉴 AlushPacker 仅当 cookie 为默认值时才覆盖，
+ *      借鉴 peldr 用 KUSER_SHARED_DATA.InterruptTime 作熵源，无 API 依赖）
+ *
  * flags 位定义：
  *   bit0: 1=用 hash 校验, 0=用明文 password
  *   bit1: 1=测试模式（跳过弹框，直接用硬编码 L"test123" 走 verify_password）
@@ -78,8 +100,11 @@
  *         builder 检测到原 PE 有 TLS callbacks 时启用
  *   bit3: 1=ASLR 启用（stub 解密 .text 后需重新应用 relocations）
  *         builder 保留 DYNAMIC_BASE 时启用
+ *   bit4: 1=启用 PEB 反调试（P1-2）
+ *         builder -d 时设置；默认关闭，避免开发调试受阻
+ *         检查 PEB.BeingDebugged / NtGlobalFlag & 0x70 / KdDebuggerEnabled
  */
-#define STUB_DATA_VERSION 3
+#define STUB_DATA_VERSION 4
 #define STUB_DEFAULT_MAX_RETRIES 3
 
 /* flags 位掩码 */
@@ -87,11 +112,12 @@
 #define STUB_FLAG_TEST_MODE    0x0002  /* 测试模式：跳过弹框，用硬编码密码 */
 #define STUB_FLAG_TLS_PROXY    0x0004  /* TLS callback 代理模式 */
 #define STUB_FLAG_ASLR         0x0008  /* ASLR 启用，需重新应用 relocations */
+#define STUB_FLAG_ANTIDEBUG    0x0010  /* 启用 PEB 反调试（builder -d）*/
 
 #pragma pack(push, 8)
 typedef struct {
     uint64_t magic;            /* STUB_DATA_MAGIC，builder 据此定位         */
-    uint16_t version;         /* 结构版本号 (v3 = 3)                        */
+    uint16_t version;         /* 结构版本号 (v4 = 4)                        */
     uint16_t flags;           /* bit0: hash; bit1: test; bit2: tls proxy; bit3: aslr */
     uint16_t max_retries;     /* 密码错误最大重试次数                       */
     uint16_t reserved16;
@@ -110,6 +136,11 @@ typedef struct {
     uint32_t reloc_size;     /* .reloc 节 Size                              */
     uint32_t reserved32;     /* 对齐填充                                    */
     uint64_t orig_tls_callbacks; /* 原 PE TLS callbacks 数组 VA（0 = 无）  */
+    /* v4 新增：SecurityCookie 初始化（P0-1）
+     *   - builder 读取 LOAD_CONFIG.SecurityCookie VA 并减去 ImageBase 得到 RVA
+     *   - stub 在解密 .text 后用 img_base + rva 计算 cookie 地址
+     *   - 0 表示无 LOAD_CONFIG 或无 SecurityCookie 字段，跳过初始化 */
+    uint64_t security_cookie_rva; /* LOAD_CONFIG.SecurityCookie 的 RVA（0 = 无）*/
     uint64_t checksum;       /* XOR 所有 64-bit 字段（防篡改）             */
 } stub_data_t;
 #pragma pack(pop)

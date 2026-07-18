@@ -64,6 +64,7 @@ builder.exe -i <input.exe>                    # 用默认密码 hello123
 builder.exe -i <input.exe> -p <password>      # 指定密码
 builder.exe -i <input.exe> -o <output.exe>    # 指定输出路径
 builder.exe -i <input.exe> -t                 # 测试模式（见下）
+builder.exe -i <input.exe> -d                 # 启用 PEB 反调试（见下）
 ```
 
 | 选项 | 说明 |
@@ -72,6 +73,7 @@ builder.exe -i <input.exe> -t                 # 测试模式（见下）
 | `-o, --output <file>`    | 输出路径，默认 `<input_dir>/<base>_locked.exe` |
 | `-p, --password <pwd>`  | 密码，默认 `hello123` |
 | `-t, --test`            | 测试模式（固定密码 `test123`，不弹框） |
+| `-d, --antidebug`       | 启用 PEB 反调试（默认关闭，见下） |
 | `-h, --help`            | 显示帮助 |
 
 builder 自动检测输入 PE 的架构（`IMAGE_FILE_MACHINE_AMD64` / `IMAGE_FILE_MACHINE_I386`），
@@ -87,6 +89,24 @@ stub 解密 + 跳 OEP 的完整链路。
 builder.exe -i hellocli.exe -t
 hellocli_locked.exe          # 直接输出 "Hello World!"，无密码框
 ```
+
+### 反调试 `-d`
+
+启用 PEB 反调试（**默认关闭**，方便开发与调试）。stub 在解析完 API 后立即
+检查三项：`PEB.BeingDebugged`、`NtGlobalFlag & 0x70`、
+`KUSER_SHARED_DATA.KdDebuggerEnabled`（系统级，userland 改不了）。检测到
+调试器立即 `ExitProcess(0)`，不让调试器有机会 dump IAT 或单步 stub。
+
+```powershell
+builder.exe -i release.exe -d           # 发布版，加反调试
+builder.exe -i dev_test.exe             # 开发版，不加 -d（可用 gdb 调试）
+```
+
+**何时该加 `-d`**：发布给最终用户的加壳产物。
+**何时不该加 `-d`**：开发调试、CI 自动化、需要 gdb/windbg 排错时。
+
+> ⚠️ **若系统启用了内核调试**（`bcdedit /set debug on`），`KdDebuggerEnabled`
+> 恒为 1，加 `-d` 的加壳样本**会全部启动失败**。开发机请保持内核调试关闭。
 
 ### 默认输出到源目录
 
