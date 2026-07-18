@@ -46,6 +46,16 @@
  */
 #define STUB_ENTRY_MAGIC 0x4254535952544E45ULL
 
+/* ---- stub_tls_callback 入口魔数（builder 搜索此值定位 stub_tls_callback）
+ * "TLSCALLB" -> 0x54 0x4C 0x53 0x43 0x41 0x4C 0x4C 0x42
+ * 小端 uint64: 0x424C4C4143534C54
+ *
+ * 用途：TLS_PROXY 模式下，builder 需要知道 stub_tls_callback 在 stub.bin
+ *      中的偏移，以构造新 TLS callbacks 数组 [stub_tls_callback_VA, ...]。
+ *      stub.c 在 stub_tls_callback 函数前放此 magic，builder 搜索定位。
+ */
+#define STUB_TLS_CB_MAGIC 0x424C4C4143534C54ULL
+
 /* ---- 控件 ID ---- */
 #define IDC_PWD_EDIT  1001
 
@@ -64,30 +74,42 @@
  *   bit0: 1=用 hash 校验, 0=用明文 password
  *   bit1: 1=测试模式（跳过弹框，直接用硬编码 L"test123" 走 verify_password）
  *         用于 CI/自动化测试，验证 stub 完整流程无需 GUI 自动化
+ *   bit2: 1=TLS callback 代理模式（stub_entry 跳过解密，由 stub_tls_callback 完成）
+ *         builder 检测到原 PE 有 TLS callbacks 时启用
+ *   bit3: 1=ASLR 启用（stub 解密 .text 后需重新应用 relocations）
+ *         builder 保留 DYNAMIC_BASE 时启用
  */
-#define STUB_DATA_VERSION 2
+#define STUB_DATA_VERSION 3
 #define STUB_DEFAULT_MAX_RETRIES 3
 
 /* flags 位掩码 */
-#define STUB_FLAG_HASH      0x0001  /* 用 SHA-256 hash 校验（否则明文 password） */
-#define STUB_FLAG_TEST_MODE 0x0002  /* 测试模式：跳过弹框，用硬编码密码 */
+#define STUB_FLAG_HASH         0x0001  /* 用 SHA-256 hash 校验（否则明文 password） */
+#define STUB_FLAG_TEST_MODE    0x0002  /* 测试模式：跳过弹框，用硬编码密码 */
+#define STUB_FLAG_TLS_PROXY    0x0004  /* TLS callback 代理模式 */
+#define STUB_FLAG_ASLR         0x0008  /* ASLR 启用，需重新应用 relocations */
 
 #pragma pack(push, 8)
 typedef struct {
     uint64_t magic;            /* STUB_DATA_MAGIC，builder 据此定位         */
-    uint16_t version;         /* 结构版本号 (v2 = 2)                        */
-    uint16_t flags;           /* bit0: 1=用 hash 校验, 0=用明文 password    */
+    uint16_t version;         /* 结构版本号 (v3 = 3)                        */
+    uint16_t flags;           /* bit0: hash; bit1: test; bit2: tls proxy; bit3: aslr */
     uint16_t max_retries;     /* 密码错误最大重试次数                       */
     uint16_t reserved16;
     uint64_t oep_rva;         /* 原 AddressOfEntryPoint                     */
     uint64_t text_rva;        /* 加密的第一个可执行节 RVA                   */
-    uint64_t text_size;       /* 加密大小（= text_raw_size）                */
+    uint64_t text_size;       /* 加密大小（= min(VSize,RawSize) & ~7）      */
     uint32_t text_raw_size;   /* 该节 SizeOfRawData                         */
     uint32_t text_protect;    /* 该节原保护（PAGE_EXECUTE_READ 等）         */
     uint32_t xtea_key[4];    /* XTEA 密钥（随机生成）                       */
     uint8_t  salt[16];       /* PBKDF2 / SHA-256 salt（随机生成）           */
     uint8_t  pwd_hash[32];   /* SHA-256(password_utf8 + salt)              */
     wchar_t  password[64];   /* 明文密码（v1 兼容，flags.bit0=0 时使用）   */
+    /* v3 新增：重定位与 TLS 代理 */
+    uint64_t image_base;     /* 原 PE OptionalHeader.ImageBase（preferred）*/
+    uint64_t reloc_rva;      /* .reloc 节 RVA（0 = 无重定位表）            */
+    uint32_t reloc_size;     /* .reloc 节 Size                              */
+    uint32_t reserved32;     /* 对齐填充                                    */
+    uint64_t orig_tls_callbacks; /* 原 PE TLS callbacks 数组 VA（0 = 无）  */
     uint64_t checksum;       /* XOR 所有 64-bit 字段（防篡改）             */
 } stub_data_t;
 #pragma pack(pop)

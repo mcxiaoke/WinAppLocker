@@ -66,6 +66,15 @@ typedef struct {
     LDRCNT *Ldr;
 } PEBX;
 
+/* PEB 访问：x64 用 gs:[0x60]，x86 用 fs:[0x30]。
+ * PVOID 自动按架构变大小（8B/4B），PEBX/LDRENT/USTR 用 PVOID/LIST_ENTRY，
+ * 默认对齐与 Windows 内核结构一致，x86/x64 都能正确解析。 */
+#ifdef _WIN64
+#define WINLOCK_PEB()  ((PEBX*)__readgsqword(0x60))
+#else
+#define WINLOCK_PEB()  ((PEBX*)(uintptr_t)__readfsdword(0x30))
+#endif
+
 /* 函数指针类型 */
 typedef HMODULE  (WINAPI *FnLoadLibraryA)(LPCSTR);
 typedef FARPROC  (WINAPI *FnGetProcAddress)(HMODULE, LPCSTR);
@@ -99,6 +108,11 @@ volatile stub_data_t stub_data = {
     .salt          = { 0 },
     .pwd_hash      = { 0 },
     .password      = WINLOCK_DEFAULT_PASSWORD,
+    .image_base    = 0,
+    .reloc_rva     = 0,
+    .reloc_size    = 0,
+    .reserved32    = 0,
+    .orig_tls_callbacks = 0,
     .checksum      = 0,
 };
 
@@ -209,7 +223,7 @@ static int astr_eq(const char* a, const char* b) {
 /* PEB walk：按名字查找已加载模块基址 */
 __attribute__((section(".lock.text"), used, noinline))
 static PVOID find_module(const wchar_t* name) {
-    PEBX*   peb = (PEBX*)__readgsqword(0x60);
+    PEBX*   peb = WINLOCK_PEB();
     LDRCNT* ldr = peb->Ldr;
     LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
     LIST_ENTRY* curr = head->Flink;
@@ -434,9 +448,156 @@ static INT_PTR WINAPI dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam
 }
 
 /* ============================================================
+ * 重定位处理
+ *   stub 解密 .text 后必须重新应用 relocations：
+ *   - loader 加载时 .text 是密文，loader 应用 relocations 到密文上（无意义）
+ *   - stub 解密恢复明文（ImageBase 基准），但实际加载在随机基址
+ *   - 必须遍历 .reloc 表，把绝对地址引用从 ImageBase patch 到实际基址
+ *
+ *   参考：PE-Shield stub/relocation.c, AlushPacker loader.c:647
+ * ============================================================ */
+
+/* 重定位类型（IMAGE_REL_BASED_*） */
+#define WINLOCK_RELOC_ABSOLUTE 0
+#define WINLOCK_RELOC_HIGH     1
+#define WINLOCK_RELOC_LOW      2
+#define WINLOCK_RELOC_HIGHLOW  3
+#define WINLOCK_RELOC_DIR64    10
+
+/* 应用重定位表
+ *   img_base: 实际加载基址（PEB.ImageBaseAddress）
+ *
+ *   关键：只 patch .text 范围内的条目！
+ *   原因：loader 加载时 .text 是密文，loader 对密文应用了 relocations
+ *         （修改 .text 里的绝对地址引用以匹配实际基址）。stub 解密 .text
+ *         时用文件原字节覆盖，冲掉了 loader 的 reloc 修改 → .text 里绝对
+ *         地址回到 preferred ImageBase 基准 → 必须重新应用 delta。
+ *         但 .rdata/.data 等非加密节 loader 已经正确 reloc，stub 没碰它们，
+ *         若再次应用 delta 会"双重重定位"→ 数据损坏。
+ *
+ *   返回：1 成功（或无需重定位），0 失败 */
+__attribute__((section(".lock.text"), used, noinline))
+static int apply_relocations(uint8_t* img_base) {
+    /* 如果 builder 没填 reloc 信息，或没启用 ASLR，跳过 */
+    if (!(stub_data.flags & STUB_FLAG_ASLR)) return 1;
+    if (stub_data.reloc_rva == 0 || stub_data.reloc_size == 0) {
+        /* 启用了 ASLR 但无重定位表 → 无法修正绝对地址，失败 */
+        return 0;
+    }
+
+    /* delta = 实际基址 - preferred ImageBase */
+    int64_t delta = (int64_t)((uintptr_t)img_base - (uintptr_t)stub_data.image_base);
+    if (delta == 0) return 1;  /* 加载在 preferred 基址，无需重定位 */
+
+    /* .text 节的 RVA 范围（stub 只 patch 这个范围） */
+    uint32_t text_rva = (uint32_t)stub_data.text_rva;
+    uint32_t text_end = text_rva + (uint32_t)stub_data.text_size;
+
+    uint8_t* reloc_start = img_base + stub_data.reloc_rva;
+    uint8_t* reloc_end   = reloc_start + stub_data.reloc_size;
+    IMAGE_BASE_RELOCATION* reloc = (IMAGE_BASE_RELOCATION*)reloc_start;
+
+    while ((uint8_t*)reloc < reloc_end && reloc->SizeOfBlock > 0) {
+        DWORD block_size = reloc->SizeOfBlock;
+        if (block_size < sizeof(IMAGE_BASE_RELOCATION)) break;
+
+        DWORD block_rva = reloc->VirtualAddress;
+        DWORD num_entries = (block_size - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        WORD* entries = (WORD*)(reloc + 1);
+
+        for (DWORD i = 0; i < num_entries; i++) {
+            WORD type = entries[i] >> 12;
+            WORD offset = entries[i] & 0xFFF;
+            DWORD patch_rva = block_rva + offset;
+
+            /* 只 patch .text 范围内的条目。
+             * 跨块边界的整块 RVA 检查：若整块都不在 .text 范围内，跳过；
+             * 单条目检查更精确。 */
+            if (patch_rva < text_rva || patch_rva >= text_end) {
+                continue;  /* loader 已处理，跳过避免双重 reloc */
+            }
+
+            uint8_t* patch_addr = img_base + patch_rva;
+
+            switch (type) {
+                case WINLOCK_RELOC_ABSOLUTE:
+                    break;  /* padding，跳过 */
+                case WINLOCK_RELOC_HIGH: {
+                    /* 高 16 位加 delta 高 16 位（x86 罕见） */
+                    *(uint16_t*)patch_addr += (uint16_t)((uint32_t)delta >> 16);
+                    break;
+                }
+                case WINLOCK_RELOC_LOW: {
+                    /* 低 16 位加 delta 低 16 位 */
+                    *(uint16_t*)patch_addr += (uint16_t)(delta & 0xFFFF);
+                    break;
+                }
+                case WINLOCK_RELOC_HIGHLOW: {
+                    /* 32 位加 delta（x86 主要类型） */
+                    *(uint32_t*)patch_addr += (uint32_t)delta;
+                    break;
+                }
+                case WINLOCK_RELOC_DIR64: {
+                    /* 64 位加 delta（x64 主要类型） */
+                    *(uint64_t*)patch_addr += (uint64_t)delta;
+                    break;
+                }
+                default:
+                    /* 未知类型，跳过（x64 PE 通常只有 ABSOLUTE/DIR64） */
+                    break;
+            }
+        }
+
+        reloc = (IMAGE_BASE_RELOCATION*)((uint8_t*)reloc + block_size);
+    }
+
+    return 1;
+}
+
+/* ============================================================
+ * 解密 .text 节 + 应用 relocations（stub_entry 与 stub_tls_callback 共用）
+ *   返回：1 成功，0 失败
+ * ============================================================ */
+__attribute__((section(".lock.text"), used, noinline))
+static int decrypt_text_and_reloc(void) {
+    PEBX*   peb       = WINLOCK_PEB();
+    uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
+    uint8_t* text_va  = img_base + stub_data.text_rva;
+    DWORD    old_prot = 0;
+
+    /* 1. VirtualProtect 改 RW */
+    if (!fn.VirtualProtect(text_va, (SIZE_T)stub_data.text_size,
+                           PAGE_READWRITE, &old_prot))
+        return 0;
+
+    /* 2. XTEA 解密 .text（恢复明文，ImageBase 基准） */
+    xtea_decrypt_buf(text_va, (size_t)stub_data.text_size,
+                     (const uint32_t*)stub_data.xtea_key);
+
+    /* 3. 重新应用 relocations（如果 ASLR 启用） */
+    if (!apply_relocations(img_base)) {
+        /* ASLR 启用但重定位失败，恢复保护后返回失败 */
+        fn.VirtualProtect(text_va, (SIZE_T)stub_data.text_size,
+                          stub_data.text_protect, &old_prot);
+        return 0;
+    }
+
+    /* 4. 恢复原保护（让 CPU 能执行） */
+    fn.VirtualProtect(text_va, (SIZE_T)stub_data.text_size,
+                     stub_data.text_protect, &old_prot);
+
+    return 1;
+}
+
+/* ============================================================
  * stub 入口
  *   链接脚本保证 stub_entry 在 .lock 节起始（offset 0）
  *   builder 设置 AddressOfEntryPoint = .lock_RVA + 0
+ *
+ *   两种工作模式：
+ *   - 直接模式（默认）：stub_entry 完成密码校验 + 解密 + 跳 OEP
+ *   - TLS 代理模式（flags & STUB_FLAG_TLS_PROXY）：
+ *     stub_entry 跳过解密（已在 stub_tls_callback 完成），只跳 OEP
  * ============================================================ */
 __attribute__((section(".lock.entry"), used, noinline, optimize("O0")))
 void stub_entry(void) {
@@ -452,6 +613,15 @@ void stub_entry(void) {
     if (!fn.GetProcAddress || !fn.LoadLibraryA
         || !fn.VirtualProtect || !fn.ExitProcess)
         goto fail;
+
+    /* TLS 代理模式：解密已在 stub_tls_callback 完成，直接跳 OEP */
+    if (stub_data.flags & STUB_FLAG_TLS_PROXY) {
+        PEBX* peb = WINLOCK_PEB();
+        uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
+        void* oep = img_base + stub_data.oep_rva;
+        ((void(*)())oep)();
+        /* never returns */
+    }
 
     /* 3. 密码校验
      *    - 测试模式（flags & STUB_FLAG_TEST_MODE）：跳过弹框，
@@ -506,31 +676,149 @@ void stub_entry(void) {
     }
     (void)pwd_ok;
 
-    /* 5. 解密 .text 节
-     *    PEB.ImageBaseAddress 是真实加载基址（即使被 ASLR 重定位也正确） */
-    PEBX*   peb       = (PEBX*)__readgsqword(0x60);
-    uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
-    uint8_t* text_va  = img_base + stub_data.text_rva;
-    DWORD    old_prot = 0;
-
-    /* VirtualSize 可能 > RawSize，剩余部分加载时为 0，可直接解密 */
-    if (!fn.VirtualProtect(text_va, (SIZE_T)stub_data.text_size,
-                           PAGE_READWRITE, &old_prot))
-        goto fail;
-
-    xtea_decrypt_buf(text_va, (size_t)stub_data.text_size,
-                     (const uint32_t*)stub_data.xtea_key);
-
-    /* 恢复原保护（让 CPU 能执行） */
-    fn.VirtualProtect(text_va, (SIZE_T)stub_data.text_size,
-                     stub_data.text_protect, &old_prot);
+    /* 5. 解密 .text 节 + 应用 relocations（如果 ASLR 启用） */
+    if (!decrypt_text_and_reloc()) goto fail;
 
     /* 6. 跳原 OEP */
-    void* oep = img_base + stub_data.oep_rva;
-    ((void(*)())oep)();
-    /* never returns */
+    {
+        PEBX* peb = WINLOCK_PEB();
+        uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
+        void* oep = img_base + stub_data.oep_rva;
+        ((void(*)())oep)();
+        /* never returns */
+    }
 
 fail:
     fn.ExitProcess(2);
     while (1) { /* never reach */ }
+}
+
+/* ============================================================
+ * TLS callback 代理
+ *   builder 检测到原 PE 有 TLS callbacks 时启用此模式：
+ *   - builder 在 .lock 节内创建新 TLS directory + callbacks 数组
+ *   - callbacks 数组 = [stub_tls_callback, NULL]
+ *   - DataDirectory[9] 指向新 TLS directory
+ *   - Windows loader 在 EP 之前调用 stub_tls_callback(DLL_PROCESS_ATTACH)
+ *
+ *   stub_tls_callback 流程：
+ *   1. PEB walk 找 kernel32 + 解析函数
+ *   2. 弹密码框（仅 DLL_PROCESS_ATTACH 时）
+ *   3. 解密 .text + 应用 relocations
+ *   4. 调用原 PE 的 TLS callbacks（保存在 stub_data.orig_tls_callbacks）
+ *   5. 返回（loader 继续，最终跳 EP = stub_entry，stub_entry 检测 TLS_PROXY
+ *      直接跳 OEP）
+ *
+ *   注意：TLS callback 必须很快返回？实际上 Windows 允许 TLS callback
+ *   阻塞（弹 MessageBox 是 OK 的）。
+ * ============================================================ */
+
+/* TLS callback 函数类型 */
+typedef void (WINAPI *TLS_CALLBACK)(PVOID, DWORD, PVOID);
+
+/* TLS 回调原因 */
+#define WINLOCK_DLL_PROCESS_ATTACH 1
+#define WINLOCK_DLL_THREAD_ATTACH  2
+#define WINLOCK_DLL_THREAD_DETACH  3
+#define WINLOCK_DLL_PROCESS_DETACH 0
+
+/* stub_tls_callback 状态：确保解密只做一次（DLL_PROCESS_ATTACH） */
+__attribute__((section(".lock.data"), used, aligned(8)))
+static volatile int g_tls_decrypted = 0;
+
+/* stub_tls_callback 的定位魔数：builder 在 stub.bin 中搜索此 8 字节，
+ * 紧随其后的就是 stub_tls_callback 函数入口。
+ *
+ * 放在独立 section .lock.tlscbm 中（const 数据不能与函数同 section），
+ * stub.ld 把 .lock.tlscbm 紧接在 .lock.text 之后、.lock.tlscb 之前。
+ *
+ * 用 16 字节数组（magic + zero pad）：因为 stub.ld 的 SUBALIGN(16) 强制
+ * 每个子节 16 字节对齐，marker 后必然有填充。让 marker 自身占满 16 字节，
+ * function 就紧跟在 marker+16 处（无额外填充），builder 计算 offset = M + 16。 */
+__attribute__((section(".lock.tlscbm"), used, aligned(16)))
+static const uint64_t g_stub_tls_cb_marker[2] = { STUB_TLS_CB_MAGIC, 0 };
+
+/* TLS callback 必须有特定签名，且放在 .lock.tlscb 节（代码节）
+ * Windows loader 通过 IMAGE_TLS_DIRECTORY.AddressOfCallBacks 调用 */
+__attribute__((section(".lock.tlscb"), used, noinline))
+void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
+    (void)hModule;
+    (void)reserved;
+
+    /* 只在 DLL_PROCESS_ATTACH 时执行解密 + 密码校验 */
+    if (reason != WINLOCK_DLL_PROCESS_ATTACH) return;
+
+    /* 避免重复执行（理论上 TLS callbacks 只调一次，保险起见） */
+    if (g_tls_decrypted) return;
+    g_tls_decrypted = 1;
+
+    /* 1. PEB walk 找 kernel32 */
+    PVOID k32 = find_module(STR_KERNEL32);
+    if (!k32) goto fail;
+
+    /* 2. 解析 kernel32 关键函数 */
+    fn.GetProcAddress = (FnGetProcAddress)find_export(k32, STR_FN_GETPROCADDRESS);
+    fn.LoadLibraryA  = (FnLoadLibraryA)   find_export(k32, STR_FN_LOADLIBRARYA);
+    fn.VirtualProtect = (FnVirtualProtect) find_export(k32, STR_FN_VIRTUALPROTECT);
+    fn.ExitProcess   = (FnExitProcess)     find_export(k32, STR_FN_EXITPROCESS);
+    if (!fn.GetProcAddress || !fn.LoadLibraryA
+        || !fn.VirtualProtect || !fn.ExitProcess)
+        goto fail;
+
+    /* 3. 密码校验（测试模式 / 正常模式） */
+    if (stub_data.flags & STUB_FLAG_TEST_MODE) {
+        if (!verify_password(STR_TEST_PWD)) goto fail;
+    } else {
+        HMODULE u32 = fn.LoadLibraryA(STR_USER32_A);
+        if (!u32) goto fail;
+        fn.DialogBoxIndirectParamW = (FnDialogBoxIndirectParamW)
+            fn.GetProcAddress(u32, STR_FN_DLGBOXINDIRECTPARAMW);
+        fn.EndDialog          = (FnEndDialog)
+            fn.GetProcAddress(u32, STR_FN_ENDDIALOG);
+        fn.GetDlgItemTextW    = (FnGetDlgItemTextW)
+            fn.GetProcAddress(u32, STR_FN_GETDLGITEMTEXTW);
+        fn.MessageBoxW        = (FnMessageBoxW)
+            fn.GetProcAddress(u32, STR_FN_MESSAGEBOXW);
+        if (!fn.DialogBoxIndirectParamW || !fn.EndDialog
+            || !fn.GetDlgItemTextW || !fn.MessageBoxW)
+            goto fail;
+
+        uint8_t dlg_buf[1024];
+        size_t  dlg_size = build_dialog(dlg_buf);
+        (void)dlg_size;
+
+        INT_PTR r = 0;
+        uint16_t retries = 0;
+        uint16_t max_retries = stub_data.max_retries;
+        if (max_retries == 0) max_retries = STUB_DEFAULT_MAX_RETRIES;
+
+        do {
+            r = fn.DialogBoxIndirectParamW(
+                NULL, (LPCDLGTEMPLATEW)dlg_buf, NULL, dlg_proc, 0);
+            if (r == 1) break;
+            if (r == 0) fn.ExitProcess(1);
+            retries++;
+        } while (retries < max_retries);
+
+        if (r != 1) fn.ExitProcess(2);
+    }
+
+    /* 4. 解密 .text + 应用 relocations */
+    if (!decrypt_text_and_reloc()) goto fail;
+
+    /* 5. 调用原 PE 的 TLS callbacks
+     *    stub_data.orig_tls_callbacks 是原 PE 的 callbacks 数组 VA
+     *    （builder 填入，实际加载后该地址已正确）
+     *    数组以 NULL 结尾 */
+    if (stub_data.orig_tls_callbacks) {
+        TLS_CALLBACK* callbacks = (TLS_CALLBACK*)stub_data.orig_tls_callbacks;
+        while (*callbacks) {
+            (*callbacks)(hModule, reason, reserved);
+            callbacks++;
+        }
+    }
+    return;
+
+fail:
+    fn.ExitProcess(2);
 }

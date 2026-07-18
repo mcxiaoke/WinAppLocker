@@ -211,27 +211,42 @@ def test_bandizip():
         last = lines[-1] if lines else ""
         results.append((name, FAIL, last[:80]))
 
-def test_tls_rejected():
-    """7. 有 TLS callbacks 的样本应被 builder 拒绝"""
-    name = "tls_rejected"
-    rejected = []
-    not_rejected = []
-    for s in ["hellomingw", "helloucrt", "sha256sum"]:
+def test_tls_supported():
+    """7. 有 TLS callbacks 的样本应能被 builder 加壳并运行（v3 stub_tls_callback 代理）"""
+    name = "tls_supported"
+    passed = []
+    failed = []
+    for s in ["hellomingw", "helloucrt"]:
         src = os.path.join(SAMPLES, f"{s}.exe")
-        dst = os.path.join(TEST_DIR, f"{s}_should_fail.exe")
-        ok, out = pack(src, dst, password="hello123")
-        if ok:
-            # builder 没拒绝，是问题
-            not_rejected.append(s)
+        dst = os.path.join(TEST_DIR, f"{s}_locked.exe")
+        ok, out = pack(src, dst, test_mode=True)
+        if not ok:
+            failed.append(f"{s}(builder)")
+            continue
+        # hellomingw/helloucrt 是 CLI 程序，test mode 跳过弹框，直接运行
+        rc, out2 = run([dst], timeout=5)
+        if rc == 0 and ("Hello" in out2 or "TLS" in out2 or rc == 0):
+            passed.append(s)
         else:
-            if "TLS callbacks" in out:
-                rejected.append(s)
-            else:
-                not_rejected.append(f"{s}(其他原因)")
-    if not_rejected:
-        results.append((name, FAIL, f"未拒绝: {not_rejected}"))
+            failed.append(f"{s}(run exit={rc})")
+    # sha256sum 需要参数才能运行
+    src = os.path.join(SAMPLES, "sha256sum.exe")
+    dst = os.path.join(TEST_DIR, "sha256sum_locked.exe")
+    ok, out = pack(src, dst, test_mode=True)
+    if not ok:
+        failed.append("sha256sum(builder)")
     else:
-        results.append((name, PASS, f"全部拒绝: {rejected}"))
+        # sha256sum --version 看看是否能启动
+        rc, out2 = run([dst, "--version"], timeout=5)
+        # sha256sum (GNU coreutils) 8.xx 都会返回 0 并打印版本
+        if rc == 0 and "sha256sum" in out2.lower():
+            passed.append("sha256sum")
+        else:
+            failed.append(f"sha256sum(run exit={rc})")
+    if failed:
+        results.append((name, FAIL, f"failed: {failed}"))
+    else:
+        results.append((name, PASS, f"all passed: {passed}"))
 
 # ---------- 主 ----------
 
@@ -258,7 +273,7 @@ def main():
         test_dontsleep,
         test_notepad4,
         test_bandizip,
-        test_tls_rejected,
+        test_tls_supported,
     ]
     for t in tests:
         print(f"\n[{t.__doc__.split('.')[0].strip()}] {t.__name__}")

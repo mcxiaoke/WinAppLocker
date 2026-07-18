@@ -399,7 +399,124 @@ typedef struct {
 - 资源加密（.rsrc 不加密）
 - 压缩（LZ4/LZMA）—— 工业级 packer 通常带压缩，但 demo 简化
 - IAT 重建（保留原 IAT，loader 处理）
-- TLS 回调支持（v1 检测并拒绝，v2 再做）
 - .NET 程序支持（拒绝加壳）
-- 32 位 PE 支持（仅 x64）
 - DLL 支持（仅 EXE）
+
+---
+
+## 阶段 6: ASLR + TLS callback 代理 + CFG 修复 ✅
+
+> 目标：解决 Bandizip 等 ASLR/CFG/TLS 程序加壳后 loader 阶段崩溃问题。
+> 放弃 Rust 重写 builder（阶段 2），保持 C builder，直接增强 stub 与 builder 到 v3。
+
+### 6.1 v3 stub_data 扩展
+
+新增字段（参见 `config.h`）：
+- `image_base`：原 PE preferred ImageBase（用于 ASLR 重定位 delta 计算）
+- `reloc_rva` / `reloc_size`：原 .reloc 表位置与大小
+- `orig_tls_callbacks`：原 TLS callbacks 数组 VA（TLS_PROXY 模式下 stub 调用）
+
+新增 flags 位：
+- `STUB_FLAG_HASH (0x0001)`：用 SHA-256 hash 校验密码
+- `STUB_FLAG_TEST_MODE (0x0002)`：测试模式，硬编码 L"test123"
+- `STUB_FLAG_TLS_PROXY (0x0004)`：TLS callback 代理模式
+- `STUB_FLAG_ASLR (0x0008)`：ASLR 启用，stub 解密后重新应用 relocations
+
+### 6.2 TLS callback 代理模式
+
+builder 检测原 PE 是否有 TLS callbacks：
+- **有 callbacks** → 启用 STUB_FLAG_TLS_PROXY，禁用 ASLR
+  - builder 在 .lock 节末尾追加新 callbacks 数组 `[stub_tls_callback_VA, NULL]`
+  - 修改原 TLS directory 的 AddressOfCallBacks 指向新数组
+  - stub_tls_callback 在 DLL_PROCESS_ATTACH 时弹密码框 + 解密 .text + 调原 callbacks
+  - stub_entry 在 TLS_PROXY 模式下只跳 OEP（解密已由 TLS callback 完成）
+- **无 callbacks** → 启用 STUB_FLAG_ASLR（若 DYNAMIC_BASE 置位）
+  - stub_entry 完成密码校验 + 解密 + 重新应用 relocations + 跳 OEP
+
+stub_tls_callback 用 `STUB_TLS_CB_MAGIC` (0x424C4C4143534C54ULL, "TLSCALLB" 小端) +
+16 字节 marker 让 builder 在 stub.bin 中定位函数入口偏移。
+
+### 6.3 ASLR 处理（非 TLS_PROXY 路径）
+
+loader 行为：加载到随机基址 → 对 .text 等节应用 relocations（但 .text 是密文，
+relocations 应用到密文上无意义）→ 跳 EP（stub_entry）。
+
+stub 行为：
+1. 弹密码框，校验通过
+2. `decrypt_text_and_reloc()`：
+   - VirtualProtect 改 .text 为 RW
+   - XTEA 解密 .text（覆盖 loader 应用的 relocations）
+   - `apply_relocations()` 重新应用 relocations
+     - delta = current_base - stub_data.image_base
+     - 只 patch `.text` 范围（避免对 .rdata 等节双重 reloc）
+     - 支持 ABSOLUTE/HIGH/LOW/HIGHLOW/DIR64 类型
+   - VirtualProtect 恢复 .text 原保护
+3. 跳 OEP
+
+### 6.4 CFG (Control Flow Guard) 修复
+
+**根因**：原 PE 启用 CFG（`DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF`）
+时，loader 用 CFG dispatch 校验 EP 是否在 GFIDS 表中。我们把 EP 改为 .lock 节中的
+`stub_entry`，不在 GFIDS 表 → `STATUS_STACK_BUFFER_OVERRUN (0xC0000409)` 在
+`ntdll!RtlGetReturnAddressHijackTarget` 触发，stub_entry 根本没机会执行。
+
+**症状**：
+- Bandizip.x64.exe（CFG=YES）加壳后崩溃 0xC0000409
+- Notepad4.exe（CFG=NO）正常
+- 用 `flip_aslr.py` 禁用 ASLR 不影响 CFG（CFG 与 ASLR 独立），但仍崩溃 →
+  排除 ASLR 是主因
+- 在 stub_entry 最开头加 `ExitProcess(0x42)` 仍崩溃 → stub_entry 未执行
+
+**修复**：builder 在 step 15b 清除 `IMAGE_DLLCHARACTERISTICS_GUARD_CF` 位。
+副作用：原 PE 的 CFG 保护失效，但原 .text 已被 XTEA 加密，CFG 本来就保护不了
+密文，影响可忽略。参考 pe-packer 项目（同样处理 CFG）。
+
+### 6.5 测试结果
+
+| 样本 | 特性 | 加壳 | 运行 |
+|------|------|------|------|
+| hellocli (test mode) | 无 ASLR/CFG/TLS | ✅ | ✅ |
+| hellogui (正/错密码) | 无 ASLR/CFG/TLS | ✅ | ✅ |
+| DontSleep | 无 ASLR/CFG，有签名 | ✅ | ✅ |
+| Notepad4 | ASLR + CFG=NO | ✅ | ✅ |
+| Bandizip | ASLR + CFG=YES + TLS dir | ✅ | ✅ (CFG 禁用后) |
+| hellomingw/helloucrt/sha256sum | TLS callbacks (代理模式) | ✅ | ✅ |
+
+e2e_test.py：8/8 PASS
+
+---
+
+## 阶段 7: x86 (PE32) 支持
+
+> 目标：让 builder + stub 支持 32 位 PE，覆盖 QQ / FreeFileSync / ShutterEncoder 等。
+
+### 7.1 设计要点
+
+- 双架构 stub.bin：`stub_x64.bin` + `stub_x86.bin`
+- builder 检测 `IMAGE_FILE_MACHINE_I386` (0x14c) vs `IMAGE_FILE_MACHINE_AMD64` (0x8664)
+- x86 stub 编译选项：`-m32 -mno-sse -fno-pic`，链接 `--image-base=0x10000`
+- x86 PEB 访问：`__readfsdword(0x30)` 而非 `__readgsqword(0x60)`
+- x86 重定位类型：HIGHLOW(3) 为主，不再有 DIR64(10)
+- x86 跳 OEP：用 `push OEP; ret` 或间接 `jmp *OEP`
+- stub_data 字段类型保持 uint64_t（统一），stub 内部按架构截断使用
+- builder 在 PE32 上修改的字段偏移不同（OptionalHeader 32 vs 64）
+
+### 7.2 实施步骤
+
+- [ ] **S7.1** 把 stub.c 中所有 `__readgsqword(0x60)` / `PEBX` / `LDRENT` 等
+      x64 专用代码用 `#ifdef WINLOCK_X64` / `WINLOCK_X86` 分开
+- [ ] **S7.2** 写 `stub_x86.ld` 链接脚本（同 stub.ld，image-base 改 0x10000）
+- [ ] **S7.3** 在 stub.c 内 `apply_relocations` 增加 HIGHLOW 类型处理
+- [ ] **S7.4** stub_entry / stub_tls_callback 的"跳 OEP"按架构分开
+- [ ] **S7.5** Makefile 增加 `stub_x86.bin` 目标
+- [ ] **S7.6** builder 检测 Machine，按架构选 stub.bin
+- [ ] **S7.7** builder 处理 PE32 OptionalHeader（32 位字段：ImageBase 是 DWORD）
+- [ ] **S7.8** 测试样本：找 1-2 个 x86 PE 加壳并运行
+
+---
+
+## 阶段 8: 文档更新
+
+- [ ] **S8.1** 更新 README.md：v3 架构、ASLR/TLS/CFG 处理、CLI 用法
+- [ ] **S8.2** 更新 PLAN.md（本文档）：阶段 6/7 完成情况
+- [ ] **S8.3** 整理 tools/ 下的诊断脚本（pe_diag.py 等保留，废弃的删掉）

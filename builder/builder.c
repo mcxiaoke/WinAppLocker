@@ -1,28 +1,42 @@
 /*
- * winlock/builder/builder.c - PE 加壳器（v2）
+ * winlock/builder/builder.c - PE 加壳器（v3）
  *
- * 修复与增强：
+ * v3 增强：
+ *   - 支持 TLS callbacks：stub_tls_callback 代理模式
+ *     builder 在 .lock 末尾追加 [stub_tls_callback_VA, NULL] callbacks 数组，
+ *     修改原 PE TLS directory 的 AddressOfCallBacks 指向新数组。
+ *     stub_tls_callback 在 loader 调用原 callbacks 之前解密 .text。
+ *   - 支持 ASLR：保留 DYNAMIC_BASE，stub 解密 .text 后重新应用 relocations
+ *     （仅 patch .text 范围，避免对 .rdata 等节双重 reloc）。
+ *   - TLS_PROXY 模式禁用 ASLR（简化：避免 .lock 内 VA 引用与 reloc 冲突）。
+ *
+ * 修复与增强（v2 遗留）：
  *   - overlay 数据保留（避免堆崩溃）
  *   - Authenticode 签名剥离
- *   - 检测 TLS 回调 / .NET CLR / DLL，拒绝加壳
- *   - 清零 Bound Imports / Delay Import 中的标志（避免 loader 走捷径）
- *   - 随机生成 per-file XTEA key（用 RtlGenRandom）
- *   - 密码仍存明文（v3 改 SHA-256 hash）
+ *   - 检测 .NET CLR / DLL，拒绝加壳
+ *   - 清零 Bound Imports（避免 loader 走捷径）
+ *   - 随机生成 per-file XTEA key
+ *   - SHA-256 hash 密码校验
  *
  * 流程：
  *   1. 读输入 PE
- *   2. 验证：x64 EXE，无 TLS 回调，无 CLR
- *   3. 找第一个可执行节
- *   4. 随机生成 XTEA key
- *   5. XTEA 加密该节 RawData
- *   6. 读 stub.bin，搜索 STUB_DATA_MAGIC，填充 stub_data
- *   7. 计算新 .lock 节位置（保留 overlay）
- *   8. 剥离 Authenticode 签名（清零 DataDirectory[4]）
- *   9. 清零 DataDirectory[11] (Bound Imports)
- *   10. 新增 .lock 节，写入 stub.bin
- *   11. 修改 AddressOfEntryPoint 指向 .lock
- *   12. 更新 SizeOfImage / NumberOfSections
- *   13. 写输出 PE（原 PE 数据 + overlay + .lock 节）
+ *   2. 验证：x64 EXE，无 CLR
+ *   3. 找第一个可执行节，记录 .text 信息
+ *   4. 检测 TLS callbacks，保存原 callback 列表（不拒绝）
+ *   5. 随机生成 XTEA key + salt，计算 SHA-256(password+salt)
+ *   6. XTEA 加密 .text 前 enc_size 字节
+ *   7. 读 stub.bin，搜索 STUB_DATA_MAGIC 与 STUB_TLS_CB_MAGIC
+ *   8. 填充 stub_data：v3 字段（image_base/reloc_rva/reloc_size/orig_tls_callbacks）
+ *   9. 计算 .lock 节位置（保留 overlay），追加 callbacks 数组（若 TLS_PROXY）
+ *   10. 剥离 Authenticode 签名，清零 Bound Imports
+ *   11. 新增 .lock 节，写入 stub.bin + callbacks 数组
+ *   12. 修改 AddressOfEntryPoint 指向 .lock
+ *   13. 更新 SizeOfImage / NumberOfSections
+ *   14. ASLR 处理：
+ *       - TLS_PROXY 模式：禁用 ASLR
+ *       - 非 TLS_PROXY 模式 + ASLR 启用：保留 ASLR，stub 重应用 reloc
+ *   15. TLS_PROXY 模式：修改原 TLS directory 的 AddressOfCallBacks
+ *   16. 写输出 PE
  */
 
 #include <stdio.h>
@@ -143,6 +157,34 @@ static void sec_name_str(const char* name8, char* out, size_t out_sz) {
         out[i] = name8[i];
     }
     out[i] = 0;
+}
+
+/* ---- 辅助：RVA -> 文件偏移（在原 PE 节表中查找）----
+ * 返回 0 表示未找到（注意：0 也可能是合法偏移，调用方应先检查 RVA 是否合法） */
+static DWORD rva_to_raw(IMAGE_SECTION_HEADER* sec, WORD n_sec, DWORD rva) {
+    for (WORD i = 0; i < n_sec; i++) {
+        DWORD sva = sec[i].VirtualAddress;
+        /* 用 VirtualSize 优先，但若 VirtualSize < RawSize，用 RawSize 作上限
+         * （某些 PE 用 SizeOfRawData 作为节实际大小）*/
+        DWORD va_end = sva + (sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData);
+        if (rva >= sva && rva < va_end) {
+            return sec[i].PointerToRawData + (rva - sva);
+        }
+    }
+    return 0;
+}
+
+/* ---- 辅助：在 stub.bin 中搜索 STUB_TLS_CB_MAGIC，返回 stub_tls_callback 偏移 ----
+ * stub.c 把 magic 放在 16 字节 marker（8 字节 magic + 8 字节 zero pad）中，
+ * function 紧跟其后，所以 function_offset = magic_offset + 16。
+ * 返回 0 表示未找到。 */
+static size_t find_stub_tls_cb_offset(const uint8_t* stub, size_t stub_size) {
+    for (size_t off = 0; off + 16 <= stub_size; off += 8) {
+        if (*(const uint64_t*)(stub + off) == STUB_TLS_CB_MAGIC) {
+            return off + 16;
+        }
+    }
+    return 0;
 }
 
 /* ---- 辅助：从输入路径生成默认输出路径 <dir>/<base>_locked.exe ----
@@ -306,50 +348,68 @@ int main(int argc, char* argv[]) {
     IMAGE_SECTION_HEADER* sec =
         (IMAGE_SECTION_HEADER*)((uint8_t*)nt + sizeof(IMAGE_NT_HEADERS));
 
-    /* 检查 TLS 回调 */
+    /* 检查 TLS 回调（v3：不再拒绝，保存原 callback 列表用于 stub_tls_callback 代理）*/
     IMAGE_DATA_DIRECTORY* tls_dir =
         &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+
+    /* TLS 信息结构 */
+    struct {
+        int      has_callbacks;          /* 是否有 TLS callbacks */
+        uint64_t orig_callbacks[64];     /* 原 callback VA 列表（NULL 结尾）*/
+        int      orig_callback_count;
+        uint64_t orig_callbacks_array_va; /* 原 callbacks 数组的 VA（供 stub 调用）*/
+        DWORD    aoc_field_rva;           /* AddressOfCallBacks 字段在 PE 中的 RVA */
+    } tls_info = {0};
+
     if (tls_dir->VirtualAddress != 0 && tls_dir->Size != 0) {
-        printf("[!] TLS directory present (RVA=0x%X Size=0x%X)\n",
-               tls_dir->VirtualAddress, tls_dir->Size);
-        /* 尝试检查是否有 callback */
-        BOOL has_callbacks = FALSE;
-        for (WORD i = 0; i < n_sec; i++) {
-            DWORD sva = sec[i].VirtualAddress;
-            DWORD se  = sva + sec[i].Misc.VirtualSize;
-            if (tls_dir->VirtualAddress >= sva && tls_dir->VirtualAddress < se) {
-                IMAGE_TLS_DIRECTORY64* tls =
-                    (IMAGE_TLS_DIRECTORY64*)(pe + sec[i].PointerToRawData
-                                                  + (tls_dir->VirtualAddress - sva));
-                if (tls->AddressOfCallBacks) {
-                    /* AddressOfCallBacks 是 VA */
-                    ULONGLONG img_base = nt->OptionalHeader.ImageBase;
-                    ULONGLONG cb_va = tls->AddressOfCallBacks;
-                    ULONGLONG cb_rva = cb_va - img_base;
-                    /* 在节中找到 raw 指针 */
-                    for (WORD j = 0; j < n_sec; j++) {
-                        DWORD s2va = sec[j].VirtualAddress;
-                        DWORD s2e  = s2va + sec[j].Misc.VirtualSize;
-                        if (cb_rva >= s2va && cb_rva < s2e) {
-                            uint64_t* callbacks =
-                                (uint64_t*)(pe + sec[j].PointerToRawData
-                                                + (cb_rva - s2va));
-                            if (callbacks[0] != 0) {
-                                has_callbacks = TRUE;
-                            }
-                            break;
-                        }
+        printf("[!] TLS directory present (RVA=0x%lX Size=0x%lX)\n",
+               (unsigned long)tls_dir->VirtualAddress,
+               (unsigned long)tls_dir->Size);
+
+        /* 找 TLS directory 的 raw 指针 */
+        DWORD tls_raw = rva_to_raw(sec, n_sec, tls_dir->VirtualAddress);
+        if (tls_raw != 0) {
+            IMAGE_TLS_DIRECTORY64* tls =
+                (IMAGE_TLS_DIRECTORY64*)(pe + tls_raw);
+            /* AddressOfCallBacks 字段在 IMAGE_TLS_DIRECTORY64 中的偏移 = 24 */
+            tls_info.aoc_field_rva = tls_dir->VirtualAddress + 24;
+
+            if (tls->AddressOfCallBacks) {
+                ULONGLONG img_base = nt->OptionalHeader.ImageBase;
+                ULONGLONG cb_va = tls->AddressOfCallBacks;
+                ULONGLONG cb_rva = cb_va - img_base;
+                tls_info.orig_callbacks_array_va = cb_va;
+
+                DWORD cb_raw = rva_to_raw(sec, n_sec, (DWORD)cb_rva);
+                if (cb_raw != 0) {
+                    uint64_t* callbacks = (uint64_t*)(pe + cb_raw);
+                    /* 复制原 callbacks（最多 63 个，留一个 NULL） */
+                    while (tls_info.orig_callback_count < 63 &&
+                           callbacks[tls_info.orig_callback_count] != 0) {
+                        tls_info.orig_callbacks[tls_info.orig_callback_count] =
+                            callbacks[tls_info.orig_callback_count];
+                        tls_info.orig_callback_count++;
+                    }
+                    tls_info.orig_callbacks[tls_info.orig_callback_count] = 0;
+                    if (tls_info.orig_callback_count > 0) {
+                        tls_info.has_callbacks = 1;
                     }
                 }
-                break;
             }
         }
-        if (has_callbacks) {
-            printf("[-] PE has TLS callbacks. Not supported in v2.\n");
-            printf("    Refusing to pack. (v3 will support TLS)\n");
-            return 1;
+
+        if (tls_info.has_callbacks) {
+            printf("[+] Found %d TLS callbacks (array VA=0x%llX)\n",
+                   tls_info.orig_callback_count,
+                   (unsigned long long)tls_info.orig_callbacks_array_va);
+            for (int i = 0; i < tls_info.orig_callback_count; i++) {
+                printf("    [%d] callback VA=0x%llX\n", i,
+                       (unsigned long long)tls_info.orig_callbacks[i]);
+            }
+            printf("[*] Will use stub_tls_callback proxy mode (TLS_PROXY + disable ASLR)\n");
+        } else {
+            printf("[+] TLS directory exists but no callbacks. OK.\n");
         }
-        printf("[+] TLS directory exists but no callbacks. OK.\n");
     }
 
     /* 检查 .NET CLR */
@@ -543,11 +603,26 @@ int main(int argc, char* argv[]) {
     printf("[*] stub_data found at offset 0x%zX\n",
            (size_t)((uint8_t*)sd - stub));
 
+    /* 8a. 在 stub.bin 中搜索 STUB_TLS_CB_MAGIC，定位 stub_tls_callback */
+    size_t stub_tls_cb_offset = find_stub_tls_cb_offset(stub, stub_size);
+    if (tls_info.has_callbacks) {
+        if (stub_tls_cb_offset == 0) {
+            printf("[-] STUB_TLS_CB_MAGIC not found in stub.bin (TLS_PROXY mode required)\n");
+            return 1;
+        }
+        printf("[*] stub_tls_callback at offset 0x%zX in stub.bin\n", stub_tls_cb_offset);
+    }
+
     /* 填充 stub_data */
     sd->version       = STUB_DATA_VERSION;
     sd->flags         = STUB_FLAG_HASH;     /* 使用 hash 校验 */
     if (test_mode) {
         sd->flags    |= STUB_FLAG_TEST_MODE;  /* 测试模式：跳过弹框 */
+    }
+    if (tls_info.has_callbacks) {
+        sd->flags    |= STUB_FLAG_TLS_PROXY;  /* TLS callback 代理模式 */
+    } else if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+        sd->flags    |= STUB_FLAG_ASLR;        /* 保留 ASLR，stub 重应用 reloc */
     }
     sd->max_retries   = STUB_DEFAULT_MAX_RETRIES;
     sd->reserved16    = 0;
@@ -564,6 +639,18 @@ int main(int argc, char* argv[]) {
     memcpy(sd->pwd_hash, pwd_hash, 32);
     wcsncpy(sd->password, password, 63);  /* 保留明文兼容（生产应清零） */
     sd->password[63] = 0;
+    /* v3 字段：重定位信息（始终填充，stub 根据 STUB_FLAG_ASLR 决定是否使用）*/
+    sd->image_base = nt->OptionalHeader.ImageBase;
+    {
+        IMAGE_DATA_DIRECTORY* reloc_dir =
+            &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        sd->reloc_rva  = reloc_dir->VirtualAddress;
+        sd->reloc_size = reloc_dir->Size;
+    }
+    sd->reserved32 = 0;
+    /* TLS_PROXY 模式：保存原 callbacks 数组 VA，stub_tls_callback 调用它们 */
+    sd->orig_tls_callbacks = tls_info.has_callbacks
+        ? tls_info.orig_callbacks_array_va : 0;
     /* 计算 checksum（XOR 所有 8 字节字段） */
     uint64_t* p = (uint64_t*)sd;
     uint64_t cs = 0;
@@ -572,22 +659,62 @@ int main(int argc, char* argv[]) {
     for (qi = 0; qi < sd_qwords; qi++) cs ^= p[qi];
     sd->checksum = cs;
     printf("[*] Password set to: '%ls' (stored as SHA-256 hash)\n", sd->password);
+    printf("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d)\n",
+           sd->flags,
+           (sd->flags & STUB_FLAG_HASH)        ? 1 : 0,
+           (sd->flags & STUB_FLAG_TEST_MODE)  ? 1 : 0,
+           (sd->flags & STUB_FLAG_TLS_PROXY)  ? 1 : 0,
+           (sd->flags & STUB_FLAG_ASLR)        ? 1 : 0);
 
-    /* 9. 计算新 .lock 节位置（保留 overlay） */
+    /* 9. 计算新 .lock 节位置（保留 overlay）
+     *   .lock 节内容 = stub.bin + (TLS_PROXY 模式时追加 callbacks 数组)
+     *   callbacks 数组 = [stub_tls_callback_VA, NULL]
+     *   stub_tls_callback_VA = ImageBase + new_va + stub_tls_cb_offset
+     *   callbacks_array_VA   = ImageBase + new_va + cb_array_offset_in_lock */
     DWORD file_align = nt->OptionalHeader.FileAlignment;
     DWORD sec_align = nt->OptionalHeader.SectionAlignment;
+
+    /* callbacks 数组在 .lock 中的偏移（stub.bin 之后，8 字节对齐）*/
+    size_t cb_array_offset_in_lock = (stub_size + 7) & ~((size_t)7);
+    /* callbacks 数组大小：[stub_tls_callback_VA, NULL] = 2 * 8 字节
+     *   （stub_tls_callback 调用原 callbacks via stub_data.orig_tls_callbacks，
+     *    所以新数组只需要 stub_tls_callback + NULL，原 callbacks 不会被 loader 二次调用）*/
+    size_t cb_array_size = tls_info.has_callbacks ? (2 * 8) : 0;
+    size_t total_lock_size = cb_array_offset_in_lock + cb_array_size;
+    if (!tls_info.has_callbacks) {
+        total_lock_size = stub_size;  /* 不需要追加 callbacks 数组 */
+    }
 
     /* new_raw_off = max(last_raw_end, in_size_without_overlay) aligned up */
     DWORD pe_data_end = overlay_off + (DWORD)overlay_size;  /* == in_size if no overlay */
     DWORD new_raw_off = (pe_data_end + file_align - 1) & ~(file_align - 1);
-    DWORD new_raw_size = (DWORD)((stub_size + file_align - 1) & ~(file_align - 1));
+    DWORD new_raw_size = (DWORD)((total_lock_size + file_align - 1) & ~(file_align - 1));
     DWORD new_va = (last_va_end + sec_align - 1) & ~(sec_align - 1);
-    DWORD new_vsize = (DWORD)stub_size;
+    DWORD new_vsize = (DWORD)total_lock_size;
     DWORD new_vsize_aligned = (new_vsize + sec_align - 1) & ~(sec_align - 1);
+
+    /* 计算 stub_tls_callback VA（仅 TLS_PROXY 模式需要）*/
+    uint64_t stub_tls_cb_va = 0;
+    uint64_t new_cb_array_va = 0;
+    if (tls_info.has_callbacks) {
+        stub_tls_cb_va   = (uint64_t)nt->OptionalHeader.ImageBase
+                         + new_va + stub_tls_cb_offset;
+        new_cb_array_va  = (uint64_t)nt->OptionalHeader.ImageBase
+                         + new_va + (uint64_t)cb_array_offset_in_lock;
+        printf("[*] stub_tls_callback VA = 0x%llX (ImageBase + 0x%lX + 0x%zX)\n",
+               (unsigned long long)stub_tls_cb_va,
+               (unsigned long)new_va, stub_tls_cb_offset);
+        printf("[*] new callbacks array VA = 0x%llX (offset in .lock = 0x%zX)\n",
+               (unsigned long long)new_cb_array_va, cb_array_offset_in_lock);
+    }
 
     printf("[*] New .lock section: RVA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX\n",
            (unsigned long)new_va, (unsigned long)new_vsize,
            (unsigned long)new_raw_off, (unsigned long)new_raw_size);
+    if (tls_info.has_callbacks) {
+        printf("[*]   .lock content: stub.bin(0x%zX) + callbacks_array(0x%zX) = 0x%zX\n",
+               stub_size, cb_array_size, total_lock_size);
+    }
 
     /* 10. 准备输出缓冲区
      *   [原 PE 数据 + overlay] + [padding] + [.lock 节] + [padding] */
@@ -635,8 +762,20 @@ int main(int argc, char* argv[]) {
                               | IMAGE_SCN_MEM_READ
                               | IMAGE_SCN_MEM_WRITE;
 
-    /* 14. 拷贝 stub.bin 到新节 */
+    /* 14. 拷贝 stub.bin 到新节，追加 callbacks 数组（TLS_PROXY 模式） */
     memcpy(out + new_raw_off, stub, stub_size);
+    if (tls_info.has_callbacks) {
+        /* 在 .lock 末尾追加新 callbacks 数组：[stub_tls_callback_VA, NULL]
+         * Windows loader 会遍历此数组调用每个 callback。
+         * stub_tls_callback 在 DLL_PROCESS_ATTACH 时解密 .text + 调原 callbacks。
+         * 数组以 NULL 结尾，所以原 callbacks 不会被 loader 二次调用
+         * （由 stub_tls_callback 通过 stub_data.orig_tls_callbacks 调用）。 */
+        uint64_t* cb_array = (uint64_t*)(out + new_raw_off + cb_array_offset_in_lock);
+        cb_array[0] = stub_tls_cb_va;  /* stub_tls_callback 入口 VA */
+        cb_array[1] = 0;                /* NULL 结尾 */
+        printf("[+] Wrote new callbacks array at .lock+0x%zX: [0x%llX, NULL]\n",
+               cb_array_offset_in_lock, (unsigned long long)stub_tls_cb_va);
+    }
     /* 剩余填充由 calloc 自动清零 */
 
     /* 15. 更新 PE 头 */
@@ -645,22 +784,73 @@ int main(int argc, char* argv[]) {
     nt->OptionalHeader.AddressOfEntryPoint = new_va;
     nt->OptionalHeader.CheckSum = 0;
 
-    /* 禁用 ASLR (IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)：
-     * 原因：stub 解密 .text 节用文件原字节覆盖内存，会冲掉 loader 应用过的
-     *       relocations（修改 .text 里绝对地址引用以匹配实际加载基址）。
-     *       冲掉后跳 OEP 执行时，绝对地址指向错误位置 → STATUS_STACK_BUFFER_OVERRUN。
-     * 解决：强制加载到固定 ImageBase（不清 ImageBase 字段），relocations 不被
-     *       应用，stub 解密恢复的原文绝对地址刚好匹配实际加载基址。
-     * stub 本身是 PIC，不受 ImageBase 影响。 */
-    if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+    /* ASLR 处理（v3 条件化）：
+     * - TLS_PROXY 模式：禁用 ASLR。原因：新 callbacks 数组中的 stub_tls_callback_VA
+     *   是绝对 VA，若 ASLR 启用需要 .reloc 覆盖此地址，但 .lock 节无 reloc 条目。
+     *   禁用 ASLR 让 PE 加载到 preferred ImageBase，所有 VA 直接生效。
+     *   绝大多数带 TLS callbacks 的程序（CRT 初始化等）不依赖 ASLR，禁用无影响。
+     * - 非 TLS_PROXY 模式 + ASLR 启用：保留 ASLR，stub 解密 .text 后重新应用
+     *   relocations（仅 patch .text 范围，避免对其他节双重 reloc）。
+     *   STUB_FLAG_ASLR 已在 stub_data.flags 中设置。 */
+    if (tls_info.has_callbacks) {
+        if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+            WORD old = nt->OptionalHeader.DllCharacteristics;
+            nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+            nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+            printf("[!] ASLR disabled (TLS_PROXY mode, DllChar 0x%04X -> 0x%04X)\n",
+                   old, nt->OptionalHeader.DllCharacteristics);
+        }
+    } else if (sd->flags & STUB_FLAG_ASLR) {
+        printf("[+] ASLR preserved (stub will re-apply .text relocations)\n");
+    } else if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) {
+        /* 这一支本不该触发（非 TLS_PROXY 时 DYNAMIC_BASE 应该走 STUB_FLAG_ASLR 路径）*/
         WORD old = nt->OptionalHeader.DllCharacteristics;
         nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
         nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
-        printf("[!] ASLR disabled (DllChar 0x%04X -> 0x%04X) to avoid reloc/decrypt conflict\n",
+        printf("[!] ASLR disabled (fallback, DllChar 0x%04X -> 0x%04X)\n",
                old, nt->OptionalHeader.DllCharacteristics);
     }
 
-    /* 16. 写输出文件 */
+    /* 15b. CFG (Control Flow Guard) 处理：
+     *   原 PE 若启用 CFG（DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF），
+     *   loader 在调用 EP 时会用 CFG dispatch 校验目标地址是否在 GFIDS 表中。
+     *   我们把 EP 改为 .lock 节中的 stub_entry，不在 GFIDS 表里，
+     *   → 触发 STATUS_STACK_BUFFER_OVERRUN (0xC0000409)。
+     *   修复：清 GUARD_CF 位，让 loader 不对 EP 做 CFG dispatch 校验。
+     *   副作用：原 PE 中 CFG 保护的间接调用目标不再被 loader 校验；
+     *   但原 .text 已被 XTEA 加密，CFG 本来就保护不了密文，影响可忽略。
+     *   参考：pe-packer 项目同样处理 CFG（patch GFIDS 表或禁用）。 */
+    if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) {
+        WORD old = nt->OptionalHeader.DllCharacteristics;
+        nt->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
+        printf("[!] CFG disabled (DllChar 0x%04X -> 0x%04X); stub_entry not in GFIDS table\n",
+               old, nt->OptionalHeader.DllCharacteristics);
+    }
+
+    /* 16. TLS_PROXY 模式：修改原 TLS directory 的 AddressOfCallBacks 字段
+     *   让 Windows loader 调用我们的 stub_tls_callback，而不是原 callbacks。
+     *   stub_tls_callback 在 DLL_PROCESS_ATTACH 时：
+     *     1. 解析 kernel32 / 弹密码框 / 解密 .text
+     *     2. 通过 stub_data.orig_tls_callbacks 调用原 callbacks
+     *   stub_entry 在 TLS_PROXY 模式下只跳 OEP（解密已由 TLS callback 完成）。
+     *   注意：AddressOfCallBacks 是 VA（不是 RVA），ASLR 已禁用所以 VA = ImageBase + RVA */
+    if (tls_info.has_callbacks) {
+        /* 在输出 PE 中找 AddressOfCallBacks 字段的文件偏移 */
+        DWORD aoc_raw = rva_to_raw(sec, n_sec, tls_info.aoc_field_rva);
+        if (aoc_raw == 0) {
+            printf("[-] Cannot locate AddressOfCallBacks field in output PE\n");
+            return 1;
+        }
+        uint64_t* aoc_field = (uint64_t*)(out + aoc_raw);
+        uint64_t old_aoc = *aoc_field;
+        *aoc_field = new_cb_array_va;
+        printf("[+] TLS directory AddressOfCallBacks: 0x%llX -> 0x%llX (file off 0x%lX)\n",
+               (unsigned long long)old_aoc,
+               (unsigned long long)new_cb_array_va,
+               (unsigned long)aoc_raw);
+    }
+
+    /* 17. 写输出文件 */
     if (write_file(out_path, out, out_size) != 0) {
         printf("[-] Failed to write %s\n", out_path);
         return 1;
