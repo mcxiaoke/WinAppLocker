@@ -1,5 +1,43 @@
 # 变更记录
 
+## 变更记录 2026-07-19 反射式 Packer 阶段二：PEB.Ldr 覆写修复 DontSleep 崩溃 + 8/8 样本通过
+
+阶段 2 核心障碍修复：反射式加载 DontSleep.exe 跳到 OEP 后被 MFC42u 内部抛出的 C++ 异常（0xE06D7363）终止。诊断并修复后 **8/8 x64 样本 round-trip 全部通过**。
+
+1. **`packer/reflective/loader.c` 新增 PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY 结构**
+   - 借鉴 `F:\Temp\pe\AlushPacker-main\Packer\structs.h`，按 Windows 内部 `_LDR_DATA_TABLE_ENTRY` 布局定义精简结构
+   - 字段偏移与 OS 一致：DllBase +0x30 / EntryPoint +0x38 / SizeOfImage +0x40
+   - PEBX 结构同步新增 `Ldr` 字段（offset 24/x64、12/x86）
+
+2. **`packer/reflective/loader.c` 新增 `patch_peb_ldr_main_entry()` 函数**
+   - 遍历 `PEB.Ldr.InMemoryOrderModuleList`，第一个条目就是主 EXE（stub 自己）
+   - 覆写该条目 `DllBase/EntryPoint/SizeOfImage` 为反射式加载的 new_img 值
+   - 借鉴 AlushPacker `LdrpPatchDataTableEntry` 思路，让 OS 把手动映射的 PE 当作"已加载模块"识别
+
+3. **`packer/reflective/loader.c` 在 `map_image()` 中调用 `patch_peb_ldr_main_entry`**
+   - 紧接 `update_peb_image_base` 之后，IAT 处理之前完成覆写
+   - 保证 PEB.ImageBaseAddress 和 PEB.Ldr 主 EXE 条目一致
+
+4. **DontSleep 崩溃根因分析与修复（核心进展）**
+   - **症状**：DontSleep 反射式加载后 `_mainCRTStartup` 在 0x43014c 调用 `MFC42u!#1584`，该函数抛 C++ 异常 0xE06D7363 终止进程
+   - **诊断**：在 stub 中加 FindResourceW / LoadStringW / GetModuleHandleW 测试代码，发现
+     - `FindResourceW(0x400000, 1, RT_MANIFEST) = 0x48ac50` 成功（直接读 PE header）
+     - `LoadStringW(0x400000, 1) = 0 chars, err=59` 失败（**ERROR_DIRECT_ACCESS_HANDLE**）
+     - `GetModuleHandleW(L"DontSleep.exe") = NULL` - PEB.Ldr 里没有 0x400000 条目
+   - **根因**：`LoadString` / `LoadResource` 走 `LdrFindResource_U`，需要 PEB.Ldr 里有对应模块条目。MFC42u!AfxWinInit 内部调用 `LoadString` 加载资源失败，抛 C++ 异常导致崩溃
+   - **修复**：覆写 PEB.Ldr 主 EXE 条目，让 OS 认为 0x400000 是合法模块
+   - **效果**：8/8 样本 PASS（Notepad4 / DontSleep / helloguix64 / hellocli / hellomingw / helloucrt / ddccli / sha256sum）
+
+5. **清理调试代码**
+   - 移除 main() 中用于诊断的 FindResource/LoadString/GetModuleHandle 测试代码块
+   - 优化 patch_peb_ldr_main_entry 中不正确的 TimeDateStamp 日志行
+
+6. **遗留**：阶段 2 剩余未完成项（不影响当前 8/8 通过）
+   - 延迟导入表（`IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`）
+   - builder 端资源保留（manifest / `.rsrc` 节复制到 stub EXE）
+   - forwarder 递归解析（目前依赖 `GetProcAddress` 自动处理）
+   - dotnet packer 集成
+
 ## 变更记录 2026-07-19 反射式 Packer/Stub 阶段一 MVP 实施完成
 
 按照 `packer/docs/REFLECTIVE_DESIGN.md` 阶段 1 MVP 计划完成反射式 loader 的首个可运行版本，**已通过端到端验收**：反射式加载 Notepad4.exe / hellocli.exe 跳 OEP 成功。

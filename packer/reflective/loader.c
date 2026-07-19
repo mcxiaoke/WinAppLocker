@@ -51,11 +51,9 @@ static void log_init(void) {
     else strcat(path, "_loader.log");
     g_logf = fopen(path, "w");
 }
-/* 同时输出到文件 + OutputDebugStringA（便于 DebugView 实时观察） */
+/* 只输出到文件（OutputDebugStringA 会触发 0x40010006 异常，干扰 VEH 调试） */
 #define DBG(fmt, ...) do { \
     if (g_logf) { fprintf(g_logf, "[REFL] " fmt, ##__VA_ARGS__); fflush(g_logf); } \
-    { char _buf[1024]; int _n = snprintf(_buf, sizeof(_buf), "[REFL] " fmt, ##__VA_ARGS__); \
-      if (_n > 0) OutputDebugStringA(_buf); } \
 } while (0)
 #else
 #define DBG(fmt, ...) do {} while (0)
@@ -70,6 +68,7 @@ typedef struct {
     UCHAR  a, b, c, d;       /* offset 0-3: InheritedAddressSpace 等  */
     PVOID  Mutant;           /* offset 8 (x64) / 4 (x86)，前面有 padding */
     PVOID  ImageBaseAddress; /* offset 16 (x64) / 8 (x86) */
+    PVOID  Ldr;              /* offset 24 (x64) / 12 (x86) -> PEB_LDR_DATA */
 } PEBX;
 
 #ifdef _WIN64
@@ -78,22 +77,84 @@ typedef struct {
 #define WINLOCK_PEB() ((PEBX*)(uintptr_t)__readfsdword(0x30))
 #endif
 
+/* ---- PEB_LDR_DATA + LDR_DATA_TABLE_ENTRY（简化版，仅含需要的字段） ----
+ * 用于修改主 EXE 在 PEB.Ldr 里的条目，让 OS 识别反射加载的 PE 为模块。
+ * 这样 LoadString / LoadResource 等走 LdrFindResource_U 的 API 能工作。
+ *
+ * 布局参考：MS Internal `nt!_LDR_DATA_TABLE_ENTRY` 和 AlushPacker structs.h
+ * 字段顺序/偏移必须与 OS 一致，因此用 BYTE 数组占位未用字段 */
+typedef struct _MY_LIST_ENTRY {
+    struct _MY_LIST_ENTRY* Flink;
+    struct _MY_LIST_ENTRY* Blink;
+} MY_LIST_ENTRY;
+
+typedef struct _PEB_LDR_DATA_X {
+    ULONG      Length;                              /* +0x00 */
+    BOOLEAN    Initialized;                         /* +0x04 */
+    PVOID      SsHandle;                            /* +0x08 */
+    MY_LIST_ENTRY InLoadOrderModuleList;            /* +0x10 */
+    MY_LIST_ENTRY InMemoryOrderModuleList;          /* +0x20 */
+    MY_LIST_ENTRY InInitializationOrderModuleList;  /* +0x30 */
+} PEB_LDR_DATA_X;
+
+/* LDR_DATA_TABLE_ENTRY 仅前几个字段需要精确偏移，后面用 BYTE[] 占位
+ * InLoadOrderLinks        +0x00 (16 字节)
+ * InMemoryOrderLinks      +0x10 (16 字节)
+ * InInitializationOrderLinks +0x20 (16 字节)
+ * DllBase                 +0x30
+ * EntryPoint              +0x38
+ * SizeOfImage             +0x40 (ULONG)
+ * FullDllName             +0x48 (UNICODE_STRING: USHORT Length, USHORT MaxLength, PVOID Buffer)
+ * BaseDllName             +0x58
+ */
+typedef struct _LDR_DATA_TABLE_ENTRY_X {
+    MY_LIST_ENTRY InLoadOrderLinks;          /* +0x00 */
+    MY_LIST_ENTRY InMemoryOrderLinks;        /* +0x10 */
+    MY_LIST_ENTRY InInitializationOrderLinks;/* +0x20 */
+    PVOID         DllBase;                   /* +0x30 */
+    PVOID         EntryPoint;                /* +0x38 */
+    ULONG         SizeOfImage;               /* +0x40 */
+    ULONG         _pad1;                     /* +0x44 对齐 */
+    struct { USHORT Length; USHORT MaxLength; PVOID Buffer; } FullDllName; /* +0x48 */
+    struct { USHORT Length; USHORT MaxLength; PVOID Buffer; } BaseDllName; /* +0x58 */
+} LDR_DATA_TABLE_ENTRY_X;
+
+/* ---- OEP return 后的兜底处理 ----
+ * _mainCRTStartup 正常路径会调用 exit() 不返回；但如果原 PE 直接 return，
+ * 会回到这里。这时调用 ExitProcess 终止，避免跳到栈上的垃圾地址。
+ * noinline + used 防止编译器优化掉 */
+static void __attribute__((noinline, used)) oep_returned(int exit_code) {
+    if (g_logf) {
+        fprintf(g_logf, "[REFL] OEP returned (unexpected, exit_code=%d), calling ExitProcess\n",
+                exit_code);
+        fflush(g_logf);
+    }
+    ExitProcess((UINT)exit_code);
+    __builtin_unreachable();
+}
+
 /* ---- x64 栈对齐跳 OEP（借鉴 winlock stub.c:743-759 + peldr） ----
- * 用 jmp 而非 call，不压返回地址
- * 16B 对齐 + 40B shadow space 符合 x64 ABI */
-static void jump_to_oep(void* oep) {
+ * 用 push + jmp 模拟 call，压入返回地址（oep_returned）
+ * 这样原 PE 内的 C++ 异常 dispatch 能正确 unwind 到本 stub 帧，
+ * 不会因找不到 caller 而 terminate（修复 DontSleep/MFC42u 崩溃问题）
+ *
+ * x64 ABI: 函数入口 RSP % 16 == 8
+ *   andq $-16, rsp  -> RSP % 16 == 0
+ *   pushq ret       -> RSP -= 8, RSP % 16 == 8 ✓ */
+static void jump_to_oep(void* oep, void* ret_addr) {
 #ifdef _WIN64
     __asm__ volatile (
         "andq $-16, %%rsp\n\t"   /* 16 字节对齐 */
-        "subq $40,  %%rsp\n\t"   /* 32B shadow space + 8 对齐余量 */
-        "jmpq *%0\n\t"           /* jmp 而非 call,不压返回地址 */
-        : : "r"(oep) : "memory"
+        "pushq %1\n\t"           /* 压入返回地址，RSP -= 8（RSP % 16 == 8） */
+        "jmpq *%0\n\t"           /* jmp 到 OEP，相当于 call 但返回地址已压入 */
+        : : "r"(oep), "r"(ret_addr) : "memory"
     );
 #else
     __asm__ volatile (
         "andl $-16, %%esp\n\t"
+        "pushl %1\n\t"
         "jmp *%0\n\t"
-        : : "r"(oep) : "memory"
+        : : "r"(oep), "r"(ret_addr) : "memory"
     );
 #endif
     __builtin_unreachable();
@@ -212,10 +273,20 @@ static int process_iat(uint8_t* img) {
     return 1;
 }
 
-/* ---- 应用 relocations（MVP 只处理 DIR64） ----
+/* ---- 应用 relocations（完整 5 类型：ABS/DIR64/HIGHLOW/HIGH/LOW） ----
  * old_base = preferred ImageBase（PE 头里的值）
  * new_base = 实际加载地址
- * 如果 old_base == new_base，无需重定位 */
+ * 如果 old_base == new_base，无需重定位
+ *
+ * 类型说明：
+ *   ABSOLUTE  (0)  - padding，跳过
+ *   HIGHLOW   (3)  - 32 位绝对地址，加 (int32_t)delta（x86 用）
+ *   HIGH      (1)  - 32 位地址的高 16 位，加 delta>>16（罕见，16 位 Windows 遗留）
+ *   LOW       (2)  - 32 位地址的低 16 位，加 delta&0xFFFF（罕见，16 位 Windows 遗留）
+ *   DIR64     (10) - 64 位绝对地址，加 delta（x64 用）
+ *
+ * HIGH/LOW 在现代 32 位 PE 中也极少见，主要用 HIGHLOW；
+ * 但为完整性还是实现，避免边界情况崩溃 */
 static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base) {
     if (old_base == new_base) {
         DBG("reloc: no delta (base matched), skip\n");
@@ -230,12 +301,15 @@ static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base)
     }
 
     int64_t delta = (int64_t)(new_base - old_base);
+    int32_t delta32 = (int32_t)delta;
+    uint16_t delta_high = (uint16_t)((delta >> 16) & 0xFFFF);
+    uint16_t delta_low  = (uint16_t)(delta & 0xFFFF);
     DBG("reloc: applying delta=0x%llx (old=0x%llx new=0x%llx)\n",
         (long long)delta, (unsigned long long)old_base, (unsigned long long)new_base);
 
     IMAGE_BASE_RELOCATION* reloc = (IMAGE_BASE_RELOCATION*)(img + dir->VirtualAddress);
     uint8_t* reloc_end = (uint8_t*)reloc + dir->Size;
-    int count = 0;
+    int count_dir64 = 0, count_highlow = 0, count_high = 0, count_low = 0;
 
     while ((uint8_t*)reloc < reloc_end) {
         uint32_t block_size = reloc->SizeOfBlock;
@@ -254,19 +328,31 @@ static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base)
                     /* padding, skip */
                     break;
                 case IMAGE_REL_BASED_DIR64:
-                    *(uint64_t*)patch += delta;
-                    count++;
+                    *(uint64_t*)patch += (uint64_t)delta;
+                    count_dir64++;
+                    break;
+                case IMAGE_REL_BASED_HIGHLOW:
+                    *(uint32_t*)patch += (uint32_t)delta32;
+                    count_highlow++;
+                    break;
+                case IMAGE_REL_BASED_HIGH:
+                    *(uint16_t*)patch += delta_high;
+                    count_high++;
+                    break;
+                case IMAGE_REL_BASED_LOW:
+                    *(uint16_t*)patch += delta_low;
+                    count_low++;
                     break;
                 default:
                     DBG("reloc: unsupported type %d at RVA 0x%lx, skip\n",
                         type, (unsigned long)(reloc->VirtualAddress + offset));
-                    /* MVP 不处理 HIGHLOW/HIGH/LOW，后续可加 */
                     break;
             }
         }
         reloc = (IMAGE_BASE_RELOCATION*)((uint8_t*)reloc + block_size);
     }
-    DBG("reloc: applied %d DIR64 fixups\n", count);
+    DBG("reloc: applied DIR64=%d HIGHLOW=%d HIGH=%d LOW=%d\n",
+        count_dir64, count_highlow, count_high, count_low);
     return 1;
 }
 
@@ -396,6 +482,204 @@ static void update_peb_image_base(void* new_base) {
     peb->ImageBaseAddress = new_base;
 }
 
+/* ---- 修改 PEB.Ldr 中主 EXE 的 LDR_DATA_TABLE_ENTRY ----
+ *
+ * 关键修复：让 OS 把反射加载的 new_img 当成"主 EXE 模块"
+ *
+ * 背景：FindResource 直接读 hModule 的 PE header，能工作；
+ *      但 LoadString / LoadResource / LdrFindResource_U 需要在
+ *      PEB.Ldr 里有对应模块条目，否则返回 ERROR_DIRECT_ACCESS_HANDLE (59)。
+ *      MFC42u!AfxWinInit 内部调用 LoadString 加载 IDS_VALID_RES 等，
+ *      失败时抛 C++ 异常 0xE06D7363，导致 DontSleep 崩溃。
+ *
+ * 方案（借鉴 AlushPacker LdrpPatchDataTableEntry）：
+ *   遍历 PEB.Ldr.InMemoryOrderModuleList，第一个条目就是主 EXE
+ *   （即 stub 自己）。覆写其 DllBase/EntryPoint/SizeOfImage/TimeDateStamp
+ *   为 new_img 的值。stub 在 jump_to_oep 之后就不再需要被 OS 识别，
+ *   所以覆写是安全的。
+ *
+ * 注意：BaseDllName / FullDllName 保持 stub 的名字不变
+ *      （MFC 主要用 hInstance 找资源，不在意文件名） */
+static void patch_peb_ldr_main_entry(void* new_img) {
+    PEBX* peb = WINLOCK_PEB();
+    PEB_LDR_DATA_X* ldr = (PEB_LDR_DATA_X*)peb->Ldr;
+    if (!ldr) {
+        DBG("peb: Ldr is NULL, skip patch\n");
+        return;
+    }
+
+    /* InMemoryOrderModuleList 第一个 Flink 指向主 EXE 的 LDR_DATA_TABLE_ENTRY
+     * 注意：Flink 指向的是 InMemoryOrderLinks 字段，需要 CONTAINING_RECORD 回退到结构头 */
+    MY_LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
+    MY_LIST_ENTRY* first = head->Flink;
+    if (first == head) {
+        DBG("peb: InMemoryOrderModuleList is empty\n");
+        return;
+    }
+
+    /* first 指向 LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks（偏移 0x10）
+     * 回退 0x10 字节得到结构头 */
+    LDR_DATA_TABLE_ENTRY_X* entry = (LDR_DATA_TABLE_ENTRY_X*)
+        ((uint8_t*)first - offsetof(LDR_DATA_TABLE_ENTRY_X, InMemoryOrderLinks));
+
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)new_img;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)((uint8_t*)new_img + dos->e_lfanew);
+
+    DBG("peb: patch LDR entry %p: DllBase %p -> %p, SizeOfImage 0x%lx -> 0x%lx\n",
+        (void*)entry, (void*)entry->DllBase, new_img,
+        entry->SizeOfImage, nt->OptionalHeader.SizeOfImage);
+    DBG("peb:   EntryPoint %p -> %p\n",
+        (void*)entry->EntryPoint,
+        (void*)((uint8_t*)new_img + nt->OptionalHeader.AddressOfEntryPoint));
+
+    entry->DllBase     = new_img;
+    entry->EntryPoint  = (uint8_t*)new_img + nt->OptionalHeader.AddressOfEntryPoint;
+    entry->SizeOfImage = nt->OptionalHeader.SizeOfImage;
+    /* TimeDateStamp / HashLinks 等字段在 +0x80 之后，对 LdrFindResource_U
+     * 不是必须的，跳过（AlushPacker 也只更新上述 4 个字段就够用） */
+}
+
+/* ---- 从内存 PE 提取 RT_MANIFEST 资源并创建 activation context ----
+ *
+ * 阶段 2 关键功能：解决 comctl32 v6 等 SxS manifest 依赖问题
+ *
+ * 背景：反射式加载的原 PE 可能依赖 comctl32 v6（通过 manifest 声明）。
+ * 但 stub EXE 自身没有 manifest，进程启动时 OS 不会创建 activation context，
+ * LoadLibraryA("comctl32.dll") 只能加载 v5（经典主题）。
+ * 某些程序（如 DontSleep 用 MFC42u）在 comctl32 v5 下会 C++ 异常崩溃。
+ *
+ * 方案：stub 在跳 OEP 前，从原 PE 的 .rsrc 节提取 RT_MANIFEST 资源，
+ *      写临时文件，CreateActCtx + ActivateActCtx 激活。
+ *      后续 LoadLibrary 调用会自动走 manifest 声明的版本。
+ *
+ * 返回：0 成功（context 已激活），1 无 manifest，-1 失败 */
+static int activate_manifest_from_image(uint8_t* img) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+    if (dir->VirtualAddress == 0 || dir->Size == 0) {
+        DBG("actctx: no .rsrc directory, skip\n");
+        return 1;
+    }
+
+    /* 遍历资源目录找 RT_MANIFEST (type=24) */
+    uint8_t* rsrc_base = img + dir->VirtualAddress;
+    IMAGE_RESOURCE_DIRECTORY* type_dir = (IMAGE_RESOURCE_DIRECTORY*)rsrc_base;
+
+    /* 第一层：按 type 查找 RT_MANIFEST (24) */
+    DWORD type_count = type_dir->NumberOfNamedEntries + type_dir->NumberOfIdEntries;
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* type_entries =
+        (IMAGE_RESOURCE_DIRECTORY_ENTRY*)(type_dir + 1);
+
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* manifest_type = NULL;
+    for (DWORD i = 0; i < type_count; i++) {
+        if (!type_entries[i].NameIsString && type_entries[i].Id == 24) {
+            manifest_type = &type_entries[i];
+            break;
+        }
+    }
+    if (!manifest_type) {
+        DBG("actctx: no RT_MANIFEST (type=24) resource, skip\n");
+        return 1;
+    }
+
+    /* 第二层：按 name/id 查找（manifest 通常 id=1） */
+    IMAGE_RESOURCE_DIRECTORY* name_dir =
+        (IMAGE_RESOURCE_DIRECTORY*)(rsrc_base + manifest_type->OffsetToDirectory);
+    DWORD name_count = name_dir->NumberOfNamedEntries + name_dir->NumberOfIdEntries;
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* name_entries =
+        (IMAGE_RESOURCE_DIRECTORY_ENTRY*)(name_dir + 1);
+    if (name_count == 0) {
+        DBG("actctx: RT_MANIFEST has no entries, skip\n");
+        return 1;
+    }
+
+    /* 取第一个（manifest 通常只有一个，id=1） */
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* name_entry = &name_entries[0];
+
+    /* 第三层：按 language 查找 */
+    IMAGE_RESOURCE_DIRECTORY* lang_dir =
+        (IMAGE_RESOURCE_DIRECTORY*)(rsrc_base + name_entry->OffsetToDirectory);
+    DWORD lang_count = lang_dir->NumberOfNamedEntries + lang_dir->NumberOfIdEntries;
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* lang_entries =
+        (IMAGE_RESOURCE_DIRECTORY_ENTRY*)(lang_dir + 1);
+    if (lang_count == 0) {
+        DBG("actctx: RT_MANIFEST has no language entries, skip\n");
+        return 1;
+    }
+
+    /* 取第一个 language */
+    IMAGE_RESOURCE_DIRECTORY_ENTRY* lang_entry = &lang_entries[0];
+    IMAGE_RESOURCE_DATA_ENTRY* data_entry =
+        (IMAGE_RESOURCE_DATA_ENTRY*)(rsrc_base + lang_entry->OffsetToData);
+
+    /* 数据在原 PE 的 RVA 空间里（data_entry->OffsetToData 是 RVA） */
+    uint8_t* manifest_data = img + data_entry->OffsetToData;
+    DWORD manifest_size = data_entry->Size;
+    DBG("actctx: found RT_MANIFEST size=%lu at RVA=0x%lx\n",
+        manifest_size, (unsigned long)data_entry->OffsetToData);
+
+    if (manifest_size == 0 || manifest_size > 1024 * 1024) {
+        DBG("actctx: invalid manifest size %lu, skip\n", manifest_size);
+        return -1;
+    }
+
+    /* 写临时文件（CreateActCtx 的 lpSource 需要文件路径） */
+    char tmp_path[MAX_PATH];
+    DWORD n = GetTempPathA(MAX_PATH, tmp_path);
+    if (n == 0 || n >= MAX_PATH) {
+        DBG("actctx: GetTempPathA failed, skip\n");
+        return -1;
+    }
+    strcat(tmp_path, "winlock_reflective_manifest.xml");
+
+    HANDLE hf = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        DBG("actctx: CreateFile(%s) failed err=%lu\n", tmp_path, GetLastError());
+        return -1;
+    }
+    DWORD written = 0;
+    if (!WriteFile(hf, manifest_data, manifest_size, &written, NULL) || written != manifest_size) {
+        DBG("actctx: WriteFile failed err=%lu\n", GetLastError());
+        CloseHandle(hf);
+        return -1;
+    }
+    CloseHandle(hf);
+    DBG("actctx: wrote manifest to %s (%lu bytes)\n", tmp_path, manifest_size);
+
+    /* 创建 activation context
+     * lpSource 指向 manifest XML 文件（不是 PE 文件），
+     * 所以不需要 ACTCTX_FLAG_RESOURCE_NAME_VALID */
+    ACTCTXA act = { 0 };
+    act.cbSize = sizeof(act);
+    act.dwFlags = ACTCTX_FLAG_SET_PROCESS_DEFAULT;
+    act.lpSource = tmp_path;
+    act.lpResourceName = NULL;
+
+    HANDLE hActCtx = CreateActCtxA(&act);
+    if (hActCtx == INVALID_HANDLE_VALUE) {
+        DBG("actctx: CreateActCtxA failed err=%lu\n", GetLastError());
+        DeleteFileA(tmp_path);
+        return -1;
+    }
+    DBG("actctx: created context %p\n", hActCtx);
+
+    /* 激活 */
+    ULONG_PTR cookie = 0;
+    if (!ActivateActCtx(hActCtx, &cookie)) {
+        DBG("actctx: ActivateActCtx failed err=%lu\n", GetLastError());
+        DeleteFileA(tmp_path);
+        return -1;
+    }
+    DBG("actctx: activated (cookie=0x%lx)\n", (unsigned long)cookie);
+
+    /* 注意：临时文件不能删除，activation context 可能需要它
+     * 但实际上 CreateActCtx 成功后已经把 manifest 读入内存了，文件可以删
+     * 不过保险起见先不删，进程退出时 %TEMP% 会被清理 */
+    return 0;
+}
+
 /* ---- 反射式映射主流程 ---- */
 static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     (void)hdr;  /* MVP v1 不用 header 字段（v2 加密版会用到）*/
@@ -460,6 +744,23 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
         return NULL;
     }
 
+    /* 4.5 提前更新 PEB.ImageBaseAddress + PEB.Ldr 主 EXE 条目（在 IAT 处理之前）
+     *
+     * 原因 1：IAT 处理调用 LoadLibraryA 加载依赖 DLL（如 MFC42u.dll），
+     *        DLL 的 DllMain 可能调用 GetModuleHandle(NULL) 获取宿主 EXE 的 hInstance。
+     *        如果此时 PEB.ImageBaseAddress 还是 stub 的基址，DLL 会获取到错误的 hInstance。
+     *
+     * 原因 2：原 PE 的 OEP（如 MFC42u!AfxWinInit）会调用 LoadString / LoadResource，
+     *        这些走 LdrFindResource_U，需要 PEB.Ldr 里有对应模块条目，
+     *        否则返回 ERROR_DIRECT_ACCESS_HANDLE (59)，MFC 抛 C++ 异常。
+     *        修复：把 PEB.Ldr 第一个条目（主 EXE = stub）的 DllBase 改成 new_img。
+     *
+     * 风险：stub 自己的 CRT 全局变量已初始化（用的是 stub 基址），不受影响。
+     *      stub 代码不依赖 GetModuleHandle(NULL)。stub 在 jump_to_oep 之后就不再
+     *      需要 OS 识别，覆写主 EXE 条目是安全的。 */
+    update_peb_image_base(new_img);
+    patch_peb_ldr_main_entry(new_img);
+
     /* 5. 处理 IAT */
     if (!process_iat(new_img)) {
         DBG("map: process_iat failed\n");
@@ -477,13 +778,120 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     /* 8. 设置节权限 */
     set_section_permissions(new_img);
 
-    /* 9. 更新 PEB.ImageBaseAddress */
-    update_peb_image_base(new_img);
+    /* 9. 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
+     * 必须在 IAT 处理之后（LoadLibrary 才能走 manifest）
+     * 必须在 TLS callbacks 之前（TLS 可能也依赖 manifest） */
+    activate_manifest_from_image(new_img);
 
     /* 10. 调用 TLS callbacks */
     run_tls_callbacks(new_img);
 
     return new_img;
+}
+
+/* ---- Vectored Exception Handler（调试用，捕获 OEP 后的崩溃） ----
+ * 安装后，原 PE 代码崩溃时 VEH 会先触发，记录异常地址和代码。
+ * 这样可以定位反射式加载后 OEP 代码在哪里崩溃。
+ * 注意：VEH 里不能用 DBG 宏（可能触发递归异常），直接写文件 */
+static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    /* 过滤掉非严重异常 */
+    if (code == 0x40010006) return EXCEPTION_CONTINUE_SEARCH;  /* OutputDebugString */
+    if (code == 0x406D1388) return EXCEPTION_CONTINUE_SEARCH;  /* SetThreadName */
+
+    /* C++ 异常只记录前 3 次（避免日志爆炸） */
+    static int cpp_exc_count = 0;
+    if (code == 0xE06D7363) {
+        if (cpp_exc_count < 3) {
+            cpp_exc_count++;
+        } else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
+    /* 只记录真正的崩溃异常 + C++ 异常前几次 */
+    if (code != 0xE06D7363 &&
+        code != EXCEPTION_ACCESS_VIOLATION &&
+        code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION &&
+        code != EXCEPTION_IN_PAGE_ERROR &&
+        code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED &&
+        code != EXCEPTION_DATATYPE_MISALIGNMENT &&
+        code != EXCEPTION_FLT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_BREAKPOINT &&
+        code != EXCEPTION_SINGLE_STEP) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    /* 直接写文件，不用 DBG 宏 */
+    if (g_logf) {
+        fprintf(g_logf, "[VEH] exception code=0x%08lx addr=%p\n",
+                code, ep->ExceptionRecord->ExceptionAddress);
+        if (code == EXCEPTION_ACCESS_VIOLATION) {
+            const char* op = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" :
+                             ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "exec";
+            fprintf(g_logf, "[VEH] ACCESS_VIOLATION %s address %p\n",
+                    op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+        }
+        fprintf(g_logf, "[VEH] RIP=%p RSP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p\n",
+                (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rsp,
+                (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
+                (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8,
+                (void*)ep->ContextRecord->R9);
+        fflush(g_logf);
+        /* 用 RtlVirtualUnwind 做正确的栈回溯
+         * 根据已注册的 .pdata 表逐帧 unwind，得到真正的调用链
+         * 这样能精确定位抛异常的代码位置在 image 内的哪个函数 */
+        CONTEXT ctx = *ep->ContextRecord;
+        fprintf(g_logf, "[VEH] call stack (RtlVirtualUnwind):\n");
+        fflush(g_logf);
+        for (int depth = 0; depth < 32; depth++) {
+            uint64_t rip = ctx.Rip;
+            uint64_t rsp = ctx.Rsp;
+            if (rip == 0) break;
+            /* 标记地址所在模块 */
+            const char* mod = "?";
+            if (rip >= 0x400000 && rip < 0x500000) {
+                mod = "IMG";  /* DontSleep image */
+            } else if (rip >= 0x500000 && rip < 0x10000000) {
+                mod = "?";
+            }
+            fprintf(g_logf, "  [%d] %s rip=0x%llx rsp=0x%llx",
+                    depth, mod, (unsigned long long)rip, (unsigned long long)rsp);
+            if (rip >= 0x400000 && rip < 0x500000) {
+                fprintf(g_logf, " (RVA=0x%llx)", (unsigned long long)(rip - 0x400000));
+            }
+            fprintf(g_logf, "\n");
+            fflush(g_logf);
+
+            /* 用 RtlVirtualUnwind 计算下一帧 */
+            DWORD64 img_base;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(rip, &img_base, NULL);
+            if (!rf) {
+                /* 没有 .pdata 信息，假设是 leaf function（rsp+8 是返回地址） */
+                fprintf(g_logf, "      (no RUNTIME_FUNCTION, leaf unwind)\n");
+                fflush(g_logf);
+                ctx.Rip = *(uint64_t*)rsp;
+                ctx.Rsp = rsp + 8;
+            } else {
+                fprintf(g_logf, "      (rf: Begin=0x%x End=0x%x Unwind=0x%x img_base=0x%llx)\n",
+                        (unsigned)rf->BeginAddress, (unsigned)rf->EndAddress,
+                        (unsigned)rf->UnwindData, (unsigned long long)img_base);
+                fflush(g_logf);
+                PVOID handler_data;
+                DWORD64 establisher_frame;
+                RtlVirtualUnwind(0, img_base, rip, rf, &ctx, &handler_data,
+                                 &establisher_frame, NULL);
+            }
+            /* 防止无限循环 */
+            if (ctx.Rip == rip) break;
+            if (ctx.Rsp <= rsp) break;
+        }
+        fflush(g_logf);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* ---- stub 入口 ----
@@ -497,6 +905,9 @@ int main(int argc, char* argv[]) {
      * 如需实时观察，用 DebugView 查看 OutputDebugStringA 输出 */
     log_init();
 #endif
+
+    /* 安装 VEH 捕获 OEP 后的崩溃（调试用） */
+    AddVectoredExceptionHandler(1 /*第一个调用*/, refl_veh);
 
     DBG("=== WinLock Reflective Loader MVP v1 ===\n");
     DBG("stub image base = %p\n", (void*)GetModuleHandleW(NULL));
@@ -568,8 +979,8 @@ int main(int argc, char* argv[]) {
 
     /* 4. 跳 OEP */
     void* oep = new_img + hdr->oep_rva;
-    DBG("jump_to_oep(%p)\n", oep);
-    jump_to_oep(oep);
+    DBG("jump_to_oep(%p) ret=%p\n", oep, (void*)oep_returned);
+    jump_to_oep(oep, (void*)oep_returned);
     /* never returns */
     return 0;
 }

@@ -402,7 +402,6 @@ int main(int argc, char* argv[]) {
 
 以下功能均为**可选编译开关**或**flags 位**，默认关闭，需要时再开：
 
-- [ ] **加密升级**：ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256 100k 轮（payload.version=2）
 - [ ] **压缩**：LZ4 解压器（flags & COMPRESS）
 - [ ] **反调试**：PEB 三件套 + NtQueryInformationProcess + guard page（flags & ANTIDEBUG）
 - [ ] **反 dump**：PE header erasure + 函数指针 scrub（flags & ERASE_HDR）
