@@ -14,6 +14,7 @@
  *   2. VirtualAlloc 分配 SizeOfImage 内存（优先 preferred ImageBase）
  *   3. 复制 PE headers + 各节
  *   4. 处理 IAT（LoadLibraryA + GetProcAddress）
+ *   4.5 处理延迟导入表（DataDirectory[13]，预填延迟 IAT）
  *   5. 应用 relocations（5 类型）
  *   6. RtlAddFunctionTable 注册 .pdata（仅 x64，x86 SEH 走 FS:[0] 链无法手动注册）
  *   7. 初始化 SecurityCookie
@@ -62,6 +63,22 @@
   #define MY_MACHINE              IMAGE_FILE_MACHINE_I386
   typedef uint32_t thunk_t;
 #endif
+
+/* ---- 延迟导入表描述符（ImgDelayDescr）----
+ * MinGW winnt.h 不一定提供，自己定义
+ * 字段顺序与 Microsoft 文档一致（32 字节） */
+typedef struct {
+    DWORD Attributes;                  /* +0x00 bit1=DLAT_RVA 表示字段是 RVA 而非 VA */
+    DWORD DllNameRVA;                  /* +0x04 DLL 名字 RVA/VA */
+    DWORD ModuleHandleRVA;             /* +0x08 HMODULE 存放位置 RVA/VA（运行时填）*/
+    DWORD ImportAddressTableRVA;       /* +0x0C IAT RVA/VA（运行时填函数指针）*/
+    DWORD ImportNameTableRVA;          /* +0x10 INT RVA/VA（thunk 布局同 IAT）*/
+    DWORD BoundImportAddressTableRVA;  /* +0x14 绑定 IAT（不用）*/
+    DWORD UnloadInformationTableRVA;   /* +0x18 卸载信息（不用）*/
+    DWORD TimeDateStamp;               /* +0x1C */
+} IMAGE_DELAYLOAD_DESCRIPTOR_X;
+
+#define DLAT_RVA 0x01  /* Microsoft PE 规范：bit 0 = 1 表示字段是 RVA（现代 PE 默认）*/
 
 /* ---- 调试开关 ----
  * MVP 阶段开启 RDEBUG，日志写到 reflective_loader.log（与 EXE 同目录）
@@ -303,6 +320,118 @@ static int process_iat(uint8_t* img) {
         dll_count++;
     }
     DBG("iat: resolved %d dlls, %d functions\n", dll_count, func_count);
+    return 1;
+}
+
+/* ---- 处理延迟导入表（IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT）----
+ * 遍历 DataDirectory[13]，对每个 IMAGE_DELAYLOAD_DESCRIPTOR_X：
+ *   1. LoadLibraryA(dll_name) 加载 DLL
+ *   2. 把 HMODULE 写到 ModuleHandleRVA 指向的位置（供原 PE 的 __delayLoadHelper2 复用）
+ *   3. 遍历 ImportNameTable，GetProcAddress 解析每个函数
+ *   4. 写入 ImportAddressTable
+ *
+ * 策略：启动时主动加载所有延迟导入，跟普通 IAT 一样预填 IAT。
+ * 优点：原 PE 跳到 OEP 时延迟 IAT 已就绪，首次调用直接走真实函数，
+ *      不依赖原 PE 内部的 __delayLoadHelper2 stub 机制。
+ * 缺点：失去延迟加载的启动加速效果（对 packer 不重要）。
+ *
+ * 字段格式：现代 PE（VS2008+）所有字段是 RVA（Attributes & DLAT_RVA），
+ *          老格式是 VA，需要减去 preferred ImageBase 转成 RVA。
+ *
+ * 失败策略：DLL 加载失败或函数解析失败都写 NULL 并警告，不退出。
+ * 原因：延迟导入本身就是可选的（程序不调用就不会触发），宽松处理能让
+ *      更多 PE 跑到 OEP（即使个别延迟函数不存在）。 */
+static int process_delay_imports(uint8_t* img) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (dir->VirtualAddress == 0 || dir->Size == 0) {
+        DBG("delay: no delay import directory, skip\n");
+        return 1;
+    }
+
+    /* preferred ImageBase，用于把老格式 VA 转 RVA */
+    uint64_t img_base = (uint64_t)nt->OptionalHeader.ImageBase;
+
+    IMAGE_DELAYLOAD_DESCRIPTOR_X* desc =
+        (IMAGE_DELAYLOAD_DESCRIPTOR_X*)(img + dir->VirtualAddress);
+    int dll_count = 0, func_count = 0;
+    /* 终止条件：全 0 描述符（Attributes=0 && DllNameRVA=0）*/
+    for (; desc->Attributes != 0 || desc->DllNameRVA != 0; desc++) {
+        int is_rva = (desc->Attributes & DLAT_RVA) != 0;
+
+        /* DllName 位置 */
+        uint32_t name_rva = desc->DllNameRVA;
+        if (!is_rva && name_rva) {
+            /* VA 格式：减去 preferred ImageBase 得到 RVA */
+            name_rva = (uint32_t)((uint64_t)desc->DllNameRVA - img_base);
+        }
+        if (name_rva == 0) continue;
+        const char* dll_name = (const char*)(img + name_rva);
+
+        /* IAT / INT / HMODULE 位置 */
+        uint32_t iat_rva = desc->ImportAddressTableRVA;
+        uint32_t int_rva = desc->ImportNameTableRVA;
+        uint32_t hm_rva  = desc->ModuleHandleRVA;
+        if (!is_rva) {
+            if (iat_rva) iat_rva = (uint32_t)((uint64_t)iat_rva - img_base);
+            if (int_rva) int_rva = (uint32_t)((uint64_t)int_rva - img_base);
+            if (hm_rva)  hm_rva  = (uint32_t)((uint64_t)hm_rva  - img_base);
+        }
+
+        DBG("delay: loading %s (attrs=0x%lx, rva_fmt=%d)\n", dll_name, desc->Attributes, is_rva);
+        HMODULE hMod = LoadLibraryA(dll_name);
+        if (!hMod) {
+            /* 延迟 DLL 加载失败：警告但不退出（程序可能根本不调用这些函数）*/
+            DBG("delay: WARN LoadLibraryA(%s) failed, err=%lu, skip this dll\n",
+                dll_name, GetLastError());
+            continue;
+        }
+
+        /* 把 HMODULE 写到 ModuleHandleRVA 指向的位置
+         * 原因：原 PE 的 __delayLoadHelper2 会读这个 HMODULE 复用已加载的 DLL */
+        if (hm_rva) {
+            HMODULE* hm_slot = (HMODULE*)(img + hm_rva);
+            *hm_slot = hMod;
+        }
+
+        /* 遍历 INT，解析每个函数，写入 IAT
+         * INT 和 IAT 都是 thunk_t 数组（x64=8字节，x86=4字节）
+         * INT 项布局与普通 IAT 相同：
+         *   - 高位 1（IMAGE_ORDINAL_FLAG_X）：按 ordinal 导入
+         *   - 否则：低 31 位是 IMAGE_IMPORT_BY_NAME 的 RVA */
+        if (int_rva && iat_rva) {
+            thunk_t* intp = (thunk_t*)(img + int_rva);
+            thunk_t* iatp = (thunk_t*)(img + iat_rva);
+            for (; *intp != 0; intp++, iatp++) {
+                const char* func_name = NULL;
+                WORD ord = 0;
+                if (*intp & IMAGE_ORDINAL_FLAG_X) {
+                    ord = (WORD)IMAGE_ORDINAL_X(*intp);
+                } else {
+                    IMAGE_IMPORT_BY_NAME* iibn = (IMAGE_IMPORT_BY_NAME*)(img + (*intp & 0x7FFFFFFF));
+                    func_name = (const char*)iibn->Name;
+                }
+
+                FARPROC fn;
+                if (func_name) {
+                    fn = GetProcAddress(hMod, func_name);
+                } else {
+                    fn = GetProcAddress(hMod, MAKEINTRESOURCEA(ord));
+                }
+                if (!fn) {
+                    DBG("delay: WARN GetProcAddress failed for %s!%s (err=%lu), set NULL\n",
+                        dll_name, func_name ? func_name : "#ord", GetLastError());
+                    *iatp = 0;
+                    continue;
+                }
+                *iatp = (thunk_t)fn;
+                func_count++;
+            }
+        }
+        dll_count++;
+    }
+    DBG("delay: resolved %d dlls, %d functions\n", dll_count, func_count);
     return 1;
 }
 
@@ -816,6 +945,15 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     if (!process_iat(new_img)) {
         DBG("map: process_iat failed\n");
         return NULL;
+    }
+
+    /* 5.5 处理延迟导入表（DataDirectory[13]）
+     *      CCleaner 等 app 有 12 个延迟导入 DLL，不处理会导致
+     *      跳到 OEP 后调用延迟函数时 access violation。
+     *      失败不致命：某些延迟函数可能在不同 Windows 版本不存在，
+     *      但只要原 PE 不实际调用就不会崩 */
+    if (!process_delay_imports(new_img)) {
+        DBG("map: process_delay_imports failed (non-fatal, continue)\n");
     }
 
     /* 6. 注册 .pdata（失败不致命，SEH 可能不工作但能跑） */

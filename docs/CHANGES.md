@@ -1,5 +1,34 @@
 # 变更记录
 
+## 变更记录 2026-07-19 反射式 Packer 阶段二续2：延迟导入表处理 + 大型 app 测试通过
+
+实现 `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` 延迟导入表处理，CCleaner（45MB, 12 个延迟 DLL）从"OEP 后立即崩"修复到"OEP reached"。
+
+1. **`packer/reflective/loader.c` 新增 `process_delay_imports` 函数**
+   - 自定义 `IMAGE_DELAYLOAD_DESCRIPTOR_X` 结构（MinGW winnt.h 不提供），32 字节
+   - `DLAT_RVA = 0x01`（Microsoft PE 规范：bit 0 = 1 表示字段是 RVA；之前误用 0x02 导致 CCleaner 崩溃）
+   - 流程：遍历描述符表 → `LoadLibraryA(dll_name)` → HMODULE 写到 `ModuleHandleRVA`（供原 PE 的 `__delayLoadHelper2` 复用）→ 遍历 INT 用 `GetProcAddress` 解析函数 → 写入 IAT
+   - 字段格式：现代 PE（VS2008+）用 RVA 格式（Attributes & 1），老格式用 VA，按 Attributes 判断
+   - 失败策略：DLL 加载失败或函数解析失败写 NULL + 警告，不退出（延迟导入本身可选）
+   - 在 `map_image` 主流程 `process_iat` 之后调用，失败不致命
+
+2. **测试结果**
+   - **CCleaner x64**（45.85MB, 12 延迟 DLL）：延迟导入 10/12 DLL 加载，107 函数解析，jump_to_oep 成功（之前 OEP 后立即 access violation）
+     - CCleanerDU.dll / libwaapi.dll 加载失败（CCleaner 可选组件，目录里没有），CCleaner 内部调用这些 NULL 函数指针时 VEH 捕获异常，非 loader 问题
+   - **VLC x64/x86**：窗口弹出 ✓
+   - **回归测试 9/9 PASS**：Notepad4 / DontSleep / helloguix64 / helloguix86 / hellocli / hellomingw / helloucrt / ddccli / sha256sum（无延迟导入的 PE 不受影响）
+
+3. **大型 app 测试脚本** `temp/test_testapps.py`
+   - 在原目录就地加壳（保留外部 DLL 依赖路径）
+   - 启动 → 等待 → 检查窗口 → 读日志 → kill
+   - 测试 CCleaner x64 / VLC x64 / VLC x86
+
+4. **遗留**
+   - forwarder 递归解析（GetProcAddress 自动处理，暂不需要）
+   - 资源保留（builder 端复制 .rsrc 节，PEB.Ldr 覆写后 OS 能找到资源，暂不阻塞）
+   - x86 复杂 SEH 程序支持
+   - dotnet packer 集成
+
 ## 变更记录 2026-07-19 反射式 Packer 阶段二续：x86 架构支持 + 9/9 样本通过
 
 在 x64 反射式 loader 基础上新增 x86 (i386) 架构支持，builder 按输入 PE 的 Machine 字段自动选 stub，**batch test 9/9 全部 PASS**（含 x86 样本 helloguix86.exe）。
