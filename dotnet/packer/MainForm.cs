@@ -31,6 +31,8 @@ namespace WinAppLocker.Packer {
                         this.Icon = new System.Drawing.Icon(stream);
                 }
             } catch { }
+
+            AppLogger.Info($"GUI 启动（日志目录: {AppLogger.LogDirectory ?? "(禁用)"}）");
         }
 
         private void MainForm_Load(object sender, EventArgs e) {
@@ -64,6 +66,8 @@ namespace WinAppLocker.Packer {
                 cbStubPreference.Items.Add(new StubListItem(s, label));
             }
             cbStubPreference.SelectedIndex = 0;
+
+            AppLogger.Info($"已加载 stub 列表: 共 {_availableStubs.Count} 个（可用 {_availableStubs.Count(s => s.IsAvailable)}，缺失 {_availableStubs.Count(s => !s.IsAvailable)}），目录: {stubDir}");
         }
 
         /// <summary>更新版本信息 label：显示所有可用 stub 的版本</summary>
@@ -136,6 +140,8 @@ namespace WinAppLocker.Packer {
                     string name = System.IO.Path.GetFileNameWithoutExtension(dlg.FileName);
                     txtOutputPath.Text = System.IO.Path.Combine(dir, name + "_locked.exe");
                     UpdatePackButton();
+                    // 选了输入文件后立即显示 PE 信息
+                    UpdatePeInfoLabel(dlg.FileName);
                     // 选了输入文件后，检查 WinLock + Console 子系统组合，警告
                     WarnIfIncompatible();
                 }
@@ -213,6 +219,58 @@ namespace WinAppLocker.Packer {
             btnPack.Enabled = ready;
         }
 
+        /// <summary>
+        /// 选择输入 exe 后，把 PE 关键信息（架构/子系统/ASLR/DEP/TLS/签名/.NET/大小）
+        /// 显示在 lblPeInfo 上，放在"执行加密操作"按钮上方。
+        /// </summary>
+        private void UpdatePeInfoLabel(string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
+            {
+                lblPeInfo.Text = "";
+                lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;
+                return;
+            }
+
+            try
+            {
+                byte[] pe = File.ReadAllBytes(exePath);
+                var info = PeReader.Parse(pe);
+
+                // 大小用 KB 显示
+                double sizeKb = info.FileSize / 1024.0;
+                string sizeStr = sizeKb >= 1024
+                    ? $"{sizeKb / 1024.0:F1}MB"
+                    : $"{sizeKb:F0}KB";
+
+                // 格式：x64 | GUI | ASLR✓ DEP✓ CFG✗ HEVA✗ | TLS✗ Signed✗ Reloc✓ | .NET✗ | 523.0KB
+                // 用 ✓/✗ 直观表示开关
+                string text = string.Join(" | ",
+                    $"{info.MachineName}",
+                    $"{info.SubsystemName}",
+                    $"ASLR{(info.IsAslr ? "✓" : "✗")} DEP{(info.IsDep ? "✓" : "✗")} CFG{(info.IsCfg ? "✓" : "✗")} HEVA{(info.IsHighEntropyVA ? "✓" : "✗")}",
+                    $"TLS{(info.HasTls ? "✓" : "✗")} Signed{(info.IsSigned ? "✓" : "✗")} Reloc{(info.HasReloc ? "✓" : "✗")}",
+                    $".NET{(info.IsDotNet ? "✓" : "✗")}",
+                    sizeStr);
+
+                lblPeInfo.Text = text;
+
+                // 警告色：.NET 程序或带签名（加壳后签名会失效）
+                if (info.IsDotNet || info.IsSigned)
+                    lblPeInfo.ForeColor = System.Drawing.Color.OrangeRed;
+                else
+                    lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;
+
+                AppLogger.Info($"PE 信息: {text}  路径: {exePath}");
+            }
+            catch (Exception ex)
+            {
+                lblPeInfo.Text = $"PE 信息读取失败: {ex.Message}";
+                lblPeInfo.ForeColor = System.Drawing.Color.Red;
+                AppLogger.Warn($"PE 信息读取失败: {exePath}  异常: {ex.Message}");
+            }
+        }
+
         private async void btnPack_Click(object sender, EventArgs e) {
             if (txtPassword.Text != txtConfirm.Text) {
                 MessageBox.Show(this, "两次密码不一致", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -257,6 +315,22 @@ namespace WinAppLocker.Packer {
             lblResult.Text = "正在加密…";
             lblResult.ForeColor = System.Drawing.Color.Black;
 
+            // 读取所选 exe 的 PE 信息后写入"开始加密"日志
+            // 这样即便用户中途清空了 lblPeInfo 显示，日志里也有该 exe 的关键属性
+            string peSummary = "(PE 读取失败)";
+            try
+            {
+                byte[] pe = File.ReadAllBytes(opts.InputPath);
+                var peInfo = PeReader.Parse(pe);
+                peSummary = $"{peInfo.MachineName}/{peInfo.SubsystemName} " +
+                            $"ASLR={peInfo.IsAslr} DEP={peInfo.IsDep} CFG={peInfo.IsCfg} HEVA={peInfo.IsHighEntropyVA} " +
+                            $"TLS={peInfo.HasTls} Signed={peInfo.IsSigned} Reloc={peInfo.HasReloc} " +
+                            $".NET={peInfo.IsDotNet} size={peInfo.FileSize}";
+            }
+            catch (Exception ex) { peSummary = $"(PE 读取失败: {ex.Message})"; }
+
+            AppLogger.Info($"开始加密: input={opts.InputPath} output={opts.OutputPath} stub={(opts.PreferStubName ?? "auto")} iterations={opts.KdfIterations} PE=[{peSummary}]");
+
             var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
             try {
                 var progress = new Progress<int>(p => {
@@ -265,14 +339,26 @@ namespace WinAppLocker.Packer {
                 });
 
                 var report = await System.Threading.Tasks.Task.Run(() =>
-                    PackCore.Pack(opts, progress, msg => logs.Enqueue(msg)));
+                    PackCore.Pack(opts, progress, msg => {
+                        logs.Enqueue(msg);
+                        // 按消息前缀区分级别写入 AppLogger
+                        // PackCore / IconCopier / WinLock 的 "WARN:" / "ERROR:" / "[stderr]" 走 Warn，
+                        // 其余走 Info
+                        if (msg.Contains("WARN:") || msg.Contains("ERROR:") || msg.Contains("[stderr]"))
+                            AppLogger.Warn(msg);
+                        else
+                            AppLogger.Info(msg);
+                    }));
 
                 string modeTag = report.UsedKind == StubKind.InplaceBuilder ? " [WinLock]" : "";
                 lblResult.Text = $"✓ 加密成功{modeTag}：{report.InputSize / 1024.0:F1}KB → {report.OutputSize / 1024.0:F1}KB";
                 lblResult.ForeColor = System.Drawing.Color.Green;
+
+                AppLogger.Info($"加密成功: {report.InputSize} → {report.OutputSize} bytes, stub={report.UsedStubName} ({report.UsedKind})");
             } catch (Exception ex) {
                 lblResult.Text = $"✗ 失败: {ex.Message}";
                 lblResult.ForeColor = System.Drawing.Color.Red;
+                AppLogger.Error($"加密失败: input={opts.InputPath} output={opts.OutputPath}", ex);
             } finally {
                 btnPack.Enabled = true;
                 btnBrowseInput.Enabled = true;

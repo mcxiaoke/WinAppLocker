@@ -76,10 +76,13 @@ dist/
     ├── stub_test.exe.meta.json
     ├── winlock_builder.exe       # WinLock 加壳器（打包时用，x64 单文件）
     ├── winlock_builder.exe.meta.json
-    ├── stub_x64.bin              # WinLock x64 运行时 stub（被 builder 嵌入目标 PE）
-    ├── stub_x86.bin              # WinLock x86 运行时 stub
-    └── stub_x86.exe              # x86 stub 完整 PE（builder 读 .reloc 用）
+    ├── winlock_stub_x64.bin      # WinLock x64 运行时 stub（被 builder 嵌入目标 PE）
+    ├── winlock_stub_x86.bin      # WinLock x86 运行时 stub
+    └── winlock_stub_x86.exe      # x86 stub 完整 PE（builder 读 .reloc 用）
 ```
+
+> 自 v1.0.0 起，WinLock 运行时 stub 文件统一加 `winlock_` 前缀避免与其它 stub 混淆。
+> builder.exe 仍向后兼容旧名 `stub_x{64,86}.bin` / `stub_x86.exe`（开发者直接 `make` 产物）。
 
 > **注意**：分发时必须把整个 `dist/` 目录一起分发，不能只拷 `WinAppLocker.exe`。
 > packer 启动时会扫描 `stub/` 目录，找不到 stub 会无法工作。
@@ -137,6 +140,62 @@ WinAppLocker.exe --version
 
 ---
 
+## Stub 自动选择标准
+
+当用户不显式指定 stub（即 `--stub Auto` 或 GUI 下拉框选"自动"）时，packer 按以下
+顺序在 `stub/` 目录中挑选合适的 stub。**默认总是走临时文件模式**（兼容性最高），
+WinLock 必须用户显式指定（`--stub-name winlock` 或 GUI 下拉框选 winlock）。
+
+### 选择流程
+
+`StubRegistry.Select(all, originalSubsystem, machine, preferName)` 实现，优先级：
+
+1. **用户指定优先**：若 `preferName` 非空（`--stub-name winlock` / `applocker-gui` 等），
+   且该 stub 满足 `IsAvailable`（主文件 + components 全部存在）和 `SupportsMachine`
+   （架构匹配）→ 直接用。
+2. **按子系统自动匹配**：根据原 EXE 的 `OptionalHeader.Subsystem` 选 tempfile stub：
+   - `Windows Cui`（Console 程序）→ `applocker-console`
+   - `Windows Gui`（GUI 程序）或其他 → `applocker-gui`
+3. **退而求其次**：若上面找不到，返回任意 `IsAvailable && SupportsMachine` 的 stub。
+
+### 选择约束
+
+- **`IsAvailable`**：stub 主文件存在 + `components` 中列出的所有依赖文件（如 WinLock 的
+  `winlock_stub_x64.bin` / `winlock_stub_x86.bin`）都存在。缺失任意一个就跳过该 stub。
+- **`SupportsMachine`**：检查 manifest 的 `supported_machines` 字段：
+  - tempfile stub（`applocker-*`）没填该字段 → 视为支持任意架构（`AnyCPU` 托管 PE）
+  - WinLock manifest 填 `["amd64", "i386"]` → 仅匹配 PE32+ (x64) 或 PE32 (x86) 输入
+  - 不匹配的架构跳过该 stub（例如 ARM64 输入会跳过 WinLock）
+
+### 何时选 WinLock
+
+WinLock **不会被自动选中**，必须显式指定：
+
+```powershell
+# CLI
+WinAppLocker.exe --pack -i input.exe -o output.exe -p 密码 --stub-name winlock
+
+# GUI：下拉框选 "winlock"
+```
+
+若用户选了 WinLock 但输入 PE 不满足条件，packer 会在打包前抛出明确错误：
+
+| 输入 PE 特征 | WinLock 是否可用 | 原因 |
+|------|------|------|
+| .NET CLR 托管 | ❌ | XTEA 加密 `.text` 节会破坏 CLR metadata |
+| Console 子系统 | ❌ | WinLock stub 用 `DialogBoxIndirectParamW` 弹 GUI 密码框 |
+| DLL | ❌ | builder 只处理 EXE |
+| ARM64 / ARM | ❌ | `winlock_stub_*.bin` 仅支持 amd64 / i386 |
+| x64 / x86 原生 GUI EXE | ✅ | 正常加壳 |
+
+### 为什么默认走临时文件模式
+
+临时文件模式兼容性极高（等同于原 EXE 直接运行），支持任意架构、.NET / 原生 / Console
+程序。WinLock 是 in-place 加壳，会修改原 PE 结构（新增 `.lock` 节、加密 `.text` 节、
+剥离签名等），有一定兼容性风险（见"WinLock 限制"章节），所以默认不启用，由用户显式选择。
+
+---
+
 ## WinLock 模式
 
 ### 工作原理
@@ -180,7 +239,7 @@ WinLock 模式**不适用**于以下程序：
 ## 开发测试方法
 
 - **构建**：`.\build.ps1 -Release` 生成 `dist/WinAppLocker.exe` + `dist/stub/`。
-- **自动化测试**：`.\test.ps1` 使用内置密码的 `stub_test` 做端到端 round-trip 测试，
+- **自动化测试**：`.\tests\auto_test.ps1` 使用内置密码的 `stub_test` 做端到端 round-trip 测试，
   默认对 `..\temp\samples` 下的 CLI/GUI 样本加解密并验证运行；可加 `-Info` 同时校验
   `--info` 输出，或 `-Samples "a.exe,b.exe"` 指定样本。
 - **WinLock 手动测试**：
@@ -226,9 +285,9 @@ dotnet/
 │       ├── stub_console.exe + .meta.json
 │       ├── stub_test.exe + .meta.json
 │       ├── winlock_builder.exe + .meta.json
-│       ├── stub_x64.bin
-│       ├── stub_x86.bin
-│       └── stub_x86.exe
+│       ├── winlock_stub_x64.bin
+│       ├── winlock_stub_x86.bin
+│       └── winlock_stub_x86.exe
 └── tests/                          # 临时测试脚本
 ```
 

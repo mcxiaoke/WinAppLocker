@@ -1,7 +1,7 @@
 {
-  "subsystem": "test",
+  "description": "AppLocker Test stub (hardcoded password test1234, for testing only)",
+  "kind": "tempfile",
   "name": "applocker-test",
   "version": "1.0.0",
-  "kind": "tempfile",
-  "description": "AppLocker Test stub (hardcoded password test1234, for testing only)"
+  "subsystem": "test"
 }

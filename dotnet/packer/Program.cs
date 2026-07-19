@@ -17,13 +17,14 @@ namespace WinAppLocker.Packer
         [STAThread]
         private static int Main(string[] args)
         {
-            // 任何 CLI 命令：--info / --pack / --version / --help 都需要先接管父控制台
+            // 任何 CLI 命令：--info / --pack / --version / --help 都需要先接管父控制台才能输出
             bool cliMode = args.Length > 0;
             if (cliMode)
             {
                 AttachConsole(ATTACH_PARENT_PROCESS);
                 // 让 stdout 立即写入已接管控制台，避免缓冲
                 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+                AppLogger.Info($"CLI 调用: {string.Join(" ", args)}");
             }
 
             // --info <packed.exe>: 读取已加密 EXE 的元信息，验证打包是否正确
@@ -35,6 +36,17 @@ namespace WinAppLocker.Packer
                     return 2;
                 }
                 return PackInfo.Inspect(args[1]);
+            }
+
+            // --pe-info <exe>: 显示 PE 关键信息（架构/子系统/ASLR/DEP/TLS/签名等），用于诊断
+            if (args.Length > 0 && (args[0] == "--pe-info" || args[0] == "-pe-info"))
+            {
+                if (args.Length < 2)
+                {
+                    Console.Error.WriteLine("用法: WinAppLocker.exe --pe-info <exe>");
+                    return 2;
+                }
+                return PrintPeInfo(args[1]);
             }
 
             // --list-stubs: 列出 stub/ 目录下所有 stub manifest
@@ -91,6 +103,7 @@ namespace WinAppLocker.Packer
             Console.WriteLine("  WinAppLocker.exe                              启动 GUI 界面");
             Console.WriteLine("  WinAppLocker.exe --pack -i <input> -o <output> -p <password> [options]");
             Console.WriteLine("  WinAppLocker.exe --info <packed.exe>          检查已加密 EXE 的信息");
+            Console.WriteLine("  WinAppLocker.exe --pe-info <exe>              显示 PE 关键信息（架构/ASLR/DEP/TLS/签名等）");
             Console.WriteLine("  WinAppLocker.exe --version                    显示版本信息");
             Console.WriteLine();
             Console.WriteLine("pack 选项:");
@@ -188,19 +201,42 @@ namespace WinAppLocker.Packer
 
             try
             {
+                // 读 PE 信息后写入"CLI 加密开始"日志，方便事后排查
+                string peSummary = "(PE 读取失败)";
+                try
+                {
+                    byte[] pe = File.ReadAllBytes(inputPath);
+                    var peInfo = PeReader.Parse(pe);
+                    peSummary = $"{peInfo.MachineName}/{peInfo.SubsystemName} " +
+                                $"ASLR={peInfo.IsAslr} DEP={peInfo.IsDep} CFG={peInfo.IsCfg} HEVA={peInfo.IsHighEntropyVA} " +
+                                $"TLS={peInfo.HasTls} Signed={peInfo.IsSigned} Reloc={peInfo.HasReloc} " +
+                                $".NET={peInfo.IsDotNet} size={peInfo.FileSize}";
+                }
+                catch (Exception ex) { peSummary = $"(PE 读取失败: {ex.Message})"; }
+
+                AppLogger.Info($"CLI 加密开始: input={inputPath} output={outputPath} stub-name={stubName ?? "(null)"} stub-pref={stubPref} iterations={iterations} PE=[{peSummary}]");
                 var report = PackCore.Pack(opts, new Progress<int>(p =>
                 {
                     Console.Write($"\r进度: {p,3}%");
-                }), msg => Console.Error.WriteLine($"[log] {msg}"));
+                }), msg => {
+                    Console.Error.WriteLine($"[log] {msg}");
+                    // 按消息前缀区分级别
+                    if (msg.Contains("WARN:") || msg.Contains("ERROR:") || msg.Contains("[stderr]"))
+                        AppLogger.Warn(msg);
+                    else
+                        AppLogger.Info(msg);
+                });
                 Console.WriteLine();
                 Console.WriteLine($"✓ 加密成功: {report.InputSize} bytes → {report.OutputSize} bytes");
                 Console.WriteLine($"  输出: {report.OutputPath}");
                 Console.WriteLine($"  使用 stub: {report.UsedStubName} ({report.UsedKind})");
+                AppLogger.Info($"CLI 加密成功: {report.InputSize} → {report.OutputSize} bytes, stub={report.UsedStubName} ({report.UsedKind})");
                 return 0;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"✗ 失败: {ex.Message}");
+                AppLogger.Error($"CLI 加密失败: input={inputPath} output={outputPath}", ex);
                 return 3;
             }
         }
@@ -226,6 +262,44 @@ namespace WinAppLocker.Packer
                     Console.WriteLine($"    arch: {string.Join(", ", s.SupportedMachines)}");
             }
             return 0;
+        }
+
+        /// <summary>--pe-info：打印 PE 关键信息，用于诊断原 EXE 属性</summary>
+        private static int PrintPeInfo(string exePath)
+        {
+            if (!File.Exists(exePath))
+            {
+                Console.Error.WriteLine($"文件不存在: {exePath}");
+                return 2;
+            }
+
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(exePath);
+                var info = PeReader.Parse(bytes);
+
+                Console.WriteLine($"文件: {exePath}");
+                Console.WriteLine($"  架构 (Machine):  0x{info.Machine:X4}  ({info.MachineName})");
+                Console.WriteLine($"  子系统 (Subsystem): {info.Subsystem}  ({info.SubsystemName})");
+                Console.WriteLine($"  .NET CLR 托管:    {info.IsDotNet}");
+                Console.WriteLine($"  ASLR (DynamicBase):    {info.IsAslr}");
+                Console.WriteLine($"  DEP (NxCompat):        {info.IsDep}");
+                Console.WriteLine($"  HighEntropyVA:         {info.IsHighEntropyVA}");
+                Console.WriteLine($"  CFG (GuardCf):         {info.IsCfg}");
+                Console.WriteLine($"  TLS 目录:              {info.HasTls}");
+                Console.WriteLine($"  Authenticode 签名:     {info.IsSigned}");
+                Console.WriteLine($"  重定位表 (.reloc):     {info.HasReloc}");
+                Console.WriteLine($"  文件大小:              {info.FileSize:N0} bytes ({info.FileSize / 1024.0:F1} KB)");
+
+                AppLogger.Info($"--pe-info {exePath}: machine={info.MachineName} subsystem={info.SubsystemName} dotnet={info.IsDotNet} aslr={info.IsAslr} dep={info.IsDep} tls={info.HasTls} signed={info.IsSigned} size={info.FileSize}");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"PE 解析失败: {ex.Message}");
+                AppLogger.Error($"--pe-info 失败: {exePath}", ex);
+                return 3;
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 # WinLock demo - Makefile
 # x64 stub + builder 用 w64devkit GCC 编译
 # x86 stub 用 msys2 mingw32 GCC 编译（可选，仅 'make all-x86' 时需要）
+# 请使用 mingw32-make 而不是msys的默认make
 #
 # 工具链路径（可按需覆盖，例如：make all-x86 MSYS_MINGW32=/path/to/mingw32）
 W64DEVKIT    ?= C:/Home/Develop/w64devkit/bin
@@ -20,6 +21,7 @@ RM           := rm -f
 MKDIR        := mkdir -p
 
 ROOT     := $(CURDIR)
+COMMON_DIR := $(ROOT)/common
 STUB_DIR := $(ROOT)/stub
 BLD_DIR  := $(ROOT)/builder
 TST_DIR  := $(ROOT)/test
@@ -107,7 +109,7 @@ check-x86-toolchain:
 	fi
 
 # === 构建 x64 stub ===
-$(STUB_OBJ_X64): $(STUB_SRC) $(ROOT)/config.h
+$(STUB_OBJ_X64): $(STUB_SRC) $(COMMON_DIR)/config.h
 	$(GCC_X64) $(STUB_CFLAGS_X64) -c $< -o $@
 
 $(STUB_EXE_X64): $(STUB_OBJ_X64) $(STUB_DIR)/stub.ld
@@ -119,7 +121,7 @@ $(STUB_BIN_X64): $(STUB_EXE_X64)
 	@$(NM) $< 2>/dev/null | grep -E "stub_entry|stub_data|STR_" | head -20 || true
 
 # === 构建 x86 stub ===
-$(STUB_OBJ_X86): $(STUB_SRC) $(ROOT)/config.h check-x86-toolchain
+$(STUB_OBJ_X86): $(STUB_SRC) $(COMMON_DIR)/config.h check-x86-toolchain
 	$(GCC_X86) $(STUB_CFLAGS_X86) -c $< -o $@
 
 $(STUB_EXE_X86): $(STUB_OBJ_X86) $(STUB_DIR)/stub.ld
@@ -131,7 +133,7 @@ $(STUB_BIN_X86): $(STUB_EXE_X86)
 	@$(NM) $< 2>/dev/null | grep -E "stub_entry|stub_data|STR_" | head -20 || true
 
 # === 构建 builder ===
-$(BLD_EXE): $(BLD_SRC) $(ROOT)/config.h
+$(BLD_EXE): $(BLD_SRC) $(COMMON_DIR)/config.h
 	$(GCC_X64) $(BLD_CFLAGS) $< -o $@ $(BLD_LDFLAGS)
 
 # === 测试：加壳 hellogui.exe ===

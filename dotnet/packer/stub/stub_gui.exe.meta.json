@@ -1,7 +1,7 @@
 {
-  "subsystem": "gui",
+  "description": "AppLocker GUI stub (tempfile mode, password dialog)",
+  "kind": "tempfile",
   "name": "applocker-gui",
   "version": "1.0.0",
-  "kind": "tempfile",
-  "description": "AppLocker GUI stub (tempfile mode, password dialog)"
+  "subsystem": "gui"
 }

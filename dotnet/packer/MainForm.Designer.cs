@@ -26,6 +26,7 @@ namespace WinAppLocker.Packer
         private System.Windows.Forms.Label lblStubGuiVersion;
         private System.Windows.Forms.Label lblStubConsoleVersion;
         private System.Windows.Forms.Label lblStubTestVersion;
+        private System.Windows.Forms.Label lblPeInfo;
 
         protected override void Dispose(bool disposing)
         {
@@ -59,6 +60,7 @@ namespace WinAppLocker.Packer
             this.lblStubGuiVersion = new System.Windows.Forms.Label();
             this.lblStubConsoleVersion = new System.Windows.Forms.Label();
             this.lblStubTestVersion = new System.Windows.Forms.Label();
+            this.lblPeInfo = new System.Windows.Forms.Label();
             ((System.ComponentModel.ISupportInitialize)(this.numIterations)).BeginInit();
             this.SuspendLayout();
             // 
@@ -236,81 +238,97 @@ namespace WinAppLocker.Packer
             this.progressBar.Size = new System.Drawing.Size(691, 21);
             this.progressBar.TabIndex = 15;
             this.progressBar.Visible = false;
-            // 
+            //
             // lblResult
-            // 
+            //
             this.lblResult.AutoSize = true;
             this.lblResult.Location = new System.Drawing.Point(18, 292);
             this.lblResult.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblResult.Name = "lblResult";
             this.lblResult.Size = new System.Drawing.Size(0, 28);
             this.lblResult.TabIndex = 16;
-            // 
+            //
+            // lblPeInfo
+            //   选择 exe 后显示 PE 关键信息（架构/子系统/ASLR/DEP/TLS/签名等），
+            //   放在"执行加密操作"按钮上方，作为小字提示行。
+            //
+            this.lblPeInfo.AutoSize = false;
+            this.lblPeInfo.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
+            this.lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;
+            this.lblPeInfo.Location = new System.Drawing.Point(18, 322);
+            this.lblPeInfo.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
+            this.lblPeInfo.Name = "lblPeInfo";
+            this.lblPeInfo.Size = new System.Drawing.Size(691, 24);
+            this.lblPeInfo.TabIndex = 23;
+            this.lblPeInfo.Text = "";
+            this.lblPeInfo.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.lblPeInfo.AutoEllipsis = true;
+            //
             // btnPack
-            // 
+            //
             this.btnPack.Enabled = false;
             this.btnPack.Font = new System.Drawing.Font("Microsoft YaHei UI", 11F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
-            this.btnPack.Location = new System.Drawing.Point(22, 322);
+            this.btnPack.Location = new System.Drawing.Point(22, 352);
             this.btnPack.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.btnPack.Name = "btnPack";
             this.btnPack.Size = new System.Drawing.Size(687, 47);
             this.btnPack.TabIndex = 17;
             this.btnPack.Text = "执行加密操作";
             this.btnPack.Click += new System.EventHandler(this.btnPack_Click);
-            // 
+            //
             // lblHint
-            // 
+            //
             this.lblHint.AutoSize = true;
             this.lblHint.ForeColor = System.Drawing.Color.Gray;
-            this.lblHint.Location = new System.Drawing.Point(18, 397);
+            this.lblHint.Location = new System.Drawing.Point(18, 427);
             this.lblHint.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblHint.Name = "lblHint";
             this.lblHint.Size = new System.Drawing.Size(377, 28);
             this.lblHint.TabIndex = 18;
             this.lblHint.Text = "提示：加密后的 EXE 需放在原目录运行";
-            // 
+            //
             // lblPackerVersion
-            // 
+            //
             this.lblPackerVersion.AutoSize = true;
             this.lblPackerVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblPackerVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblPackerVersion.Location = new System.Drawing.Point(18, 443);
+            this.lblPackerVersion.Location = new System.Drawing.Point(18, 473);
             this.lblPackerVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblPackerVersion.Name = "lblPackerVersion";
             this.lblPackerVersion.Size = new System.Drawing.Size(67, 24);
             this.lblPackerVersion.TabIndex = 19;
             this.lblPackerVersion.Text = "Packer";
-            // 
+            //
             // lblStubGuiVersion
-            // 
+            //
             this.lblStubGuiVersion.AutoSize = true;
             this.lblStubGuiVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubGuiVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubGuiVersion.Location = new System.Drawing.Point(18, 467);
+            this.lblStubGuiVersion.Location = new System.Drawing.Point(18, 497);
             this.lblStubGuiVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubGuiVersion.Name = "lblStubGuiVersion";
             this.lblStubGuiVersion.Size = new System.Drawing.Size(86, 24);
             this.lblStubGuiVersion.TabIndex = 20;
             this.lblStubGuiVersion.Text = "Stub GUI";
-            // 
+            //
             // lblStubConsoleVersion
-            // 
+            //
             this.lblStubConsoleVersion.AutoSize = true;
             this.lblStubConsoleVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubConsoleVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubConsoleVersion.Location = new System.Drawing.Point(18, 490);
+            this.lblStubConsoleVersion.Location = new System.Drawing.Point(18, 520);
             this.lblStubConsoleVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubConsoleVersion.Name = "lblStubConsoleVersion";
             this.lblStubConsoleVersion.Size = new System.Drawing.Size(123, 24);
             this.lblStubConsoleVersion.TabIndex = 21;
             this.lblStubConsoleVersion.Text = "Stub Console";
-            // 
+            //
             // lblStubTestVersion
-            // 
+            //
             this.lblStubTestVersion.AutoSize = true;
             this.lblStubTestVersion.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(134)));
             this.lblStubTestVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            this.lblStubTestVersion.Location = new System.Drawing.Point(18, 513);
+            this.lblStubTestVersion.Location = new System.Drawing.Point(18, 543);
             this.lblStubTestVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.lblStubTestVersion.Name = "lblStubTestVersion";
             this.lblStubTestVersion.Size = new System.Drawing.Size(90, 24);
@@ -321,7 +339,7 @@ namespace WinAppLocker.Packer
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(13F, 28F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(737, 551);
+            this.ClientSize = new System.Drawing.Size(737, 581);
             this.Controls.Add(this.lblInputPath);
             this.Controls.Add(this.txtInputPath);
             this.Controls.Add(this.btnBrowseInput);
@@ -339,6 +357,7 @@ namespace WinAppLocker.Packer
             this.Controls.Add(this.numIterations);
             this.Controls.Add(this.progressBar);
             this.Controls.Add(this.lblResult);
+            this.Controls.Add(this.lblPeInfo);
             this.Controls.Add(this.btnPack);
             this.Controls.Add(this.lblHint);
             this.Controls.Add(this.lblPackerVersion);

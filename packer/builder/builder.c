@@ -45,7 +45,16 @@
 #include <stdint.h>
 #include <windows.h>
 #include <wincrypt.h>
-#include "../config.h"
+#include "../common/config.h"
+
+/* ---- 调试日志开关 ----
+ * 默认只输出关键日志（[+] 成功、[-] 错误、[!] 警告、最终结果），
+ * 详细日志（[*] 加载/解析/位置信息、节列表等）用 DBG() 宏包裹，
+ * 只在 --debug / -v 时输出。
+ * 目的：避免 packer 把 builder 的 stdout 全部记入 AppLogger 时日志过载。
+ */
+static int g_debug = 0;
+#define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
 
 /* ---- XTEA 加密 ---- */
 
@@ -423,7 +432,7 @@ static void print_usage(const char* prog) {
     printf("WinLock v2 - PE Password Gate Packer\n");
     printf("\n");
     printf("Usage:\n");
-    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t] [-d] [--stub-dir <path>]\n", prog);
+    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t] [-d] [-v] [--stub-dir <path>]\n", prog);
     printf("\n");
     printf("Options:\n");
     printf("  -i, --input <file>    Input PE EXE (x86 or x64)\n");
@@ -433,7 +442,11 @@ static void print_usage(const char* prog) {
     printf("                        (overrides -p)\n");
     printf("  -d, --antidebug       Enable PEB anti-debug (default OFF for dev)\n");
     printf("                        Checks BeingDebugged / NtGlobalFlag / KdDebuggerEnabled\n");
-    printf("  --stub-dir <path>     Directory to search stub_x64.bin / stub_x86.bin / stub_x86.exe\n");
+    printf("  -v, --debug           Verbose log: print PE parse details, section list,\n");
+    printf("                        relocation patch info, etc. (default OFF)\n");
+    printf("  --stub-dir <path>     Directory to search winlock_stub_x64.bin /\n");
+    printf("                        winlock_stub_x86.bin / winlock_stub_x86.exe\n");
+    printf("                        (backward compat: stub_x64.bin / stub_x86.bin / stub_x86.exe)\n");
     printf("                        (default: ./stub/)\n");
     printf("  -h, --help            Show this help\n");
 }
@@ -446,7 +459,7 @@ int main(int argc, char* argv[]) {
     int test_mode = 0;
     int antidebug = 0;
 
-    /* 参数解析：只支持 -i/-o/-p/-t/-d/--stub-dir/-h，不再支持位置参数 */
+    /* 参数解析：支持 -i/-o/-p/-t/-d/-v/--stub-dir/-h，不再支持位置参数 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
             if (i + 1 >= argc) { printf("[-] -i requires argument\n"); return 1; }
@@ -461,8 +474,11 @@ int main(int argc, char* argv[]) {
             test_mode = 1;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--antidebug") == 0) {
             antidebug = 1;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--debug") == 0) {
+            /* 详细日志模式：输出 PE 解析详情、节列表、reloc patch 信息等 */
+            g_debug = 1;
         } else if (strcmp(argv[i], "--stub-dir") == 0) {
-            /* 新增：指定 stub_x64.bin / stub_x86.bin / stub_x86.exe 的搜索目录 */
+            /* 新增：指定 winlock_stub_x64.bin 等的搜索目录 */
             if (i + 1 >= argc) { printf("[-] --stub-dir requires argument\n"); return 1; }
             stub_dir = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -503,14 +519,14 @@ int main(int argc, char* argv[]) {
         wcscpy(password, WINLOCK_DEFAULT_PASSWORD);
     }
     if (test_mode) {
-        printf("[*] TEST MODE: stub will use hardcoded 'test123', no dialog\n");
+        DBG("[*] TEST MODE: stub will use hardcoded 'test123', no dialog\n");
     }
 
     /* 1. 读输入 PE */
     size_t in_size = 0;
     uint8_t* pe = read_file(in_path, &in_size);
     if (!pe) return 1;
-    printf("[*] Loaded %s (%zu bytes = 0x%zX)\n", in_path, in_size, in_size);
+    DBG("[*] Loaded %s (%zu bytes = 0x%zX)\n", in_path, in_size, in_size);
 
     /* 2. 验证 PE + 检测架构 */
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)pe;
@@ -536,7 +552,7 @@ int main(int argc, char* argv[]) {
         printf("[-] Unsupported Machine 0x%04X (only x86 and x64)\n", machine);
         return 1;
     }
-    printf("[*] Architecture: %s (Machine=0x%04X)\n",
+    DBG("[*] Architecture: %s (Machine=0x%04X)\n",
            g_is_x64 ? "x64 (PE32+)" : "x86 (PE32)", machine);
 
     IMAGE_FILE_HEADER* file_hdr = OH_FILE();
@@ -627,10 +643,10 @@ int main(int argc, char* argv[]) {
                    tls_info.orig_callback_count,
                    (unsigned long long)tls_info.orig_callbacks_array_va);
             for (int i = 0; i < tls_info.orig_callback_count; i++) {
-                printf("    [%d] callback VA=0x%llX\n", i,
-                       (unsigned long long)tls_info.orig_callbacks[i]);
+                DBG("    [%d] callback VA=0x%llX\n", i,
+                    (unsigned long long)tls_info.orig_callbacks[i]);
             }
-            printf("[*] Will use stub_tls_callback proxy mode (TLS_PROXY + disable ASLR)\n");
+            DBG("[*] Will use stub_tls_callback proxy mode (TLS_PROXY + disable ASLR)\n");
         } else {
             printf("[+] TLS directory exists but no callbacks. OK.\n");
         }
@@ -643,17 +659,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("[*] PE: %u sections, ImageBase=0x%llX, EP RVA=0x%lX, SizeOfImage=0x%lX\n",
+    DBG("[*] PE: %u sections, ImageBase=0x%llX, EP RVA=0x%lX, SizeOfImage=0x%lX\n",
            n_sec,
            (unsigned long long)OH_IMG_BASE(),
            (unsigned long)OH(AddressOfEntryPoint),
            (unsigned long)OH(SizeOfImage));
-    printf("[*] DllCharacteristics=0x%04X, Subsystem=%u\n",
+    DBG("[*] DllCharacteristics=0x%04X, Subsystem=%u\n",
            OH(DllCharacteristics),
            OH(Subsystem));
 
     /* 打印所有节 */
-    printf("[*] Sections:\n");
+    DBG("[*] Sections:\n");
     DWORD last_raw_end = 0;
     DWORD last_va_end  = 0;
     for (WORD i = 0; i < n_sec; i++) {
@@ -663,7 +679,7 @@ int main(int argc, char* argv[]) {
         DWORD va_end  = sec[i].VirtualAddress + sec[i].Misc.VirtualSize;
         if (raw_end > last_raw_end) last_raw_end = raw_end;
         if (va_end  > last_va_end)  last_va_end  = va_end;
-        printf("    [%u] %-8s VA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX Char=0x%lX\n",
+        DBG("    [%u] %-8s VA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX Char=0x%lX\n",
                i, nm,
                (unsigned long)sec[i].VirtualAddress,
                (unsigned long)sec[i].Misc.VirtualSize,
@@ -675,7 +691,7 @@ int main(int argc, char* argv[]) {
     /* overlay = 文件末尾超出最后节末尾的数据 */
     DWORD overlay_off = last_raw_end;
     size_t overlay_size = (in_size > overlay_off) ? (in_size - overlay_off) : 0;
-    printf("[*] Overlay: offset=0x%lX size=0x%zX\n",
+    DBG("[*] Overlay: offset=0x%lX size=0x%zX\n",
            (unsigned long)overlay_off, overlay_size);
 
     /* 检查 Authenticode 签名 */
@@ -719,7 +735,7 @@ int main(int argc, char* argv[]) {
     }
     char tnm[9] = {0};
     sec_name_str((const char*)text_sec->Name, tnm, sizeof(tnm));
-    printf("[*] Target section [%u]: %s RVA=0x%lX VSize=0x%lX RawSize=0x%lX RawOff=0x%lX\n",
+    DBG("[*] Target section [%u]: %s RVA=0x%lX VSize=0x%lX RawSize=0x%lX RawOff=0x%lX\n",
            text_sec_idx, tnm,
            (unsigned long)text_sec->VirtualAddress,
            (unsigned long)text_sec->Misc.VirtualSize,
@@ -762,7 +778,7 @@ int main(int argc, char* argv[]) {
         printf("[-] Failed to generate random salt\n");
         return 1;
     }
-    printf("[*] Generated random XTEA key: %08X %08X %08X %08X\n",
+    DBG("[*] Generated random XTEA key: %08X %08X %08X %08X\n",
            key[0], key[1], key[2], key[3]);
 
     /* 计算密码 hash: SHA-256(utf8(password) + salt) */
@@ -781,40 +797,49 @@ int main(int argc, char* argv[]) {
         printf("[-] Failed to compute SHA-256 of password\n");
         return 1;
     }
-    printf("[*] Password hash (SHA-256(utf8+salt)): ");
-    for (int k = 0; k < 32; k++) printf("%02X", pwd_hash[k]);
-    printf("\n");
+    DBG("[*] Password hash (SHA-256(utf8+salt)): ");
+    for (int k = 0; k < 32; k++) DBG("%02X", pwd_hash[k]);
+    DBG("\n");
 
     /* 6. XTEA 加密 .text RawData 前 enc_size 字节
      *    只加密内存中实际加载的部分（VirtualSize），不加密 RawSize 超出部分
      *    （那部分文件里有但运行时不加载，加密也无效，反而 stub 解密会越界） */
-    printf("[*] Encrypting %u bytes (RawData) with XTEA\n", enc_size);
+    DBG("[*] Encrypting %u bytes (RawData) with XTEA\n", enc_size);
     xtea_encrypt_buf(pe + text_sec->PointerToRawData, enc_size, key);
 
-    /* 7. 读 stub.bin（按输入 PE 架构选择 stub_x64.bin 或 stub_x86.bin；
-     *    优先用 --stub-dir 指定目录，否则按原相对路径搜索（向后兼容）。
-     *    向后兼容：x64 时也尝试 stub.bin） */
-    const char* stub_candidates[6];
+    /* 7. 读 stub.bin（按输入 PE 架构选择 winlock_stub_x64.bin 或 winlock_stub_x86.bin；
+     *    优先用 --stub-dir 指定目录，否则按原相对路径搜索。
+     *    新命名约定：分发目录用 winlock_ 前缀避免与其他 stub 混淆；
+     *    旧名 stub_x64.bin / stub_x86.bin / stub.bin 保留向后兼容（make 生成的源文件）。 */
+    const char* stub_candidates[8];
     int n_candidates = 0;
     char stub_dir_path[512];
     if (stub_dir) {
-        /* --stub-dir 优先：<stub_dir>/stub_x64.bin 或 <stub_dir>/stub_x86.bin */
+        /* --stub-dir 优先：winlock_stub_x64.bin / winlock_stub_x86.bin */
+        snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/winlock_stub_%s.bin",
+                 stub_dir, g_is_x64 ? "x64" : "x86");
+        stub_candidates[n_candidates++] = strdup(stub_dir_path);
+        /* 回退：旧命名 stub_x64.bin / stub_x86.bin */
         snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub_%s.bin",
                  stub_dir, g_is_x64 ? "x64" : "x86");
         stub_candidates[n_candidates++] = strdup(stub_dir_path);
         if (g_is_x64) {
-            /* x64 向后兼容：也尝试 <stub_dir>/stub.bin */
+            /* x64 进一步回退：stub.bin */
             snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub.bin", stub_dir);
             stub_candidates[n_candidates++] = strdup(stub_dir_path);
         }
     }
     if (g_is_x64) {
-        stub_candidates[n_candidates++] = "stub/stub_x64.bin";
+        stub_candidates[n_candidates++] = "stub/winlock_stub_x64.bin";
+        stub_candidates[n_candidates++] = "winlock_stub_x64.bin";
+        stub_candidates[n_candidates++] = "stub/stub_x64.bin";  /* 旧名回退 */
         stub_candidates[n_candidates++] = "stub_x64.bin";
-        stub_candidates[n_candidates++] = "stub/stub.bin";  /* 向后兼容 */
+        stub_candidates[n_candidates++] = "stub/stub.bin";  /* 最旧回退 */
         stub_candidates[n_candidates++] = "stub.bin";
     } else {
-        stub_candidates[n_candidates++] = "stub/stub_x86.bin";
+        stub_candidates[n_candidates++] = "stub/winlock_stub_x86.bin";
+        stub_candidates[n_candidates++] = "winlock_stub_x86.bin";
+        stub_candidates[n_candidates++] = "stub/stub_x86.bin";  /* 旧名回退 */
         stub_candidates[n_candidates++] = "stub_x86.bin";
     }
     size_t stub_size = 0;
@@ -825,17 +850,22 @@ int main(int argc, char* argv[]) {
     if (!stub) {
         /* 尝试基于 argv[0] 的相对路径 */
         char path[512];
-        snprintf(path, sizeof(path), "%s/stub/stub_%s.bin",
+        snprintf(path, sizeof(path), "%s/stub/winlock_stub_%s.bin",
                  argc > 0 ? argv[0] : ".", g_is_x64 ? "x64" : "x86");
         stub = read_file(path, &stub_size);
+        if (!stub) {
+            snprintf(path, sizeof(path), "%s/stub/stub_%s.bin",
+                     argc > 0 ? argv[0] : ".", g_is_x64 ? "x64" : "x86");
+            stub = read_file(path, &stub_size);
+        }
     }
     if (!stub) {
-        printf("[-] Cannot read stub_%s.bin (run 'make%s' first)\n",
+        printf("[-] Cannot read winlock_stub_%s.bin (run 'make%s' first)\n",
                g_is_x64 ? "x64" : "x86",
                g_is_x64 ? "" : " all-x86");
         return 1;
     }
-    printf("[*] Loaded stub_%s.bin (%zu bytes = 0x%zX)\n",
+    DBG("[*] Loaded winlock_stub_%s.bin (%zu bytes = 0x%zX)\n",
            g_is_x64 ? "x64" : "x86", stub_size, stub_size);
 
     /* 7b. x86: 额外读 stub_x86.exe 获取 .reloc 节
@@ -851,27 +881,36 @@ int main(int argc, char* argv[]) {
     uint32_t stub_lock_rva = 0;
     uint32_t stub_lock_size = 0;
     if (!g_is_x64) {
-        const char* exe_candidates[4];
+        const char* exe_candidates[6];
         int n_exe = 0;
         char exe_dir_path[512];
         if (stub_dir) {
-            /* --stub-dir 优先 */
+            /* --stub-dir 优先：winlock_stub_x86.exe，回退旧名 stub_x86.exe */
+            snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/winlock_stub_x86.exe", stub_dir);
+            exe_candidates[n_exe++] = strdup(exe_dir_path);
             snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/stub_x86.exe", stub_dir);
             exe_candidates[n_exe++] = strdup(exe_dir_path);
         }
-        exe_candidates[n_exe++] = "stub/stub_x86.exe";
+        exe_candidates[n_exe++] = "stub/winlock_stub_x86.exe";
+        exe_candidates[n_exe++] = "winlock_stub_x86.exe";
+        exe_candidates[n_exe++] = "stub/stub_x86.exe";  /* 旧名回退 */
         exe_candidates[n_exe++] = "stub_x86.exe";
         for (int i = 0; i < n_exe && !stub_exe; i++) {
             stub_exe = read_file(exe_candidates[i], &stub_exe_size);
         }
         if (!stub_exe) {
             char path[512];
-            snprintf(path, sizeof(path), "%s/stub/stub_x86.exe",
+            snprintf(path, sizeof(path), "%s/stub/winlock_stub_x86.exe",
                      argc > 0 ? argv[0] : ".");
             stub_exe = read_file(path, &stub_exe_size);
+            if (!stub_exe) {
+                snprintf(path, sizeof(path), "%s/stub/stub_x86.exe",
+                         argc > 0 ? argv[0] : ".");
+                stub_exe = read_file(path, &stub_exe_size);
+            }
         }
         if (!stub_exe) {
-            printf("[-] Cannot read stub_x86.exe (needed for .reloc, run 'make all-x86')\n");
+            printf("[-] Cannot read winlock_stub_x86.exe (needed for .reloc, run 'make all-x86')\n");
             return 1;
         }
         uint32_t reloc_off = 0;
@@ -879,17 +918,17 @@ int main(int argc, char* argv[]) {
                                     &stub_lock_rva, &stub_lock_size,
                                     &reloc_off, &stub_reloc_size,
                                     &stub_image_base) != 0) {
-            printf("[-] Failed to parse stub_x86.exe PE structure\n");
+            printf("[-] Failed to parse winlock_stub_x86.exe PE structure\n");
             free(stub_exe);
             return 1;
         }
         if (stub_reloc_size == 0 || reloc_off == 0) {
-            printf("[-] stub_x86.exe has no .reloc section (stub.ld 或 Makefile 配置错误)\n");
+            printf("[-] winlock_stub_x86.exe has no .reloc section (stub.ld 或 Makefile 配置错误)\n");
             free(stub_exe);
             return 1;
         }
         stub_reloc_data = stub_exe + reloc_off;
-        printf("[*] stub_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
+        DBG("[*] stub_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
                (unsigned long long)stub_image_base,
                (unsigned long)stub_lock_rva, (unsigned long)stub_lock_size,
                stub_reloc_size);
@@ -907,7 +946,7 @@ int main(int argc, char* argv[]) {
         printf("[-] STUB_DATA_MAGIC not found in stub.bin\n");
         return 1;
     }
-    printf("[*] stub_data found at offset 0x%zX\n",
+    DBG("[*] stub_data found at offset 0x%zX\n",
            (size_t)((uint8_t*)sd - stub));
 
     /* 8a. 在 stub.bin 中搜索 STUB_TLS_CB_MAGIC，定位 stub_tls_callback */
@@ -917,7 +956,7 @@ int main(int argc, char* argv[]) {
             printf("[-] STUB_TLS_CB_MAGIC not found in stub.bin (TLS_PROXY mode required)\n");
             return 1;
         }
-        printf("[*] stub_tls_callback at offset 0x%zX in stub.bin\n", stub_tls_cb_offset);
+        DBG("[*] stub_tls_callback at offset 0x%zX in stub.bin\n", stub_tls_cb_offset);
     }
 
     /* 填充 stub_data */
@@ -1002,7 +1041,7 @@ int main(int argc, char* argv[]) {
                     uint64_t img_base = OH_IMG_BASE();
                     if (cookie_va >= img_base) {
                         sd->security_cookie_rva = cookie_va - img_base;
-                        printf("[*] SecurityCookie VA=0x%llX RVA=0x%llX\n",
+                        DBG("[*] SecurityCookie VA=0x%llX RVA=0x%llX\n",
                                (unsigned long long)cookie_va,
                                (unsigned long long)sd->security_cookie_rva);
                     } else {
@@ -1021,8 +1060,8 @@ int main(int argc, char* argv[]) {
     size_t qi;
     for (qi = 0; qi < sd_qwords; qi++) cs ^= p[qi];
     sd->checksum = cs;
-    printf("[*] Password set to: '%ls' (stored as SHA-256 hash)\n", sd->password);
-    printf("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d ANTIDEBUG=%d)\n",
+    DBG("[*] Password set to: '%ls' (stored as SHA-256 hash)\n", sd->password);
+    DBG("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d ANTIDEBUG=%d)\n",
            sd->flags,
            (sd->flags & STUB_FLAG_HASH)        ? 1 : 0,
            (sd->flags & STUB_FLAG_TEST_MODE)  ? 1 : 0,
@@ -1064,18 +1103,18 @@ int main(int argc, char* argv[]) {
     if (tls_info.has_callbacks) {
         stub_tls_cb_va   = OH_IMG_BASE() + new_va + stub_tls_cb_offset;
         new_cb_array_va  = OH_IMG_BASE() + new_va + (uint64_t)cb_array_offset_in_lock;
-        printf("[*] stub_tls_callback VA = 0x%llX (ImageBase + 0x%lX + 0x%zX)\n",
+        DBG("[*] stub_tls_callback VA = 0x%llX (ImageBase + 0x%lX + 0x%zX)\n",
                (unsigned long long)stub_tls_cb_va,
                (unsigned long)new_va, stub_tls_cb_offset);
-        printf("[*] new callbacks array VA = 0x%llX (offset in .lock = 0x%zX)\n",
+        DBG("[*] new callbacks array VA = 0x%llX (offset in .lock = 0x%zX)\n",
                (unsigned long long)new_cb_array_va, cb_array_offset_in_lock);
     }
 
-    printf("[*] New .lock section: RVA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX\n",
+    DBG("[*] New .lock section: RVA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX\n",
            (unsigned long)new_va, (unsigned long)new_vsize,
            (unsigned long)new_raw_off, (unsigned long)new_raw_size);
     if (tls_info.has_callbacks) {
-        printf("[*]   .lock content: stub.bin(0x%zX) + callbacks_array(0x%zX) = 0x%zX\n",
+        DBG("[*]   .lock content: stub.bin(0x%zX) + callbacks_array(0x%zX) = 0x%zX\n",
                stub_size, cb_array_size, total_lock_size);
     }
 

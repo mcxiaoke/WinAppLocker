@@ -35,6 +35,7 @@ namespace WinAppLocker.Packer
             }
             catch (Exception ex)
             {
+                // 异常直接当 WARN（图标复制失败不影响主流程）
                 logger?.Invoke($"[IconCopier] WARN: {ex.Message}");
             }
         }
@@ -46,26 +47,30 @@ namespace WinAppLocker.Packer
                 NativeMethods.LOAD_LIBRARY_AS_DATAFILE | NativeMethods.LOAD_LIBRARY_AS_IMAGE_RESOURCE);
             if (hSrc == IntPtr.Zero)
             {
-                logger?.Invoke($"[IconCopier] LoadLibraryEx failed: {Marshal.GetLastWin32Error()}");
+                logger?.Invoke($"[IconCopier] WARN: LoadLibraryEx failed: {Marshal.GetLastWin32Error()}");
                 return;
             }
 
             var collected = new List<ResourceItem>();
+            // 主 group 名（字符串名时需要释放非托管内存）
+            ResourceName mainGroupName = default;
             try
             {
                 // 2. 找原 exe 的第一个 RT_GROUP_ICON（Windows 主图标）
-                IntPtr mainGroupName = FindFirstResourceName(hSrc, NativeMethods.RT_GROUP_ICON, logger);
-                if (mainGroupName == IntPtr.Zero)
+                //    EnumResourceNamesW 回调里的 lpName 字符串只在回调期间有效，
+                //    回调返回后字符串可能失效（特别是字符串名如 "IDR_MAINFRAME"）。
+                //    ResourceName 在回调中复制字符串到 long-lived 内存，避免 FindResourceW 失败（错误 1814）。
+                if (!FindFirstResourceName(hSrc, NativeMethods.RT_GROUP_ICON, out mainGroupName))
                 {
-                    logger?.Invoke("[IconCopier] no RT_GROUP_ICON in source");
+                    logger?.Invoke("[IconCopier] WARN: no RT_GROUP_ICON in source");
                     return;
                 }
 
                 // 3. 加载主图标 group 数据
-                IntPtr hGrpResInfo = NativeMethods.FindResourceW(hSrc, mainGroupName, NativeMethods.RT_GROUP_ICON);
+                IntPtr hGrpResInfo = NativeMethods.FindResourceW(hSrc, mainGroupName.IntPtr, NativeMethods.RT_GROUP_ICON);
                 if (hGrpResInfo == IntPtr.Zero)
                 {
-                    logger?.Invoke($"[IconCopier] FindResourceW(RT_GROUP_ICON) failed: {Marshal.GetLastWin32Error()}");
+                    logger?.Invoke($"[IconCopier] WARN: FindResourceW(RT_GROUP_ICON) failed: {Marshal.GetLastWin32Error()} (name={mainGroupName})");
                     return;
                 }
                 IntPtr hGrpData = NativeMethods.LoadResource(hSrc, hGrpResInfo);
@@ -73,14 +78,14 @@ namespace WinAppLocker.Packer
                 uint grpSize = NativeMethods.SizeofResource(hSrc, hGrpResInfo);
                 if (grpData == IntPtr.Zero || grpSize < 6)
                 {
-                    logger?.Invoke("[IconCopier] RT_GROUP_ICON data invalid");
+                    logger?.Invoke("[IconCopier] WARN: RT_GROUP_ICON data invalid");
                     return;
                 }
                 // GRPICONDIR: reserved(2) type(2) count(2) + GRPICONDIRENTRY[14 bytes each]
                 short iconCount = Marshal.ReadInt16(grpData, 4);
                 if (iconCount <= 0)
                 {
-                    logger?.Invoke("[IconCopier] RT_GROUP_ICON count <= 0");
+                    logger?.Invoke("[IconCopier] WARN: RT_GROUP_ICON count <= 0");
                     return;
                 }
 
@@ -120,11 +125,11 @@ namespace WinAppLocker.Packer
 
                 if (collected.Count == 0)
                 {
-                    logger?.Invoke("[IconCopier] nothing to copy");
+                    logger?.Invoke("[IconCopier] WARN: nothing to copy");
                     return;
                 }
 
-                logger?.Invoke($"[IconCopier] 主图标 group=主, 引用 {iconIds.Count} 个 RT_ICON，共 {collected.Count} 个资源将写入");
+                logger?.Invoke($"[IconCopier] 主图标 group={mainGroupName}, 引用 {iconIds.Count} 个 RT_ICON，共 {collected.Count} 个资源将写入");
 
                 // 8. 用 UpdateResource 写到 dst
                 WriteCollected(dstExe, collected, logger);
@@ -136,22 +141,79 @@ namespace WinAppLocker.Packer
                 {
                     if (r.DataPtr != IntPtr.Zero) Marshal.FreeHGlobal(r.DataPtr);
                 }
+                // 释放 mainGroupName 中可能复制的字符串副本
+                mainGroupName.Free();
                 NativeMethods.FreeLibrary(hSrc);
             }
         }
 
-        /// <summary>按 EnumResourceNamesW 枚举顺序返回第一个资源名（IntPtr）。</summary>
-        private static IntPtr FindFirstResourceName(IntPtr hSrc, uint type, Action<string> logger)
+        /// <summary>
+        /// 表示一个资源名（可能是整数 ID 或字符串名）。
+        ///
+        /// EnumResourceNamesW 回调返回的 lpName 只在回调期间有效：
+        ///   - 整数 ID：IntPtr 是 MAKEINTRESOURCE(id) 形式（低位 WORD = id，高位 WORD = 0），可长期使用
+        ///   - 字符串名：IntPtr 指向 loader 内部缓冲，回调返回后可能失效
+        ///
+        /// 此结构在回调中检测 lpName 类型，若是字符串则用 Marshal.StringToHGlobalUni
+        /// 复制一份 long-lived 副本，使后续 FindResourceW 能正确找到资源
+        /// （否则会出现 ERROR_RESOURCE_NAME_NOT_FOUND = 1814）。
+        /// </summary>
+        private struct ResourceName
         {
-            IntPtr firstName = IntPtr.Zero;
+            public readonly IntPtr IntPtr;
+            public readonly bool IsString;
+            public readonly int IntId;
+            public readonly string StringValue;
+
+            public ResourceName(IntPtr name)
+            {
+                long v = name.ToInt64();
+                // IS_INTRESOURCE 检测：高位 WORD == 0 表示整数 ID
+                if ((v >> 16) == 0)
+                {
+                    IntPtr = name;
+                    IsString = false;
+                    IntId = (int)(v & 0xFFFF);
+                    StringValue = null;
+                }
+                else
+                {
+                    // 字符串名：复制到 long-lived 内存（HGlobal）
+                    StringValue = Marshal.PtrToStringUni(name);
+                    IntPtr = Marshal.StringToHGlobalUni(StringValue);
+                    IsString = true;
+                    IntId = 0;
+                }
+            }
+
+            public void Free()
+            {
+                if (IsString && IntPtr != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(IntPtr);
+                }
+            }
+
+            public override string ToString() => IsString ? $"\"{StringValue}\"" : $"#{IntId}";
+        }
+
+        /// <summary>按 EnumResourceNamesW 枚举顺序返回第一个资源名。返回 false 表示没有该类型资源。</summary>
+        private static bool FindFirstResourceName(IntPtr hSrc, uint type, out ResourceName first)
+        {
+            first = default;
+            bool found = false;
+            ResourceName captured = default;
             NativeMethods.EnumResNameDelegate cb = (m, t, name, l) =>
             {
-                firstName = name;
-                return false; // stop at first
+                // 必须在回调里复制 lpName（字符串名时回调结束后失效）
+                captured = new ResourceName(name);
+                found = true;
+                return false; // 找到第一个就停止枚举
             };
             NativeMethods.EnumResourceNamesW(hSrc, type, cb, IntPtr.Zero);
             GC.KeepAlive(cb); // 防止委托在 native 回调期间被 GC 回收
-            return firstName;
+            first = captured;
+            return found;
         }
 
         private static void AddCollected(List<ResourceItem> collected, uint type, IntPtr name,

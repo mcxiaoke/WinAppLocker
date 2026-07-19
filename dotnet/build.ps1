@@ -139,12 +139,14 @@ foreach ($s in $dotnetStubs) {
 }
 
 # 2. WinLock 产物（inplace-builder 模式）
+#    分发目录里统一加 winlock_ 前缀避免与其他 stub 混淆（builder.exe 已有 winlock_ 前缀，
+#    stub_xXX.bin / stub_x86.exe 是 make 生成的源文件名，拷贝时重命名加前缀）
 if (-not $SkipWinLock) {
     $winlockArtifacts = @(
         @{ Src = "$winlockDir\builder\builder.exe";  Dst = "winlock_builder.exe" },
-        @{ Src = "$winlockDir\stub\stub_x64.bin";    Dst = "stub_x64.bin" },
-        @{ Src = "$winlockDir\stub\stub_x86.bin";    Dst = "stub_x86.bin" },
-        @{ Src = "$winlockDir\stub\stub_x86.exe";    Dst = "stub_x86.exe" }
+        @{ Src = "$winlockDir\stub\stub_x64.bin";    Dst = "winlock_stub_x64.bin" },
+        @{ Src = "$winlockDir\stub\stub_x86.bin";    Dst = "winlock_stub_x86.bin" },
+        @{ Src = "$winlockDir\stub\stub_x86.exe";    Dst = "winlock_stub_x86.exe" }
     )
     foreach ($s in $winlockArtifacts) {
         if (Test-Path $s.Src) {
@@ -198,9 +200,11 @@ $metaFiles = @(
             subsystem = "gui"
             description = "WinLock in-place packer (GUI dialog, no plaintext tempfile, XTEA + SHA-256)"
             version = "2.0.0"
+            # components 文件名与分发文件名一致（build.ps1 拷贝时已加 winlock_ 前缀）
+            # builder.exe 运行时 --stub-dir 指向此目录，按 winlock_stub_xXX.bin 优先搜索
             components = @{
-                stub_x64 = "stub_x64.bin"
-                stub_x86 = "stub_x86.bin"
+                stub_x64 = "winlock_stub_x64.bin"
+                stub_x86 = "winlock_stub_x86.bin"
             }
             supported_machines = @("amd64", "i386")
         }

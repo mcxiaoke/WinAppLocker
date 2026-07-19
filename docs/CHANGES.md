@@ -1,129 +1,61 @@
 # 变更记录
 
-## 2026-07-18 WinLock (in-place PE 加壳器) 集成到 AppLocker .NET
+## 变更记录 2026-07-19 10:40
 
-### 改动概况
+packer 日志详细度调整 + WinLock stub 改名 + IconCopier 字符串名 bug 修复
 
-把 WinLock 项目（C + 内联汇编的 in-place PE 加壳器）集成到 AppLocker .NET 项目，
-作为可选的 stub 加壳模式。packer 现在支持两种加壳方案：
+1. **加密开始日志补充 PE 信息**：GUI `btnPack_Click` 和 CLI `RunCliPack` 在调用 `PackCore.Pack`
+   之前先用 `PeReader.Parse` 读取所选 exe 的 PE 关键属性，拼接成 `PE=[x64/GUI ASLR=True DEP=True
+   CFG=True HEVA=True TLS=True Signed=True Reloc=True .NET=False size=4735888]` 形式，
+   追加到 "开始加密" 日志行尾。这样即便用户中途清空了 `lblPeInfo` 显示，日志里也保留该
+   exe 的关键属性用于事后排查。
 
-1. **临时文件模式**（原有）：原 EXE 作为 payload 附加在 stub 后，运行时释放隐藏临时文件。
-2. **WinLock in-place 模式**（新增）：原 EXE 被原地修改，stub 嵌入 `.lock` 节，
-   运行时在内存中解密 `.text` 节，不释放任何文件，单文件独立运行。
+2. **日志级别区分（[INFO] / [WARN]）**：`PackCore` 的 `logger` 回调是单个 `Action<string>`，
+   无法直接传级别枚举。改为按消息前缀约定区分：包含 `WARN:` / `ERROR:` / `[stderr]` 的消息
+   走 `AppLogger.Warn`，其余走 `AppLogger.Info`。IconCopier 的所有错误信息前缀改为
+   `[IconCopier] WARN:` 以匹配此约定。
 
-发布格式从"单文件 exe + 嵌入资源 stub"改为"exe + stub/ 目录"，packer 启动时
-扫描 stub/ 目录下的 `.meta.json` 文件动态建立可用 stub 列表。
+3. **WinLock builder 加 `--debug` 参数**：新增 `g_debug` 全局标志和 `DBG(fmt, ...)` 可变参数宏。
+   所有 `[*]` 详情日志（PE 解析、节列表、reloc patch、stub_data 填充等）从 `printf` 改为
+   `DBG()`，只在 `-v` / `--debug` 时输出。`[+]` / `[-]` / `[!]` 关键日志保持 always-on。
+   目的：避免 packer 把 builder 的 stdout 全部记入 AppLogger 时日志过载。
 
-### 新增文件
+4. **WinLock stub 文件名加 `winlock_` 前缀**：分发目录统一改名：
+   - `stub_x64.bin` → `winlock_stub_x64.bin`
+   - `stub_x86.bin` → `winlock_stub_x86.bin`
+   - `stub_x86.exe` → `winlock_stub_x86.exe`
+   - `builder.exe` → `winlock_builder.exe`（已沿用）
+   
+   `build.ps1` 拷贝 WinLock 产物到 `dotnet/packer/stub/` 时按新名拷贝；
+   `winlock_builder.exe.meta.json` 的 `components` 字段同步更新引用新名；
+   `builder.c` 的 stub 搜索路径优先用新名，向后兼容旧名 `stub_x{64,86}.bin` /
+   `stub_x86.exe`（开发者直接 `make` 产出的源文件名）。
 
-- `dotnet/packer/StubManifest.cs` — stub 元数据模型（StubKind / StubSubsystem 枚举 +
-  .meta.json 反序列化），定义 `Tempfile` 和 `InplaceBuilder` 两种加壳方案
-- `dotnet/packer/StubRegistry.cs` — stub 注册表，扫描 stub/ 目录所有 *.meta.json，
-  按用户偏好 / 子系统 / 架构选择 stub
-- `dotnet/packer/WinLockPacker.cs` — WinLock 加壳分支，调用 winlock_builder.exe
-  作为外部进程对原 EXE 做 in-place 加壳
-- `docs/CHANGES.md` — 本文件
+5. **IconCopier 修复 `FindResourceW(RT_GROUP_ICON) failed: 1814`**：
+   - **根因**：`EnumResourceNamesW` 回调返回的 `lpName` 字符串只在回调期间有效，回调返回后
+     字符串可能失效（特别是字符串名如 `"IDR_MAINFRAME"`）。旧实现把 `lpName` 的 `IntPtr`
+     直接保存，回调结束后 `FindResourceW` 用失效指针找不到资源（ERROR_RESOURCE_NAME_NOT_FOUND=1814）。
+   - **修复**：新增 `ResourceName` struct，在回调中检测 `lpName` 类型（IS_INTRESOURCE：
+     高位 WORD == 0 表示整数 ID），若是字符串则用 `Marshal.StringToHGlobalUni` 复制到
+     long-lived 非托管内存。`finally` 块中调用 `mainGroupName.Free()` 释放。
+   - **验证**：Doubao.exe（字符串名 `"IDR_MAINFRAME"` 主图标）打包后日志显示
+     `主图标 group="IDR_MAINFRAME", 引用 8 个 RT_ICON，共 10 个资源将写入`，无 1814 错误。
 
-### 修改文件
+6. **README 补充 Stub 自动选择标准章节**：新增 "Stub 自动选择标准" 章节，说明
+   `StubRegistry.Select` 的三级优先级（用户指定 > 按子系统匹配 > 任意可用）、
+   `IsAvailable` / `SupportsMachine` 约束、WinLock 不被自动选中的原因、以及
+   WinLock 对输入 PE 的限制条件（.NET / Console / DLL / ARM 等不支持情况）。
 
-#### packer/ (WinLock 源码，根目录的子项目)
+## 变更记录 2026-07-19 09:58 
 
-- `packer/builder/builder.c` — 新增 `--stub-dir <path>` 参数，让 packer 调用 builder 时
-  能指定 stub.bin 所在目录（替代硬编码的相对路径 `stub/`）
-  - 修改 `print_usage()` 帮助文本
-  - 修改 stub_x64.bin / stub_x86.bin / stub_x86.exe 搜索逻辑：优先用 --stub-dir，
-    失败再回退到 `stub/` 相对路径和 argv0 目录
+packer 新增操作日志与 PE 信息展示
 
-#### dotnet/packer/ (packer 主项目)
+1. **操作日志**：所有关键操作（GUI 启动、stub 加载、打包开始/成功/失败、CLI 调用、PE 信息查询）
+   均写入按天滚动的日志文件 `packer_YYYYMMDD.log`。日志目录优先选 `WinAppLocker.exe`
+   同级 `logs/` 子目录；若无写权限，自动回退到 `%LOCALAPPDATA%\WinAppLocker\logs\`。
+   日志写入通过 `lock` 保护线程安全，所有 IO 异常被吞掉，日志失败不影响主流程。
 
-- `dotnet/packer/PeReader.cs` — 把原 `StubKind` 枚举（Auto/Gui/Console/Test）重命名为
-  `StubPreference`，避免与新 `StubManifest.StubKind`（Tempfile/InplaceBuilder）冲突
-- `dotnet/packer/StubLoader.cs` — 新增 `FindStubDir()` 定位 stub/ 目录（packer exe 同目录
-  优先，fallback 到 CWD），新增 `LoadFromStubDir()`。`SelectStub()` 先试 stub/ 目录，
-  找不到再回退嵌入资源（兼容旧单文件发布）
-- `dotnet/packer/PackCore.cs` —
-  - `PackOptions` 新增 `PreferStubName` 字段（优先级高于 StubPreference）
-  - `PackReport` 新增 `UsedStubName` / `UsedKind` 字段
-  - `Pack()` 流程：扫描 stub/ → 加载 manifests → 选 stub → 分发到 PackWithWinLock 或 PackWithTempfile
-  - `PackWithWinLock`：复制输入到临时文件，调用 WinLockPacker.Pack，复制输出，
-    跳过 IconCopier（WinLock 已保留原 .rsrc，UpdateResourceW 会破坏 .lock 节）
-  - `PackWithTempfile`：原逻辑，stub 字节优先从 stub.MainFilePath 读，回退到嵌入资源
-  - `SelectByLegacyPreference`：旧 StubPreference(Auto/Gui/Console/Test) 映射到 manifest
-  - WinLock 模式拒绝 .NET CLR PE 和 Console 子系统程序
-- `dotnet/packer/MainForm.cs` —
-  - 新增 `StubListItem` 内部类（包装 StubManifest + Label）
-  - 新增 `_availableStubs` 字段、`LoadStubList()` 从 stub/ 目录动态填充 ComboBox
-  - 新增 `UpdateStubVersionLabels()` 显示可用/缺失 stub 列表
-  - 新增 `WarnIfIncompatible()` 在选 WinLock + Console/.NET 组合时弹警告
-  - 新增 `cbStubPreference_SelectedIndexChanged` 事件处理
-  - `btnPack_Click` 用 `PreferStubName` 传给 PackOptions，结果 label 显示 [WinLock] 标记
-- `dotnet/packer/MainForm.Designer.cs` — 移除硬编码的 ComboBox Items，加宽下拉框，
-  绑定 SelectedIndexChanged 事件
-- `dotnet/packer/Program.cs` —
-  - 修复 `StubKind` → `StubPreference` 引用（重命名后遗留）
-  - 新增 `--stub-name <name>` 参数（指定 stub manifest 名称）
-  - 新增 `--list-stubs` 顶级命令（列出 stub/ 目录所有 stub）
-  - 更新帮助文本和用法错误消息
-  - PackReport 输出加上 `UsedStubName (UsedKind)` 日志
-- `dotnet/packer/WinAppLocker.Packer.csproj` —
-  - 新增 `System.Text.Json` NuGet 包引用（.NET Framework 4.7.2 不内置，用于反序列化 .meta.json）
-  - 新增 `<None Include="stub\**\*">` ItemGroup，把 stub/ 目录内容拷到输出目录
-  - 保留原 `CopyStubs` Target 作为嵌入资源兜底（单文件发布模式）
-
-#### dotnet/ (构建脚本)
-
-- `dotnet/build.ps1` — 完全重写：
-  - 新增 `-SkipWinLock` 参数
-  - 新增 WinLock 编译步骤（调用 `mingw32-make all all-x86`，自动加入 w64devkit + msys2 到 PATH）
-  - 新增 stub 汇集步骤：拷贝 dotnet stub exe + WinLock builder/bin/exe 到 `packer/stub/`
-  - 新增 4 个 .meta.json 文件生成（stub_gui/console/test.exe.meta.json + winlock_builder.exe.meta.json）
-  - 验证 packer 输出目录的 stub/ 子目录
-  - Release 模式 dist/ 拷贝整个 stub/ 目录
-
-#### dotnet/README.md — 完全重写：
-  - 新增 WinLock 模式介绍、工作原理、与临时文件模式对比表
-  - 新增 WinLock 限制说明（不支持 .NET/Console/DLL/带自校验程序等）
-  - 新增发布格式说明（dist/ + stub/ 目录结构）
-  - 新增 CLI 参数表（含 --stub-name / --list-stubs）
-  - 新增项目结构说明
-  - 新增 -SkipWinLock 构建参数说明
-
-### 测试结果
-
-#### tempfile 模式回归（test.ps1）
-
-5 个样本全部通过：
-- hellocli.exe (CLI, exit=0, "Hello World!")
-- hellomingw.exe (CLI, exit=0, "Hello, MinGW!")
-- helloucrt.exe (CLI, exit=0, "Hello, UCRT!")
-- sha256sum.exe (CLI, exit=0, sha256 输出正确)
-- hellogui.exe (GUI, 进程存活)
-
-#### WinLock 模式端到端测试
-
-3 个 GUI 样本全部通过（加壳 → 运行 → 弹密码框 → 输入密码 → 解密 → 原程序启动）：
-- hellogui.exe (107KB → 114KB，窗口标题 "win32helloword")
-- DontSleep.exe (523KB → 520KB，窗口标题 "Don't Sleep 9.96")
-- Notepad4.exe (2.4MB → 2.4MB，窗口标题 "未命名 - Notepad4")
-
-#### --list-stubs 命令
-
-正确列出 4 个 stub：
-- applocker-console (tempfile/console) [OK]
-- applocker-gui (tempfile/gui) [OK]
-- applocker-test (tempfile/test) [OK]
-- winlock (inplace-builder/gui, arch=amd64+i386) [OK]
-
-### 修复的问题
-
-1. **StubKind 命名冲突**：原 PeReader.cs 的 `StubKind`（Auto/Gui/Console/Test，子系统偏好）
-   与 INTEGRATION.md 新 spec 要求的 `StubKind`（Tempfile/InplaceBuilder，加壳方案）冲突。
-   解决：原枚举重命名为 `StubPreference`，新枚举用 `StubKind`。
-
-2. **System.Text.Json 缺失**：.NET Framework 4.7.2 不内置 System.Text.Json，编译报
-   CS0234。解决：csproj 加 `System.Text.Json` NuGet 包引用，Costura.Fody 会把依赖 DLL
-   嵌入 exe。
-
-3. **WinLock 加壳后 PE 崩溃 (0xC0000005)**：PackCore 在 WinLock 加壳后又调用 IconCopier
-   修改资源段，UpdateResourceW 重新布局 .rsrc 导致 .lock 节 RawOffset 改变 / 内容破坏。
-   解决：WinLock 模式下不调用 IconCopier（原 PE 的 .rsrc 已被保留，图标自然在）。
+2. **PE 信息展示**：选择 exe 后在"执行加密操作"按钮上方小字位置自动展示 PE 关键信息，
+   包括架构 (x86/x64/arm/arm64)、子系统 (GUI/Console)、ASLR / DEP / CFG / HighEntropyVA、
+   TLS 回调、Authenticode 签名、重定位表、.NET CLR 托管、文件大小。.NET 或带签名程序
+   用警告色（OrangeRed）提示。同时新增 CLI 命令 `--pe-info <exe>` 用于命令行查看。

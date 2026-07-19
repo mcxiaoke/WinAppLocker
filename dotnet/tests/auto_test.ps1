@@ -2,10 +2,10 @@
 # 使用 stub_test（内置密码 test1234），无需密码输入 UI，可全自动测试 GUI 和 CLI 程序。
 #
 # 用法：
-#   .\test.ps1                 # 默认完整 round-trip 测试（含 hellogui）
-#   .\test.ps1 -Samples "a.exe,b.exe"
-#   .\test.ps1 -Info           # 对每个样本打包后用 --info 检查打包结果
-#   .\test.ps1 -WaitGui <秒>   # GUI 程序等待 N 秒后检查进程再杀掉（默认 3）
+#   .\tests\auto_test.ps1                 # 默认完整 round-trip 测试（含 hellogui）
+#   .\tests\auto_test.ps1 -Samples "a.exe,b.exe"
+#   .\tests\auto_test.ps1 -Info           # 对每个样本打包后用 --info 检查打包结果
+#   .\tests\auto_test.ps1 -WaitGui <秒>   # GUI 程序等待 N 秒后检查进程再杀掉（默认 3）
 param(
     [string]$Samples,
     [switch]$Info,
@@ -13,7 +13,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $PSScriptRoot
+Write-Host "==> Root: $root" -ForegroundColor Green
+
 Set-Location $root
 
 $packer = "$root\dist\WinAppLocker.exe"
@@ -46,7 +48,7 @@ if ($Samples) {
     $sampleList = $cliSamples + $guiSamples
 }
 
-$workDir = "$root\..\test_dotnet_work"
+$workDir = "$root\temp\test_dotnet_work"
 if (Test-Path $workDir) {
     Get-ChildItem $workDir -Filter "*.exe" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 } else {
@@ -57,6 +59,11 @@ if (Test-Path $workDir) {
 $password = "test1234"
 $failCount = 0
 $passCount = 0
+
+# 空文件作为子进程 stdin 输入：避免 sha256sum 等从 stdin 读取的程序在交互式 pwsh 下
+# 继承 TTY 而卡住（Start-Process -NoNewWindow 会让子进程共享当前控制台）
+$nullIn = "$env:TEMP\wal_null_in.txt"
+"" | Set-Content $nullIn -NoNewline -Encoding ASCII
 
 function Is-GuiExe {
     param([string]$path)
@@ -86,7 +93,7 @@ foreach ($sample in $sampleList) {
     Write-Host "  [1] Pack with --stub Test..." -NoNewline
     $outLog = "$env:TEMP\wal_pack_out.txt"
     $errLog = "$env:TEMP\wal_pack_err.txt"
-    $proc = Start-Process -FilePath $packer -ArgumentList "--pack","-i",$workSrc,"-o",$lockedPath,"-p",$password,"--stub","Test" -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -Wait -NoNewWindow
+    $proc = Start-Process -FilePath $packer -ArgumentList "--pack","-i",$workSrc,"-o",$lockedPath,"-p",$password,"--stub","Test" -RedirectStandardInput $nullIn -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -Wait -NoNewWindow
     if ($proc.ExitCode -ne 0 -or -not (Test-Path $lockedPath)) {
         Write-Host " FAIL (pack exit=$($proc.ExitCode))" -ForegroundColor Red
         Get-Content $errLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "      $_" -ForegroundColor Red }
@@ -100,7 +107,7 @@ foreach ($sample in $sampleList) {
     if ($Info) {
         Write-Host "  [1b] --info 检查..." -NoNewline
         $infoOut = "$env:TEMP\wal_info_out.txt"
-        $proc = Start-Process -FilePath $packer -ArgumentList "--info",$lockedPath -RedirectStandardOutput $infoOut -RedirectStandardError "$env:TEMP\wal_info_err.txt" -PassThru -Wait -NoNewWindow
+        $proc = Start-Process -FilePath $packer -ArgumentList "--info",$lockedPath -RedirectStandardInput $nullIn -RedirectStandardOutput $infoOut -RedirectStandardError "$env:TEMP\wal_info_err.txt" -PassThru -Wait -NoNewWindow
         $infoContent = Get-Content $infoOut -Raw -ErrorAction SilentlyContinue
         if ($proc.ExitCode -eq 0 -and $infoContent -match "合法的 WinAppLocker") {
             Write-Host " OK (合法加密 EXE)" -ForegroundColor Green
@@ -143,7 +150,9 @@ foreach ($sample in $sampleList) {
         Write-Host "  [2] Run (CLI)..." -NoNewline
         $outFile = "$env:TEMP\wal_run_out.txt"
         $errFile = "$env:TEMP\wal_run_err.txt"
-        $proc = Start-Process -FilePath $lockedPath -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -Wait -NoNewWindow
+        # 关键：必须重定向 stdin 到空文件，否则像 sha256sum 这种不带参数会从 stdin 读取的程序
+        # 在交互式 pwsh 下会继承 TTY 等待输入，导致测试卡住
+        $proc = Start-Process -FilePath $lockedPath -RedirectStandardInput $nullIn -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -Wait -NoNewWindow
         $exitCode = $proc.ExitCode
         $stdoutContent = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
         if ($exitCode -eq 0) {

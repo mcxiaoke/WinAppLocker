@@ -23,7 +23,7 @@
 static __inline__ void __winlock_sfence(void) { __asm__ __volatile__("sfence" ::: "memory"); }
 #define __builtin_ia32_sfence() __winlock_sfence()
 #include <windows.h>
-#include "../config.h"
+#include "../common/config.h"
 
 /* ============================================================
  * 类型定义
