@@ -39,6 +39,10 @@
 #include <windows.h>
 
 #include "payload.h"
+#include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS / IDC_PWD_EDIT */
+/* 复用 stub/sha256.h 的纯 C SHA-256 + UTF-16LE->UTF-8 + 常量时间比较
+ * 不定义 WINLOCK_PIC，作为普通 host 函数（loader.c 用 CRT 编译，无 .lock 节）*/
+#include "../stub/sha256.h"
 
 /* ---- 架构相关类型别名 ----
  * 让下面代码用统一的 IMAGE_NT_HEADERS_X / thunk_t 等符号，
@@ -249,6 +253,267 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
         }
     }
     return NULL;
+}
+
+/* ============================================================
+ * 密码弹框 + XTEA 解密（v2 加密 payload 支持）
+ *
+ *   参考 packer/stub/stub.c 的 prompt_password/dlg_proc/build_dialog
+ *   差异：loader.c 用 CRT 编译，可以直接用 user32 API（不用 PEB walk
+ *         + hash 解析），代码更简单
+ *
+ *   流程：
+ *     1. LoadLibraryA("user32.dll") + GetProcAddress 拿对话框 API
+ *     2. 在栈上构建 DLGTEMPLATE（密码框 + OK/Cancel 按钮）
+ *     3. DialogBoxIndirectParamW 弹框 → DlgProc 校验密码
+ *     4. SHA-256(utf8(input) + salt) == hdr->pwd_hash ?
+ *     5. 校验通过：返回 1；失败重试 N 次；Cancel → ExitProcess
+ *
+ *   返回 1 表示密码正确，0 表示不可恢复失败（已 ExitProcess 不会真返回 0）
+ * ============================================================ */
+
+/* XTEA 解密单个 8 字节块（与 builder_reflective.c xtea_encrypt_block 互逆） */
+static void xtea_decrypt_block(uint32_t* v, const uint32_t* key) {
+    uint32_t v0 = v[0], v1 = v[1];
+    uint32_t sum = XTEA_DELTA * XTEA_ROUNDS;  /* 0xC6EF3720 */
+    int i;
+    for (i = 0; i < XTEA_ROUNDS; i++) {
+        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+        sum -= XTEA_DELTA;
+        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+    }
+    v[0] = v0; v[1] = v1;
+}
+
+/* XTEA 解密缓冲区：8 字节块解密，尾部不足 8 字节按字节异或 key 字节
+ * 与 builder_reflective.c xtea_encrypt_buf 互逆 */
+static void xtea_decrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
+    size_t n_blocks = size / 8;
+    size_t i;
+    for (i = 0; i < n_blocks; i++) {
+        xtea_decrypt_block((uint32_t*)(data + i * 8), key);
+    }
+    size_t tail_off = n_blocks * 8;
+    uint8_t* k = (uint8_t*)key;
+    for (i = 0; i < size - tail_off; i++) {
+        data[tail_off + i] ^= k[i];
+    }
+}
+
+/* ---- 对话框模板构造工具（参考 stub.c 的 put_word/put_wstr/align_dword） ---- */
+static uint8_t* put_word(uint8_t* p, uint16_t w) {
+    *(uint16_t*)p = w;
+    return p + 2;
+}
+
+static uint8_t* put_wstr(uint8_t* p, const wchar_t* s) {
+    while (*s) {
+        *(uint16_t*)p = (uint16_t)*s++;
+        p += 2;
+    }
+    *(uint16_t*)p = 0;
+    return p + 2;
+}
+
+static uint8_t* align_dword(uint8_t* p, uint8_t* start) {
+    uintptr_t off = (uintptr_t)(p - start);
+    return start + ((off + 3) & ~(uintptr_t)3);
+}
+
+/* 在栈缓冲区上构建密码对话框 DLGTEMPLATE
+ * 参考 stub.c build_dialog，完全相同的布局：
+ *   DLGTEMPLATE + 3 个 DLGITEMTEMPLATE（Edit + OK + Cancel）
+ *   返回模板字节数 */
+static size_t build_dialog(uint8_t* buf) {
+    uint8_t* start = buf;
+    uint8_t* p = buf;
+
+    DLGTEMPLATE* tmpl = (DLGTEMPLATE*)p;
+    tmpl->style = WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+                | DS_CENTER | DS_MODALFRAME;
+    tmpl->dwExtendedStyle = 0;
+    tmpl->cdit = 3;
+    tmpl->x = 0; tmpl->y = 0; tmpl->cx = 200; tmpl->cy = 60;
+    p += sizeof(DLGTEMPLATE);
+    p = put_word(p, 0);                       /* no menu    */
+    p = put_word(p, 0);                       /* default class */
+    p = put_wstr(p, L"WinLock - Password Required");  /* title */
+
+    /* EDIT (password input) */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
+                    | ES_AUTOHSCROLL | ES_PASSWORD;
+        item->dwExtendedStyle = 0;
+        item->x = 10; item->y = 10; item->cx = 180; item->cy = 14;
+        item->id = IDC_PWD_EDIT;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);
+        p = put_word(p, 0x0081);              /* Edit atom   */
+        p = put_word(p, 0);                   /* no text      */
+        p = put_word(p, 0);                   /* no cd        */
+    }
+    /* OK button */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON;
+        item->dwExtendedStyle = 0;
+        item->x = 60;  item->y = 32; item->cx = 50; item->cy = 14;
+        item->id = IDOK;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);
+        p = put_word(p, 0x0080);              /* Button atom  */
+        p = put_wstr(p, L"OK");
+        p = put_word(p, 0);
+    }
+    /* Cancel button */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        item->dwExtendedStyle = 0;
+        item->x = 120; item->y = 32; item->cx = 50; item->cy = 14;
+        item->id = IDCANCEL;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);
+        p = put_word(p, 0x0080);
+        p = put_wstr(p, L"Cancel");
+        p = put_word(p, 0);
+    }
+    return (size_t)(p - start);
+}
+
+/* 全局：当前 payload 头指针，dlg_proc 用它读 salt/pwd_hash 做校验
+ * 必须是全局因为 dlg_proc 签名固定，无法通过 LPARAM 传（用闭包更简洁但 C 不支持）*/
+static reflective_payload_t* g_pwd_hdr = NULL;
+
+/* 密码校验：SHA-256(utf8(input) + salt) == hdr->pwd_hash ?
+ * 返回 1 匹配，0 不匹配 */
+static int verify_password(const wchar_t* input, const reflective_payload_t* hdr) {
+    uint8_t utf8[256];
+    size_t utf8_len = utf16le_to_utf8(input, utf8, sizeof(utf8) - 16);
+
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, utf8, utf8_len);
+    sha256_update(&ctx, hdr->salt, 16);
+    uint8_t digest[32];
+    sha256_final(&ctx, digest);
+
+    return bytes_eq_const(digest, hdr->pwd_hash, 32);
+}
+
+/* 对话框过程：WM_COMMAND 处理 OK / Cancel
+ *   IDOK   → 校验密码，正确 EndDialog(1)，错误 EndDialog(2) 让调用方重试
+ *   CANCEL → EndDialog(0)，调用方收到 0 会 ExitProcess */
+static INT_PTR WINAPI dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    (void)lParam;
+    if (msg == WM_INITDIALOG) {
+        return TRUE;
+    }
+    if (msg == WM_COMMAND) {
+        WORD cmd = LOWORD(wParam);
+        if (cmd == IDOK) {
+            wchar_t buf[64];
+            GetDlgItemTextW(hDlg, IDC_PWD_EDIT, buf, 64);
+            if (verify_password(buf, g_pwd_hdr)) {
+                EndDialog(hDlg, 1);  /* 成功 */
+            } else {
+                MessageBoxW(hDlg, L"Wrong password", L"WinLock",
+                            MB_ICONERROR | MB_OK);
+                EndDialog(hDlg, 2);  /* 失败但可重试 */
+            }
+            return TRUE;
+        }
+        if (cmd == IDCANCEL) {
+            EndDialog(hDlg, 0);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* 弹密码框，重试 max_retries 次
+ *   返回 1 成功；失败时已 ExitProcess，不会真正返回 0 */
+static int prompt_password(reflective_payload_t* hdr) {
+    g_pwd_hdr = hdr;
+
+    HMODULE u32 = LoadLibraryA("user32.dll");
+    if (!u32) {
+        DBG("prompt_password: LoadLibraryA(user32) failed err=%lu\n", GetLastError());
+        return 0;
+    }
+
+    /* gcc 默认链接 user32，直接调用即可（与 stub.c 用 hash 解析不同） */
+    uint8_t dlg_buf[1024];
+    build_dialog(dlg_buf);
+
+    INT_PTR r = 0;
+    int retries = 0;
+    int max_retries = 3;
+    do {
+        r = DialogBoxIndirectParamW(NULL, (LPCDLGTEMPLATEW)dlg_buf,
+                                    NULL, dlg_proc, 0);
+        if (r == 1) return 1;        /* 成功 */
+        if (r == 0) ExitProcess(1);  /* Cancel：直接退出 */
+        retries++;
+    } while (retries < max_retries);
+
+    ExitProcess(2);  /* 超过最大重试次数 */
+    return 0;  /* never reach */
+}
+
+/* 解密 payload_data：根据 hdr->flags 走 v2 流程
+ *   返回 1 成功（已原地解密 payload_data，可继续 map_image）
+ *   返回 0 失败（已 ExitProcess，不会真返回 0） */
+static int decrypt_payload_if_needed(reflective_payload_t* hdr,
+                                      uint8_t* payload_data, size_t payload_size) {
+    if (!(hdr->flags & RFLAG_ENCRYPTED)) {
+        /* v1 明文：无需解密 */
+        DBG("payload: v1 plaintext, no decryption needed\n");
+        return 1;
+    }
+
+    DBG("payload: v2 encrypted, prompting for password...\n");
+
+    /* 测试模式：跳过弹框，直接用硬编码 L"test123" 校验
+     * builder -t 设置 RFLAG_TEST_MODE，用于 CI/自动化测试 */
+    if (hdr->flags & RFLAG_TEST_MODE) {
+        DBG("payload: TEST MODE, using hardcoded L\"test123\"\n");
+        if (!verify_password(L"test123", hdr)) {
+            DBG("FATAL: test mode password verification failed\n");
+            ExitProcess(2);
+        }
+        DBG("payload: test mode password OK, decrypting...\n");
+    } else {
+        /* 正常模式：弹密码框让用户输入 */
+        if (!prompt_password(hdr)) {
+            DBG("FATAL: prompt_password failed (user32 load error?)\n");
+            ExitProcess(2);
+        }
+        DBG("payload: password verified, decrypting...\n");
+    }
+
+    /* .payload 节默认是只读的（builder 设置 Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA
+     * | IMAGE_SCN_MEM_READ），XTEA 解密需要原地写入，必须先 VirtualProtect 改成 RW。
+     * 解密后保持 RW（map_image 只读取 payload_data，不会因 RW 受影响）*/
+    DWORD old_prot = 0;
+    if (!VirtualProtect(payload_data, payload_size, PAGE_READWRITE, &old_prot)) {
+        DBG("FATAL: VirtualProtect(RW) for payload_data failed err=%lu\n",
+            GetLastError());
+        ExitProcess(2);
+    }
+    DBG("payload: VirtualProtect -> RW (old=0x%lx)\n", old_prot);
+
+    /* XTEA 解密 payload_data */
+    DBG("payload: XTEA decrypting %zu bytes (key=%08X %08X %08X %08X)\n",
+        payload_size, hdr->xtea_key[0], hdr->xtea_key[1],
+        hdr->xtea_key[2], hdr->xtea_key[3]);
+    xtea_decrypt_buf(payload_data, payload_size, hdr->xtea_key);
+
+    return 1;
 }
 
 /* ---- 处理 IAT ----
@@ -1588,9 +1853,11 @@ int main(int argc, char* argv[]) {
             (unsigned long long)REFLECTIVE_PAYLOAD_MAGIC);
         return 1;
     }
-    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION) {
-        DBG("FATAL: unsupported payload version %u (expected %u)\n",
-            hdr->version, REFLECTIVE_PAYLOAD_VERSION);
+    /* 同时接受 v1（明文）和 v2（XTEA 加密 + SHA-256 密码校验） */
+    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION
+        && hdr->version != REFLECTIVE_PAYLOAD_VERSION_V2) {
+        DBG("FATAL: unsupported payload version %u (expected v1=%u or v2=%u)\n",
+            hdr->version, REFLECTIVE_PAYLOAD_VERSION, REFLECTIVE_PAYLOAD_VERSION_V2);
         return 1;
     }
     DBG("payload header: version=%u flags=0x%04x original_size=%llu stored_size=%llu\n",
@@ -1601,17 +1868,6 @@ int main(int argc, char* argv[]) {
         (unsigned long long)hdr->oep_rva,
         (unsigned long long)hdr->image_base);
 
-    /* v1 MVP: 不加密，payload_data 紧跟在 header 后面 */
-    if (hdr->flags & RFLAG_ENCRYPTED) {
-        DBG("FATAL: encrypted payload not supported in MVP v1\n");
-        return 1;
-    }
-    if (hdr->stored_size != hdr->original_size) {
-        DBG("WARN: v1 expected stored_size == original_size, got %llu vs %llu\n",
-            (unsigned long long)hdr->stored_size,
-            (unsigned long long)hdr->original_size);
-    }
-
     /* 校验 payload 数据完整在 .payload 节内 */
     size_t needed = sizeof(reflective_payload_t) + (size_t)hdr->stored_size;
     if (needed > payload_sec_size) {
@@ -1621,6 +1877,13 @@ int main(int argc, char* argv[]) {
     }
 
     uint8_t* payload_data = payload_sec + sizeof(reflective_payload_t);
+
+    /* v2 加密 payload：弹密码框 → SHA-256 校验 → XTEA 解密
+     * 解密成功后 payload_data 变成原 PE 明文字节，可继续 map_image */
+    if (!decrypt_payload_if_needed(hdr, payload_data, (size_t)hdr->stored_size)) {
+        DBG("FATAL: decrypt_payload_if_needed failed\n");
+        return 2;
+    }
 
     /* 3. 反射式映射 */
     uint8_t* new_img = map_image(hdr, payload_data);

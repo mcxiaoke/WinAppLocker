@@ -29,8 +29,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <windows.h>
+#include <wincrypt.h>
 
 #include "../reflective/payload.h"
+#include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
 
 static int g_debug = 1;
 #define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
@@ -110,19 +112,100 @@ static int parse_pe(const uint8_t* pe, size_t pe_size, pe_info_t* info) {
     return 0;
 }
 
+/* ---- 加密工具：随机数 / SHA-256 / UTF-8 转换 / XTEA 加密 ----
+ * 与 packer/builder/builder.c 共用同一套算法（CryptGenRandom + CryptoAPI）
+ * stub 端 (loader.c) 用 packer/stub/sha256.h 的纯 C SHA-256 实现来校验，
+ * 两端算法必须字节级一致（参考 tests/stub_sha256_test.c 的回归测试） */
+
+/* 用 CryptGenRandom 生成密码学安全随机字节（XTEA key + salt） */
+static int gen_random_bytes(void* buf, size_t size) {
+    HCRYPTPROV hProv = 0;
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL,
+                               CRYPT_VERIFYCONTEXT)) {
+        return -1;
+    }
+    BOOL ok = CryptGenRandom(hProv, (DWORD)size, (BYTE*)buf);
+    CryptReleaseContext(hProv, 0);
+    return ok ? 0 : -1;
+}
+
+/* 用 CryptoAPI 计算 SHA-256（与 stub 端 sha256.h 字节级一致） */
+static int sha256_hash(const uint8_t* data, size_t len, uint8_t* out32) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    BOOL ok = FALSE;
+    DWORD hash_len = 32;
+
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES,
+                               CRYPT_VERIFYCONTEXT)) {
+        return -1;
+    }
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return -1;
+    }
+    if (CryptHashData(hHash, (BYTE*)data, (DWORD)len, 0)) {
+        ok = CryptGetHashParam(hHash, HP_HASHVAL, out32, &hash_len, 0);
+    }
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return ok ? 0 : -1;
+}
+
+/* UTF-16 -> UTF-8（去除 null 终止符，返回字节数） */
+static int wstr_to_utf8(const wchar_t* src, uint8_t* dst, size_t dst_max) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, src, -1,
+                                 (LPSTR)dst, (int)dst_max, NULL, NULL);
+    if (n <= 0) return -1;
+    return n - 1;  /* 去掉 null terminator */
+}
+
+/* XTEA 加密单个 8 字节块（与 stub.c xtea_decrypt_block 互逆） */
+static void xtea_encrypt_block(uint32_t* v, const uint32_t* key) {
+    uint32_t v0 = v[0], v1 = v[1], sum = 0;
+    int i;
+    for (i = 0; i < XTEA_ROUNDS; i++) {
+        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+        sum += XTEA_DELTA;
+        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+    }
+    v[0] = v0; v[1] = v1;
+}
+
+/* XTEA 加密缓冲区：8 字节块加密，尾部不足 8 字节按字节异或 key 字节
+ * 与 stub.c xtea_decrypt_buf 互逆（同样的尾部处理） */
+static void xtea_encrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
+    size_t n_blocks = size / 8;
+    size_t i;
+    for (i = 0; i < n_blocks; i++) {
+        xtea_encrypt_block((uint32_t*)(data + i * 8), key);
+    }
+    size_t tail_off = n_blocks * 8;
+    uint8_t* k = (uint8_t*)key;
+    for (i = 0; i < size - tail_off; i++) {
+        data[tail_off + i] ^= k[i];
+    }
+}
+
 /* ---- 用法 ---- */
 
 static void usage(const char* prog) {
-    printf("WinLock Reflective Packer MVP v1\n");
-    printf("Usage: %s <input.exe> <output.exe> [--stub <stub.exe>] [--no-icon] [--debug|-v]\n", prog);
-    printf("  --stub <path>   Path to reflective stub EXE\n");
-    printf("                  (default: auto-select by input PE arch:\n");
-    printf("                   x64 -> ../reflective/loader_x64.exe\n");
-    printf("                   x86 -> ../reflective/loader_x86.exe)\n");
-    printf("  --no-icon       Skip icon/version resource copy (use stub default icon)\n");
-    printf("  --debug / -v    Verbose output\n");
+    printf("WinLock Reflective Packer v1/v2\n");
+    printf("Usage: %s <input.exe> <output.exe> [options]\n", prog);
+    printf("Options:\n");
+    printf("  -p <pwd>, --password <pwd>  Encrypt payload with password (enables v2 mode)\n");
+    printf("                              Stub will prompt for password dialog on launch\n");
+    printf("  -t, --test                  Test mode: use hardcoded 'test123' password,\n");
+    printf("                              skip dialog (for CI/automation)\n");
+    printf("  --stub <path>               Path to reflective stub EXE\n");
+    printf("                              (default: auto-select by input PE arch:\n");
+    printf("                               x64 -> ../reflective/loader_x64.exe\n");
+    printf("                               x86 -> ../reflective/loader_x86.exe)\n");
+    printf("  --no-icon                   Skip icon/version resource copy (use stub default)\n");
+    printf("  --debug / -v                Verbose output\n");
     printf("\nFeatures:\n");
-    printf("  - Plaintext payload (no encryption, MVP v1)\n");
+    printf("  - Without -p/-t: plaintext payload v1 (no encryption, no password)\n");
+    printf("  - With -p/-t:    XTEA-encrypted payload v2 + SHA-256(pwd+salt) hash check\n");
     printf("  - Supports x86 and x64 input PE (ARM64 not supported)\n");
     printf("  - Auto-select stub by input PE architecture\n");
     printf("  - Inherits input PE subsystem (GUI stays GUI)\n");
@@ -226,12 +309,27 @@ int main(int argc, char* argv[]) {
     int user_specified_stub = 0;
     int copy_icon = 1;  /* 默认复制图标/版本资源，--no-icon 关闭 */
 
+    /* 密码相关参数
+     *   - pwd_arg: 用户用 -p 指定的密码
+     *   - test_mode: -t 测试模式，硬编码 "test123"（不弹框，CI 用）
+     *   - 两者都未指定：v1 明文模式（向后兼容）*/
+    const char* pwd_arg = NULL;
+    int test_mode = 0;
+
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--stub") == 0 && i + 1 < argc) {
             stub_path = argv[++i];
             user_specified_stub = 1;
         } else if (strcmp(argv[i], "--no-icon") == 0) {
             copy_icon = 0;
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
+            if (i + 1 >= argc) {
+                printf("[-] -p requires argument\n");
+                return 1;
+            }
+            pwd_arg = argv[++i];
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
+            test_mode = 1;
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-v") == 0) {
             g_debug = 1;
         } else {
@@ -239,6 +337,27 @@ int main(int argc, char* argv[]) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    /* 密码确定逻辑：
+     *   - test_mode 优先：固定 "test123"，忽略 -p
+     *   - 否则用 -p 指定的密码
+     *   - 都没指定：use_pwd = 0，走 v1 明文模式 */
+    int use_pwd = test_mode || (pwd_arg != NULL);
+    wchar_t password[64];
+    if (test_mode) {
+        MultiByteToWideChar(CP_ACP, 0, "test123", -1, password, 63);
+        password[63] = 0;
+        pwd_arg = NULL;  /* test_mode 忽略 -p */
+        printf("[+] TEST MODE: using hardcoded 'test123' (no dialog)\n");
+    } else if (pwd_arg) {
+        int n = MultiByteToWideChar(CP_ACP, 0, pwd_arg, -1, password, 63);
+        if (n <= 0) {
+            printf("[-] Invalid password (conversion failed)\n");
+            return 1;
+        }
+        password[63] = 0;
+        printf("[+] Password mode: payload will be XTEA-encrypted\n");
     }
 
     /* 1. 读输入 PE */
@@ -290,7 +409,11 @@ int main(int argc, char* argv[]) {
 
     /* 4. 构造 payload
      *    v1 明文：payload_data = 整个原 PE 文件（含 PE 头 + 所有节 + overlay）
-     *    stub 运行时按 PE 结构解析，overlay 自动忽略 */
+     *              stub 运行时按 PE 结构解析，overlay 自动忽略
+     *    v2 加密：payload_data = XTEA(in_pe) + 尾部异或 key 字节
+     *              stored_size == original_size（XTEA 不改变大小）
+     *              stub 弹密码框 → SHA-256(utf8+salt) 校验 → XTEA 解密 → map_image
+     */
     size_t payload_data_size = in_size;
     size_t total_payload_size = sizeof(reflective_payload_t) + payload_data_size;
     uint8_t* payload = (uint8_t*)calloc(total_payload_size, 1);
@@ -302,21 +425,80 @@ int main(int argc, char* argv[]) {
 
     reflective_payload_t* hdr = (reflective_payload_t*)payload;
     hdr->magic         = REFLECTIVE_PAYLOAD_MAGIC;
-    hdr->version       = REFLECTIVE_PAYLOAD_VERSION;
-    hdr->flags         = 0;          /* v1 明文，无加密 */
     hdr->kdf_iters     = 0;
     hdr->reserved16    = 0;
     hdr->original_size = (uint64_t)in_size;
-    hdr->stored_size   = (uint64_t)in_size;  /* v1: stored == original */
+    hdr->stored_size   = (uint64_t)in_size;  /* XTEA 不改变大小 */
     hdr->oep_rva       = (uint64_t)info.entry_rva;
     hdr->image_base    = info.image_base;
-    /* salt/nonce/pwd_hash/auth_tag/xtea_key 全 0（calloc 已清零）*/
     hdr->reserved32    = 0;
-    hdr->checksum      = 0;          /* v1 暂不校验 */
+    hdr->checksum      = 0;          /* 暂不校验 */
 
+    /* 先把原 PE 字节拷贝到 payload_data 区域（v2 时会被原地加密覆盖）*/
     memcpy(payload + sizeof(reflective_payload_t), in_pe, in_size);
-    printf("[+] Built payload: header=%zu data=%zu total=%zu (plaintext v1)\n",
-           sizeof(reflective_payload_t), payload_data_size, total_payload_size);
+
+    if (use_pwd) {
+        /* ---- v2: XTEA 加密 + SHA-256(pwd+salt) 校验 ---- */
+        uint32_t key[4];
+        uint8_t  salt[16];
+        if (gen_random_bytes(key, sizeof(key)) != 0) {
+            printf("[-] Failed to generate random XTEA key\n");
+            free(payload); free(in_pe); return 1;
+        }
+        if (gen_random_bytes(salt, sizeof(salt)) != 0) {
+            printf("[-] Failed to generate random salt\n");
+            free(payload); free(in_pe); return 1;
+        }
+        DBG("[*] XTEA key: %08X %08X %08X %08X\n",
+            key[0], key[1], key[2], key[3]);
+
+        /* pwd_hash = SHA-256(utf8(password) + salt)
+         * stub 端 (loader.c) 用 sha256.h 的纯 C 实现复算，必须字节级一致 */
+        uint8_t pwd_utf8[256];
+        int pwd_utf8_len = wstr_to_utf8(password, pwd_utf8, sizeof(pwd_utf8));
+        if (pwd_utf8_len < 0) {
+            printf("[-] Failed to convert password to UTF-8\n");
+            free(payload); free(in_pe); return 1;
+        }
+        uint8_t hash_input[256 + 16];
+        memcpy(hash_input, pwd_utf8, pwd_utf8_len);
+        memcpy(hash_input + pwd_utf8_len, salt, 16);
+        uint8_t pwd_hash[32];
+        if (sha256_hash(hash_input, pwd_utf8_len + 16, pwd_hash) != 0) {
+            printf("[-] Failed to compute SHA-256 of password\n");
+            free(payload); free(in_pe); return 1;
+        }
+        DBG("[*] pwd_hash = ");
+        for (int k = 0; k < 32; k++) DBG("%02X", pwd_hash[k]);
+        DBG("\n");
+
+        /* XTEA 加密 payload_data 区域（原地） */
+        xtea_encrypt_buf(payload + sizeof(reflective_payload_t),
+                         payload_data_size, key);
+
+        /* 填入 v2 字段 */
+        hdr->version = REFLECTIVE_PAYLOAD_VERSION_V2;
+        hdr->flags   = RFLAG_ENCRYPTED | RFLAG_HASH;
+        if (test_mode) hdr->flags |= RFLAG_TEST_MODE;
+        memcpy(hdr->salt, salt, 16);
+        memcpy(hdr->pwd_hash, pwd_hash, 32);
+        hdr->xtea_key[0] = key[0];
+        hdr->xtea_key[1] = key[1];
+        hdr->xtea_key[2] = key[2];
+        hdr->xtea_key[3] = key[3];
+
+        printf("[+] Built payload v2: header=%zu data=%zu total=%zu (XTEA encrypted, %s)\n",
+               sizeof(reflective_payload_t), payload_data_size, total_payload_size,
+               test_mode ? "test mode" : "password required");
+    } else {
+        /* ---- v1: 明文（向后兼容） ---- */
+        hdr->version = REFLECTIVE_PAYLOAD_VERSION;
+        hdr->flags   = 0;
+        /* salt/nonce/pwd_hash/auth_tag/xtea_key 全 0（calloc 已清零）*/
+
+        printf("[+] Built payload v1: header=%zu data=%zu total=%zu (plaintext, no encryption)\n",
+               sizeof(reflective_payload_t), payload_data_size, total_payload_size);
+    }
 
     /* 4. 读 stub EXE */
     size_t stub_size = 0;

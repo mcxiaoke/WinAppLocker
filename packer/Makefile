@@ -83,7 +83,7 @@ RFL_CFLAGS_X86 := -Wall -Wextra -O2
 # 实验：让 OS 把 main thread stack 放到 0x400000 之外
 RFL_LDFLAGS_X86 := -Wl,--disable-dynamicbase,--image-base=0x10000,--stack,0x10000
 RFL_BLD_CFLAGS := -Wall -Wextra -O2
-RFL_BLD_LDFLAGS :=
+RFL_BLD_LDFLAGS := -ladvapi32
 
 # 文件
 STUB_SRC    := $(STUB_DIR)/stub.c
@@ -178,19 +178,20 @@ $(BLD_EXE): $(BLD_SRC) $(COMMON_DIR)/config.h
 # === 构建 reflective stub x64（loader_x64.exe） ===
 # 开发优先：用 CRT + console subsystem，printf 调试可见
 # MVP 阶段直接编 exe，不做 objcopy 提取 .lock 节
-$(RFL_EXE_X64): $(RFL_SRC) $(RFL_DIR)/payload.h
-	$(GCC_X64) $(RFL_CFLAGS) $< -o $@ $(RFL_LDFLAGS)
+# 依赖 stub/sha256.h（复用 SHA-256 实现）和 common/config.h（XTEA 参数）
+$(RFL_EXE_X64): $(RFL_SRC) $(RFL_DIR)/payload.h $(STUB_DIR)/sha256.h $(COMMON_DIR)/config.h
+	$(GCC_X64) $(RFL_CFLAGS) $< -o $@ $(RFL_LDFLAGS) -luser32
 	@echo === reflective stub x64 built ===
 
 # === 构建 reflective stub x86（loader_x86.exe） ===
 # 用 MSYS2 mingw32 gcc（i686-w64-mingw32 工具链）
 # 需要先把 msys2 mingw32/bin 加入 PATH（Makefile 顶部已处理）
-$(RFL_EXE_X86): $(RFL_SRC) $(RFL_DIR)/payload.h check-x86-toolchain
-	$(GCC_X86) $(RFL_CFLAGS_X86) $< -o $@ $(RFL_LDFLAGS_X86)
+$(RFL_EXE_X86): $(RFL_SRC) $(RFL_DIR)/payload.h $(STUB_DIR)/sha256.h $(COMMON_DIR)/config.h check-x86-toolchain
+	$(GCC_X86) $(RFL_CFLAGS_X86) $< -o $@ $(RFL_LDFLAGS_X86) -luser32
 	@echo === reflective stub x86 built ===
 
 # === 构建 reflective builder（builder_reflective.exe） ===
-$(RFL_BLD_EXE): $(RFL_BLD_SRC) $(RFL_DIR)/payload.h
+$(RFL_BLD_EXE): $(RFL_BLD_SRC) $(RFL_DIR)/payload.h $(COMMON_DIR)/config.h
 	$(GCC_X64) $(RFL_BLD_CFLAGS) $< -o $@ $(RFL_BLD_LDFLAGS)
 	@echo === reflective builder built ===
 

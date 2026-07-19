@@ -28,8 +28,13 @@
  * v1: 明文模式（MVP 阶段 1），无加密、无压缩
  * v2: XTEA 加密 + SHA-256(pwd+salt) KDF（复用 in-place 加密栈）
  * v3: ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256（后期升级）
+ *
+ * REFLECTIVE_PAYLOAD_VERSION = 最新版本号，builder 默认写此版本
+ * builder -p / -t 时升到 v2；不带密码时仍写 v1（向后兼容）
+ * stub 同时接受 v1 和 v2（按 hdr->version 分支处理）
  */
-#define REFLECTIVE_PAYLOAD_VERSION 1
+#define REFLECTIVE_PAYLOAD_VERSION    1   /* 当前默认：v1 明文（无密码）*/
+#define REFLECTIVE_PAYLOAD_VERSION_V2 2   /* v2：XTEA + SHA-256（密码模式）*/
 
 /* ---- flags 位定义 ---- */
 #define RFLAG_HASH         0x0001  /* bit0: 启用密码 hash 校验（v2+） */

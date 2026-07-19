@@ -1,5 +1,57 @@
 # 变更记录
 
+## 变更记录 2026-07-19 Reflective 加壳添加密码弹框 + XTEA 加密（v2 模式）
+
+**目标**：Reflective 加壳方案之前是 MVP v1 半成品（明文 payload，无密码框），现在参考 WinLock Inplace（`packer/stub/stub.c`）补齐密码弹框 + 加密功能。
+
+**实现方案**：复用 Inplace 的加密栈（XTEA + SHA-256(pwd+salt)），通过 payload.h 的 v2 版本号区分。
+
+**改动文件**：
+
+1. **`packer/reflective/payload.h`**：新增 `REFLECTIVE_PAYLOAD_VERSION_V2 = 2`，v2 = XTEA 加密 + SHA-256 密码校验。v1 字段（salt/pwd_hash/xtea_key）此前已预留。
+
+2. **`packer/builder/builder_reflective.c`**：
+   - 新增 `-p <pwd>` / `--password <pwd>` 参数：用密码加密 payload，启用 v2 模式
+   - 新增 `-t` / `--test` 参数：测试模式，硬编码 `test123` 密码，跳过弹框（CI/自动化用）
+   - 新增加密工具函数：`gen_random_bytes`（CryptGenRandom）、`sha256_hash`（CryptoAPI）、`wstr_to_utf8`、`xtea_encrypt_block`、`xtea_encrypt_buf`
+   - 密码模式流程：生成随机 XTEA key[4] + salt[16] → SHA-256(utf8(pwd)+salt) → pwd_hash[32] → XTEA 加密 payload_data → 填入 hdr 字段 + 设置 `RFLAG_ENCRYPTED|RFLAG_HASH`
+   - 无密码时仍写 v1 明文（向后兼容）
+   - 链接 `advapi32`（CryptGenRandom + SHA-256）
+
+3. **`packer/reflective/loader.c`**：
+   - 复用 `packer/stub/sha256.h` 的纯 C SHA-256 + UTF-16LE→UTF-8 + 常量时间比较
+   - 新增 `xtea_decrypt_block` / `xtea_decrypt_buf`（与 builder 互逆）
+   - 新增 `build_dialog` / `dlg_proc` / `verify_password` / `prompt_password` / `decrypt_payload_if_needed`
+     - 与 stub.c 不同：loader.c 用 CRT 编译，可以直接 `#include <user32.h>` 调用 `DialogBoxIndirectParamW`，不用 PEB walk + hash 解析
+   - 修改 `main()`：接受 v1 和 v2，v2 时弹密码框 → SHA-256 校验 → VirtualProtect 改 .payload 为 RW → XTEA 解密 → map_image
+   - 测试模式（`RFLAG_TEST_MODE`）：跳过弹框，用硬编码 `L"test123"` 校验
+   - 链接 `user32`（DialogBoxIndirectParamW）
+
+4. **`packer/Makefile`**：
+   - `builder_reflective.exe` 增加 `-ladvapi32`
+   - `loader_x64.exe` / `loader_x86.exe` 增加 `-luser32`
+   - 更新依赖关系：reflective 模块依赖 `stub/sha256.h` 和 `common/config.h`
+
+**密码框 UI**（参考 stub.c build_dialog）：
+- 标题 "WinLock - Password Required"
+- 一个 EDIT 控件（ES_PASSWORD 属性，输入显示为 *）
+- OK / Cancel 按钮
+- 错误密码弹 MessageBox "Wrong password"，可重试 3 次
+- Cancel / 超过重试次数 → ExitProcess
+
+**测试结果**（2026-07-19）：
+- ✅ x64 + v2 密码模式：Notepad4.exe 加壳后弹密码框，输入正确密码 `testpwd123` → Notepad4 启动
+- ✅ x64 + v2 错误密码重试：输入 `wrongpassword` → 弹"Wrong password" → 重输正确密码 → 启动
+- ✅ x64 + v2 test 模式：跳过弹框，自动用 `test123` 校验 → Notepad4 启动
+- ✅ x64 + v1 明文向后兼容：不加 `-p`/`-t` 仍走 v1，Notepad4 启动
+- ✅ x86 + v2 test 模式：helloguix86.exe 加壳 + 运行 → 显示主窗口
+- ✅ x86 + v2 密码模式加壳：成功生成
+
+**关键经验**：
+- `.payload` 节默认是 `IMAGE_SCN_MEM_READ` 只读，XTEA 解密前必须 `VirtualProtect` 改成 `PAGE_READWRITE`，否则触发 ACCESS_VIOLATION（实测日志可见）
+- loader.c 用 CRT 编译可以省掉 stub.c 那套 PEB walk + DJB2 hash 的 API 解析，直接 `LoadLibraryA("user32.dll")` + `DialogBoxIndirectParamW` 即可
+- builder 和 stub 共享 `packer/common/config.h` 的 `XTEA_DELTA`/`XTEA_ROUNDS`/`IDC_PWD_EDIT` 常量，避免魔法数字
+
 ## 变更记录 2026-07-19 新增 PE 加壳方案技术对比文档
 
 新增 `packer/docs/PACKER_TECHNIQUES.md`（约 400 行），系统对比主流 PE 加壳方案的原理、优缺点、适用场景，并给出本项目的选型决策与演进路线。

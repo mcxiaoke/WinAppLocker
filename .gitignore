@@ -53,6 +53,7 @@ package-lock.json
 
 # Visual Studio Code
 .vscode/
+.qoder/
 
 # JetBrains (Rider / CLion etc.)
 .idea/
