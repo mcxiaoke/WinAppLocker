@@ -1,5 +1,36 @@
 # 变更记录
 
+## 变更记录 2026-07-19 reflective builder 复制原图标/版本资源到输出 EXE
+
+**问题**：反射式加壳后的 EXE 在 Explorer 里显示的是 stub 的默认 MinGW 图标，不是原 PE 的图标。文件属性也没有原 PE 的版本信息。
+
+**根因**：OS/Explorer 显示图标和版本信息时只看 stub 自己的 `.rsrc` 节。反射式 loader 运行时虽然能从 `.payload` 节读原 PE 资源，但 OS 加载 stub 时不知道 `.payload` 的存在。之前 `PackCore.cs/PackWithReflective` 注释错误地说"原 PE .rsrc 已完整保留在 .payload 中，不需要 IconCopier"——实际上 `.payload` 是运行时数据，不是 OS 资源。
+
+**修复方案**（`packer/builder/builder_reflective.c`）：
+1. 新增 `copy_resources(src_w, dst_w)` 函数，用 Windows `UpdateResource` API 复制资源
+2. 流程：`LoadLibraryExW(src, LOAD_LIBRARY_AS_DATAFILE)` 加载原 PE → `BeginUpdateResourceW(dst, FALSE)` 打开输出 → `EnumResourceNamesW` 枚举 RT_GROUP_ICON/RT_ICON/RT_VERSION → 回调里 `FindResourceW` + `LoadResource` + `UpdateResourceW` 逐个复制 → `EndUpdateResourceW` 提交
+3. 在 `main()` 写完输出文件后调用，新增 `--no-icon` 参数可跳过
+4. 失败不致命（图标错不影响程序运行），只打印警告
+
+**MinGW 编译坑**：`RT_GROUP_ICON` 等宏是 `MAKEINTRESOURCE` 返回 `LPWSTR`，传给 `EnumResourceNamesW` 的 `LPCWSTR` 参数需显式 cast，否则 GCC 报 `incompatible pointer type` error。
+
+**测试结果**（`temp/extract_icons.py` 用 `System.Drawing.Icon.ExtractAssociatedIcon` 提取图标对比 PNG 大小）：
+
+| 程序 | 原 PE 图标大小 | 加壳后图标大小 | stub 默认图标 | 结果 |
+|---|---|---|---|---|
+| FastCopy | 628B | 628B | 533B | ✓ 和原图标一致 |
+| Bandizip | 533B | 533B | 533B | 原 PE 无图标，显示默认 |
+| BCompare | 6520B | 6520B | 533B | ✓ 和原图标一致 |
+| CC-Switch | 3910B | 3910B | 533B | ✓ 和原图标一致 |
+| AutoHotkey64 | 974B | 974B | 533B | ✓ 和原图标一致 |
+
+**回归测试**（`temp/retest_all.py`）：UpdateResource 修改 `.rsrc` 节不影响 `.payload` 节，所有程序运行正常：
+- FastCopy / BCompare / CC-Switch: ✅ TIMEOUT (GUI up)
+- Bandizip: ✅ exit=10
+- AutoHotkey32 (x86): ❌ 仍 x86 SEH 问题（与图标无关）
+
+**dotnet packer 同步**：`PackCore.cs/PackWithReflective` 更新注释，说明 builder 已处理图标复制，dotnet 层不再调 IconCopier（避免重复操作）。
+
 ## 变更记录 2026-07-19 新增 TLS 专业文档 packer/docs/TLS_NOTES.md
 
 整理反射式 loader 的 TLS 处理经验，撰写专业文档供备忘和参考。

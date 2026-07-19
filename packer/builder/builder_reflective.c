@@ -114,17 +114,103 @@ static int parse_pe(const uint8_t* pe, size_t pe_size, pe_info_t* info) {
 
 static void usage(const char* prog) {
     printf("WinLock Reflective Packer MVP v1\n");
-    printf("Usage: %s <input.exe> <output.exe> [--stub <stub.exe>] [--debug|-v]\n", prog);
+    printf("Usage: %s <input.exe> <output.exe> [--stub <stub.exe>] [--no-icon] [--debug|-v]\n", prog);
     printf("  --stub <path>   Path to reflective stub EXE\n");
     printf("                  (default: auto-select by input PE arch:\n");
     printf("                   x64 -> ../reflective/loader_x64.exe\n");
     printf("                   x86 -> ../reflective/loader_x86.exe)\n");
+    printf("  --no-icon       Skip icon/version resource copy (use stub default icon)\n");
     printf("  --debug / -v    Verbose output\n");
     printf("\nFeatures:\n");
     printf("  - Plaintext payload (no encryption, MVP v1)\n");
     printf("  - Supports x86 and x64 input PE (ARM64 not supported)\n");
     printf("  - Auto-select stub by input PE architecture\n");
     printf("  - Inherits input PE subsystem (GUI stays GUI)\n");
+    printf("  - Copies input PE icon + version info to output (Explorer shows original icon)\n");
+}
+
+/* ---- 图标/版本资源复制 ----
+ *
+ * 反射式加壳后，输出 EXE 在 Explorer 里显示的是 stub 的默认图标（MinGW 链接器
+ * 生成的 generic 图标），不是原 PE 的图标。原因是 OS/Explorer 显示图标时只看
+ * stub 自己的 .rsrc 节，不知道 .payload 节里嵌入的原 PE 资源。
+ *
+ * 解决方案：用 Windows UpdateResource API 把原 PE 的图标和版本资源复制到
+ * 输出 EXE 的 .rsrc 节。这样 Explorer 显示原图标，文件属性显示原版本信息。
+ *
+ * 策略：全量复制 RT_GROUP_ICON + RT_ICON + RT_VERSION。
+ *   - MinGW 编译的 stub 通常没有任何图标资源，直接复制不会冲突
+ *   - 如果原 PE 有多个图标 group（如 doubao.exe 有 6 个），全部复制，
+ *     Windows 按 ID 最小的整数 group 作为主图标显示
+ *   - RT_VERSION 全量复制，让文件属性显示原 PE 的版本信息
+ *
+ * 注意：UpdateResource 只动 stub 的 .rsrc 节，不影响 .payload 节。
+ *       失败不致命（图标错不影响程序运行），只打印警告。 */
+
+static HANDLE g_res_update_handle = NULL;
+
+/* EnumResourceNamesW 回调：把单个资源从原 PE 复制到输出 EXE
+ * type/name 可能是整数 ID（MAKEINTRESOURCE）或字符串指针，直接传递即可 */
+static BOOL CALLBACK copy_res_callback(HMODULE hMod, LPCWSTR type, LPWSTR name, LONG_PTR lParam) {
+    (void)lParam;
+    HRSRC hRes = FindResourceW(hMod, name, type);
+    if (!hRes) return TRUE;  /* 继续枚举其他资源 */
+    HGLOBAL hMem = LoadResource(hMod, hRes);
+    if (!hMem) return TRUE;
+    LPVOID pData = LockResource(hMem);
+    DWORD size = SizeofResource(hMod, hRes);
+    if (!pData || !size) return TRUE;
+
+    /* 写入输出 EXE（type/name 直接传，UpdateResourceW 支持整数 ID 和字符串） */
+    if (!UpdateResourceW(g_res_update_handle, type, name,
+                         MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+                         pData, size)) {
+        /* 失败不中断，继续复制其他资源 */
+    }
+    return TRUE;
+}
+
+/* 从 src_path 复制图标和版本资源到 dst_path
+ * 返回 0 成功，-1 失败（失败不致命，调用方可继续） */
+static int copy_resources(const wchar_t* src_path, const wchar_t* dst_path) {
+    /* 用 LOAD_LIBRARY_AS_DATAFILE 加载原 PE，不执行任何代码，只读资源 */
+    HMODULE hSrc = LoadLibraryExW(src_path, NULL, LOAD_LIBRARY_AS_DATAFILE);
+    if (!hSrc) {
+        printf("[-] copy_resources: LoadLibraryExW(src) failed: %lu\n", GetLastError());
+        return -1;
+    }
+
+    HANDLE hUpdate = BeginUpdateResourceW(dst_path, FALSE);
+    if (!hUpdate) {
+        printf("[-] copy_resources: BeginUpdateResourceW failed: %lu\n", GetLastError());
+        FreeLibrary(hSrc);
+        return -1;
+    }
+
+    g_res_update_handle = hUpdate;
+
+    /* 复制图标资源（RT_GROUP_ICON + RT_ICON）和版本信息（RT_VERSION）
+     * RT_* 宏是 MAKEINTRESOURCE 返回 LPWSTR，需 cast 成 LPCWSTR 以匹配
+     * EnumResourceNamesW 的第二个参数类型（MinGW GCC 严格类型检查） */
+    EnumResourceNamesW(hSrc, (LPCWSTR)RT_GROUP_ICON, copy_res_callback, 0);
+    EnumResourceNamesW(hSrc, (LPCWSTR)RT_ICON,       copy_res_callback, 0);
+    EnumResourceNamesW(hSrc, (LPCWSTR)RT_VERSION,    copy_res_callback, 0);
+
+    BOOL ok = EndUpdateResourceW(hUpdate, FALSE);  /* FALSE = 提交更新 */
+    FreeLibrary(hSrc);
+    if (!ok) {
+        printf("[-] copy_resources: EndUpdateResourceW failed: %lu\n", GetLastError());
+        return -1;
+    }
+    return 0;
+}
+
+/* char* 转 wchar_t*（路径转换，用于 Windows W 系列 API） */
+static int char_to_wchar(const char* src, wchar_t* dst, int dst_elems) {
+    int n = MultiByteToWideChar(CP_ACP, 0, src, -1, NULL, 0);
+    if (n == 0 || n > dst_elems) return -1;
+    MultiByteToWideChar(CP_ACP, 0, src, -1, dst, n);
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -138,11 +224,14 @@ int main(int argc, char* argv[]) {
     /* stub_path = NULL 表示按输入 PE 架构自动选；--stub 显式覆盖 */
     const char* stub_path = NULL;
     int user_specified_stub = 0;
+    int copy_icon = 1;  /* 默认复制图标/版本资源，--no-icon 关闭 */
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--stub") == 0 && i + 1 < argc) {
             stub_path = argv[++i];
             user_specified_stub = 1;
+        } else if (strcmp(argv[i], "--no-icon") == 0) {
+            copy_icon = 0;
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-v") == 0) {
             g_debug = 1;
         } else {
@@ -527,6 +616,27 @@ int main(int argc, char* argv[]) {
     printf("[+]   SizeOfImage: 0x%lx -> 0x%lx\n",
            (unsigned long)s_size_of_image, (unsigned long)new_size_of_image);
     printf("[+]   Entry: stub mainCRTStartup (unchanged)\n");
+
+    /* 12. 复制原 PE 的图标和版本资源到输出 EXE
+     *     让 Explorer 显示原图标，文件属性显示原版本信息
+     *     失败不致命（图标错不影响程序运行） */
+    if (copy_icon) {
+        wchar_t in_path_w[MAX_PATH], out_path_w[MAX_PATH];
+        if (char_to_wchar(in_path, in_path_w, MAX_PATH) == 0 &&
+            char_to_wchar(out_path, out_path_w, MAX_PATH) == 0) {
+            printf("[+] Copying icon/version resources from input PE...\n");
+            if (copy_resources(in_path_w, out_path_w) == 0) {
+                printf("[+]   Resources copied (Explorer will show original icon)\n");
+            } else {
+                printf("[!]   Resource copy failed (continuing, icon may be wrong)\n");
+            }
+        } else {
+            printf("[!] Failed to convert paths to wide chars, skip resource copy\n");
+        }
+    } else {
+        printf("[+] Skipping icon/version copy (--no-icon)\n");
+    }
+
     printf("[+] Done. Output will run stub -> reflective load -> jump to original OEP\n");
 
     free(out); free(stub); free(payload); free(in_pe);

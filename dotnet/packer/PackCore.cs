@@ -245,9 +245,11 @@ namespace WinAppLocker.Packer
                 if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
                 File.Copy(tempOutput, opts.OutputPath, true);
 
-                // Reflective 模式不调用 IconCopier（原 PE 的 .rsrc 节已完整保留在 .payload 中，
-                // stub 加载原 PE 后通过 PEB.Ldr 覆写让 OS 找到原 PE 的资源；再调 UpdateResourceW
-                // 会改 stub 自己的资源段，与原 PE 资源无关，反而可能干扰）
+                // Reflective 模式不调用 IconCopier：
+                // builder_reflective.exe 内部已用 UpdateResource API 把原 PE 的
+                // RT_GROUP_ICON + RT_ICON + RT_VERSION 复制到输出 EXE 的 .rsrc 节，
+                // Explorer 会显示原图标，文件属性会显示原版本信息。
+                // 这里再调 IconCopier 会重复操作，且 builder 处理更底层（C 层直接调 Win32 API）。
 
                 progress?.Report(100);
                 return new PackReport
