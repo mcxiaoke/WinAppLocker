@@ -25,6 +25,7 @@ COMMON_DIR := $(ROOT)/common
 STUB_DIR := $(ROOT)/stub
 BLD_DIR  := $(ROOT)/builder
 TST_DIR  := $(ROOT)/test
+RFL_DIR  := $(ROOT)/reflective
 
 # 输入样本
 SAMPLE   ?= $(ROOT)/../samples/hellogui.exe
@@ -59,6 +60,16 @@ STUB_LDFLAGS_X86 := -nostdlib -nostartfiles \
 BLD_CFLAGS   := -Wall -Wextra -O2
 BLD_LDFLAGS  := -ladvapi32
 
+# === reflective stub / builder 编译参数 ===
+# - 开发优先：用 CRT + console subsystem，允许 printf 调试
+# - 不做 PIC / 无 CRT 限制（开发阶段便于调试）
+# - MVP 只支持 x64
+# - gcc 默认链接 msvcrt/kernel32/user32，无需显式 -l
+RFL_CFLAGS     := -Wall -Wextra -O2
+RFL_LDFLAGS    :=
+RFL_BLD_CFLAGS := -Wall -Wextra -O2
+RFL_BLD_LDFLAGS :=
+
 # 文件
 STUB_SRC    := $(STUB_DIR)/stub.c
 
@@ -78,10 +89,21 @@ STUB_BIN     := $(STUB_BIN_X64)
 BLD_SRC     := $(BLD_DIR)/builder.c
 BLD_EXE     := $(BLD_DIR)/builder.exe
 
+# === reflective 文件 ===
+RFL_SRC     := $(RFL_DIR)/loader.c
+RFL_EXE     := $(RFL_DIR)/loader_x64.exe
+RFL_BLD_SRC := $(BLD_DIR)/builder_reflective.c
+RFL_BLD_EXE := $(BLD_DIR)/builder_reflective.exe
+
 # 默认输出
 PROTECTED   := $(TST_DIR)/hellogui_locked.exe
 
-.PHONY: all all-x86 clean test run-stub run-protected
+# reflective 测试样本与输出
+NOTEPAD_SAMPLE := $(ROOT)/../temp/samples/Notepad4.exe
+NOTEPAD_OUT    := $(TST_DIR)/Notepad4_reflective.exe
+
+.PHONY: all all-x86 clean test run-stub run-protected \
+        reflective reflective-test reflective-clean
 
 # 默认只编 x64 + builder（保持快速）
 all: $(STUB_BIN_X64) $(BLD_EXE)
@@ -136,6 +158,38 @@ $(STUB_BIN_X86): $(STUB_EXE_X86)
 $(BLD_EXE): $(BLD_SRC) $(COMMON_DIR)/config.h
 	$(GCC_X64) $(BLD_CFLAGS) $< -o $@ $(BLD_LDFLAGS)
 
+# === 构建 reflective stub（loader_x64.exe） ===
+# 开发优先：用 CRT + console subsystem，printf 调试可见
+# MVP 阶段直接编 exe，不做 objcopy 提取 .lock 节
+$(RFL_EXE): $(RFL_SRC) $(RFL_DIR)/payload.h
+	$(GCC_X64) $(RFL_CFLAGS) $< -o $@ $(RFL_LDFLAGS)
+	@echo === reflective stub built ===
+
+# === 构建 reflective builder（builder_reflective.exe） ===
+$(RFL_BLD_EXE): $(RFL_BLD_SRC) $(RFL_DIR)/payload.h
+	$(GCC_X64) $(RFL_BLD_CFLAGS) $< -o $@ $(RFL_BLD_LDFLAGS)
+	@echo === reflective builder built ===
+
+# === reflective 一键构建：stub + builder ===
+reflective: $(RFL_EXE) $(RFL_BLD_EXE)
+	@echo ""
+	@echo "=== Reflective build complete ==="
+	@echo "loader_x64.exe:           $(RFL_EXE)"
+	@echo "builder_reflective.exe:   $(RFL_BLD_EXE)"
+	@echo "Run 'make reflective-test' to pack Notepad4.exe and verify."
+
+# === reflective 端到端测试：加壳 Notepad4.exe ===
+reflective-test: $(RFL_EXE) $(RFL_BLD_EXE)
+	@if [ ! -d "$(TST_DIR)" ]; then $(MKDIR) "$(TST_DIR)"; fi
+	@if [ ! -f "$(NOTEPAD_SAMPLE)" ]; then \
+		echo "[ERR] sample not found: $(NOTEPAD_SAMPLE)"; \
+		exit 1; \
+	fi
+	"$(RFL_BLD_EXE)" "$(NOTEPAD_SAMPLE)" "$(NOTEPAD_OUT)" --stub "$(RFL_EXE)"
+	@echo ""
+	@echo "=== Packed output: $(NOTEPAD_OUT) ==="
+	@echo "Run it manually to verify reflective loading works."
+
 # === 测试：加壳 hellogui.exe ===
 test: $(STUB_BIN_X64) $(BLD_EXE)
 	@if [ ! -d "$(TST_DIR)" ]; then $(MKDIR) "$(TST_DIR)"; fi
@@ -149,9 +203,13 @@ run-protected: $(PROTECTED)
 run-stub: $(STUB_EXE_X64)
 	"$(STUB_EXE_X64)"
 
-clean:
+clean: reflective-clean
 	$(RM) "$(STUB_OBJ_X64)" "$(STUB_EXE_X64)" "$(STUB_BIN_X64)"
 	$(RM) "$(STUB_OBJ_X86)" "$(STUB_EXE_X86)" "$(STUB_BIN_X86)"
 	$(RM) "$(BLD_EXE)" "$(PROTECTED)"
 	# 清理旧命名
 	$(RM) "$(STUB_DIR)/stub.o" "$(STUB_DIR)/stub.exe" "$(STUB_DIR)/stub.bin"
+
+# 清理 reflective 产物
+reflective-clean:
+	$(RM) "$(RFL_EXE)" "$(RFL_BLD_EXE)" "$(NOTEPAD_OUT)"

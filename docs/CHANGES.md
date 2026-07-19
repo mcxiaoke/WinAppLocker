@@ -1,5 +1,60 @@
 # 变更记录
 
+## 变更记录 2026-07-19 反射式 Packer/Stub 阶段一 MVP 实施完成
+
+按照 `packer/docs/REFLECTIVE_DESIGN.md` 阶段 1 MVP 计划完成反射式 loader 的首个可运行版本，**已通过端到端验收**：反射式加载 Notepad4.exe / hellocli.exe 跳 OEP 成功。
+
+1. **新增 `packer/reflective/payload.h`**：反射式 payload 容器格式定义
+   - 魔数 `WLOCKR` + 版本 + flags 位域（HASH/TEST_MODE/COMPRESS/ENCRYPTED/ANTIDEBUG/ERASE_HDR/SCRUB_FN）
+   - `reflective_payload_t` 结构 152 字节：含 image_base / oep_rva / salt / nonce / pwd_hash / xtea_key 等字段（v1 明文模式这些字段全 0）
+   - builder 和 stub 共享此头定义
+
+2. **新增 `packer/reflective/loader.c`**：反射式 stub 主体（MVP v1 明文模式）
+   - 用 Win32 API + CRT（开发优先，不做 PIC 无 CRT）
+   - 仅 x64，PEB 访问用 `__readgsqword(0x60)`
+   - 完整流程：定位 .payload 节 → 解析 header → VirtualAlloc preferred base → 复制 PE 头+各节 → 应用 relocations（DIR64）→ 处理 IAT（LoadLibraryA + GetProcAddress，OS 自动处理 forwarder）→ 注册 .pdata（RtlAddFunctionTable）→ 初始化 SecurityCookie（KUSER_SHARED_DATA）→ 设置节权限 → 更新 PEB.ImageBaseAddress → 调用 TLS callbacks（DLL_PROCESS_ATTACH）→ jump_to_oep（16B 对齐 + 40B shadow space）
+   - 调试日志：写 `*_loader.log` 文件 + OutputDebugStringA（不弹 console 避免 GUI 干扰）
+   - IAT 解析宽松策略：GetProcAddress 失败时写 NULL 警告但继续（解决 comctl32 v6 ordinal 在 v5 缺失的问题）
+
+3. **新增 `packer/builder/builder_reflective.c`**：反射式 packer builder（MVP v1 明文模式）
+   - 读取任意架构 PE（x86/x64/ARM64/.NET 都能读，反射式不挑食）
+   - 构造 payload：reflective_payload_t 头 + 完整原 PE 文件（v1 明文不加密）
+   - 在 stub EXE 末尾追加 .payload 节（含节头空间检查、对齐计算）
+   - 继承原 PE 的 Subsystem（GUI 保持 GUI，console 保持 console）
+   - 清零 CheckSum
+
+4. **修改 `packer/Makefile`**：新增 reflective 构建规则
+   - `make reflective`：编译 loader_x64.exe + builder_reflective.exe
+   - `make reflective-test`：用 builder_reflective 加壳 Notepad4.exe
+   - `make reflective-clean`：清理 reflective 产物
+   - 不影响现有 in-place stub/builder 构建规则
+
+5. **新增 `packer/tests/run_reflective_test.ps1`**：反射式加载测试脚本
+   - 启动加壳后 EXE，等待若干秒，检查进程是否存活 + Notepad4 窗口是否出现
+   - 自动清理测试进程
+
+6. **端到端验收通过**：
+   - ✅ `temp/samples/Notepad4.exe`（x64 GUI, 2.4MB）：加壳后启动，"未命名 - Notepad4" 窗口出现，进程存活
+     - 日志显示：12 DLL / 482 函数解析成功，4028 个 .pdata 注册，节权限设置完成，OEP 跳转成功
+   - ✅ `temp/samples/hellocli.exe`（x64 console, 12KB）：加壳后运行输出 "Hello World!"
+   - 反射式加载完整流程（VirtualAlloc preferred base 命中 → 节复制 → IAT → reloc → .pdata → SecurityCookie → 节权限 → PEB 更新 → 跳 OEP）全部跑通
+
+## 变更记录 2026-07-19 反射式 Packer/Stub 设计文档
+
+新增反射式 loader 模式技术储备文档（无代码改动）
+
+1. **新增 `packer/docs/REFLECTIVE_ANALYSIS.md`**：5 个反射式 PE loader 项目深度对比报告
+   - peldr / AlushPacker / AtomPePacker / amber / pe-packer-rust
+   - 每个项目的 stub 语言、payload 格式、加密栈、IAT 解析、reloc 覆盖、TLS/.pdata/SecurityCookie 处理、栈对齐跳 OEP、API hash、反调试、反 dump、资源保留、stub 体积、与 OS loader 协作方式
+   - 横向对比表 + 可借鉴度评分 + 关键源码位置索引
+
+2. **新增 `packer/docs/REFLECTIVE_DESIGN.md`**：WinLock 反射式 Packer/Stub 设计方案
+   - 核心原则：**开发优先**（stub 体积放宽到 2MB）、**加密和反调试后置**（MVP 用 XTEA+SHA-256，后期升级 ChaCha20+PBKDF2）
+   - 文件结构：新增 `reflective/loader.c` + `builder_reflective.c` + `payload.h`，与现有 in-place 模式并存
+   - payload 格式：紧凑二进制头 + 魔数("WLOCKR") + 版本 + flags 位域
+   - 实施计划 5 阶段：MVP → 完整 PE 初始化 → MVP 加密版 → 后期增强 → 测试
+   - 决策记录：工具链、payload 容器、MVP 加密、TLS 处理、跳 OEP、API hash、反调试后置等 7 项决策
+
 ## 变更记录 2026-07-19 11:20
 
 auto_test.ps1 扩展支持 WinLock 模式 + 样本列表更新 + --test CLI 参数
