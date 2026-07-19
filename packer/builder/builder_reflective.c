@@ -5,7 +5,10 @@
  *   1. 读输入 PE 文件（任意架构：x86/x64/ARM64/.NET 都行，反射式不挑食）
  *   2. 解析 PE 头：ImageBase / SizeOfImage / OEP / Subsystem / Machine
  *   3. 构造 payload：reflective_payload_t 头 + 原 PE 文件完整数据（v1 明文）
- *   4. 读预编译 stub EXE（reflective/loader_x64.exe）
+ *   4. 按输入 PE 的架构选预编译 stub EXE：
+ *        x64 -> reflective/loader_x64.exe
+ *        x86 -> reflective/loader_x86.exe
+ *      ARM64 -> 不支持（无 ARM64 工具链），报错退出
  *   5. 在 stub EXE 末尾追加 .payload 节：
  *      - 新增节头（.payload）
  *      - 节内容 = reflective_payload_t + 原 PE 数据
@@ -16,7 +19,7 @@
  *
  * MVP 简化：
  *   - 不加密、不压缩、不复制 .rsrc 节
- *   - stub 用 x64（loader.c 只编译 x64）
+ *   - 支持 x64 和 x86 输入 PE（ARM64 暂不支持）
  *   - 不处理 overlay（直接读整个文件作为 payload_data）
  *   - 不修改 stub 的 entry（stub 用默认 mainCRTStartup -> main()）
  */
@@ -112,11 +115,15 @@ static int parse_pe(const uint8_t* pe, size_t pe_size, pe_info_t* info) {
 static void usage(const char* prog) {
     printf("WinLock Reflective Packer MVP v1\n");
     printf("Usage: %s <input.exe> <output.exe> [--stub <stub.exe>] [--debug|-v]\n", prog);
-    printf("  --stub <path>   Path to reflective stub EXE (default: ../reflective/loader_x64.exe)\n");
+    printf("  --stub <path>   Path to reflective stub EXE\n");
+    printf("                  (default: auto-select by input PE arch:\n");
+    printf("                   x64 -> ../reflective/loader_x64.exe\n");
+    printf("                   x86 -> ../reflective/loader_x86.exe)\n");
     printf("  --debug / -v    Verbose output\n");
     printf("\nFeatures:\n");
     printf("  - Plaintext payload (no encryption, MVP v1)\n");
-    printf("  - Supports any PE architecture (x86/x64/ARM64/.NET)\n");
+    printf("  - Supports x86 and x64 input PE (ARM64 not supported)\n");
+    printf("  - Auto-select stub by input PE architecture\n");
     printf("  - Inherits input PE subsystem (GUI stays GUI)\n");
 }
 
@@ -128,13 +135,14 @@ int main(int argc, char* argv[]) {
 
     const char* in_path = argv[1];
     const char* out_path = argv[2];
-    /* 默认 stub 路径：相对于 builder/ 目录的 ../reflective/loader_x64.exe
-     * 也可通过 --stub 覆盖 */
-    const char* stub_path = "../reflective/loader_x64.exe";
+    /* stub_path = NULL 表示按输入 PE 架构自动选；--stub 显式覆盖 */
+    const char* stub_path = NULL;
+    int user_specified_stub = 0;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--stub") == 0 && i + 1 < argc) {
             stub_path = argv[++i];
+            user_specified_stub = 1;
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-v") == 0) {
             g_debug = 1;
         } else {
@@ -158,9 +166,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const char* arch_str = "unknown";
-    if (info.machine == IMAGE_FILE_MACHINE_AMD64) arch_str = "x64";
-    else if (info.machine == IMAGE_FILE_MACHINE_I386) arch_str = "x86";
-    else if (info.machine == IMAGE_FILE_MACHINE_ARM64) arch_str = "ARM64";
+    const char* default_stub_path = NULL;
+    if (info.machine == IMAGE_FILE_MACHINE_AMD64) {
+        arch_str = "x64";
+        default_stub_path = "../reflective/loader_x64.exe";
+    } else if (info.machine == IMAGE_FILE_MACHINE_I386) {
+        arch_str = "x86";
+        default_stub_path = "../reflective/loader_x86.exe";
+    } else if (info.machine == IMAGE_FILE_MACHINE_ARM64) {
+        arch_str = "ARM64";
+    }
     const char* subsys_str = "unknown";
     if (info.subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI) subsys_str = "GUI";
     else if (info.subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI) subsys_str = "CUI(console)";
@@ -169,7 +184,22 @@ int main(int argc, char* argv[]) {
            info.size_of_image, info.entry_rva,
            info.subsystem, subsys_str);
 
-    /* 3. 构造 payload
+    /* 3. 决定 stub 路径
+     *    用户没指定时按输入 PE 架构选默认 stub */
+    if (!user_specified_stub) {
+        if (!default_stub_path) {
+            printf("[-] Unsupported input PE architecture (Machine=0x%04x)\n", info.machine);
+            printf("    Only x86 (0x014c) and x64 (0x8664) are supported.\n");
+            free(in_pe);
+            return 1;
+        }
+        stub_path = default_stub_path;
+        printf("[+] Auto-selected stub: %s (by input PE arch=%s)\n", stub_path, arch_str);
+    } else {
+        printf("[+] User-specified stub: %s\n", stub_path);
+    }
+
+    /* 4. 构造 payload
      *    v1 明文：payload_data = 整个原 PE 文件（含 PE 头 + 所有节 + overlay）
      *    stub 运行时按 PE 结构解析，overlay 自动忽略 */
     size_t payload_data_size = in_size;
@@ -209,29 +239,57 @@ int main(int argc, char* argv[]) {
     }
     printf("[+] Read stub: %s (%zu bytes)\n", stub_path, stub_size);
 
-    /* 5. 解析 stub PE 头（stub 是 x64，用 NT_HEADERS64）*/
+    /* 5. 解析 stub PE 头（stub 可能是 x86 或 x64，按 Machine 字段解析）*/
     IMAGE_DOS_HEADER* s_dos = (IMAGE_DOS_HEADER*)stub;
     if (s_dos->e_magic != IMAGE_DOS_SIGNATURE) {
         printf("[-] Stub is not a valid PE (bad DOS magic)\n");
         free(stub); free(payload); free(in_pe);
         return 1;
     }
-    IMAGE_NT_HEADERS64* s_nt = (IMAGE_NT_HEADERS64*)(stub + s_dos->e_lfanew);
-    if (s_nt->Signature != IMAGE_NT_SIGNATURE) {
+    /* FileHeader 在 IMAGE_NT_HEADERS32/64 里偏移相同（都在 Signature 之后），
+     * 先读 FileHeader.Machine 决定后续用什么类型解析 OptionalHeader */
+    IMAGE_NT_HEADERS32* s_nt32 = (IMAGE_NT_HEADERS32*)(stub + s_dos->e_lfanew);
+    IMAGE_NT_HEADERS64* s_nt64 = (IMAGE_NT_HEADERS64*)(stub + s_dos->e_lfanew);
+    if (s_nt32->Signature != IMAGE_NT_SIGNATURE) {
         printf("[-] Stub is not a valid PE (bad NT signature)\n");
         free(stub); free(payload); free(in_pe);
         return 1;
     }
-    if (s_nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        printf("[-] Stub is not x64 (MVP only supports x64 stub)\n");
+    WORD s_machine = s_nt32->FileHeader.Machine;
+    int stub_is_x64 = (s_machine == IMAGE_FILE_MACHINE_AMD64);
+    int stub_is_x86 = (s_machine == IMAGE_FILE_MACHINE_I386);
+    if (!stub_is_x64 && !stub_is_x86) {
+        printf("[-] Stub has unsupported Machine: 0x%04x (need x86 or x64)\n", s_machine);
+        free(stub); free(payload); free(in_pe);
+        return 1;
+    }
+    /* 检查 stub 架构与输入 PE 架构匹配（防止用 x64 stub 加壳 x86 PE） */
+    if (s_machine != info.machine) {
+        printf("[-] Stub arch (0x%04x) doesn't match input PE arch (0x%04x)\n",
+               s_machine, info.machine);
+        printf("    Use --stub to specify a matching stub, or omit --stub for auto-select.\n");
         free(stub); free(payload); free(in_pe);
         return 1;
     }
 
-    WORD  s_n_sec      = s_nt->FileHeader.NumberOfSections;
-    DWORD s_file_align = s_nt->OptionalHeader.FileAlignment;
-    DWORD s_sec_align  = s_nt->OptionalHeader.SectionAlignment;
-    IMAGE_SECTION_HEADER* s_sec = IMAGE_FIRST_SECTION(s_nt);
+    /* 用统一的字段提取避免后续代码 #ifdef 分支 */
+    WORD  s_n_sec;
+    DWORD s_file_align, s_sec_align;
+    DWORD s_size_of_image;
+    IMAGE_SECTION_HEADER* s_sec;
+    if (stub_is_x64) {
+        s_n_sec         = s_nt64->FileHeader.NumberOfSections;
+        s_file_align    = s_nt64->OptionalHeader.FileAlignment;
+        s_sec_align     = s_nt64->OptionalHeader.SectionAlignment;
+        s_size_of_image = s_nt64->OptionalHeader.SizeOfImage;
+        s_sec           = IMAGE_FIRST_SECTION(s_nt64);
+    } else {
+        s_n_sec         = s_nt32->FileHeader.NumberOfSections;
+        s_file_align    = s_nt32->OptionalHeader.FileAlignment;
+        s_sec_align     = s_nt32->OptionalHeader.SectionAlignment;
+        s_size_of_image = s_nt32->OptionalHeader.SizeOfImage;
+        s_sec           = IMAGE_FIRST_SECTION(s_nt32);
+    }
 
     /* 检查 stub 是否已有 .payload 节（避免重复加壳）*/
     for (WORD i = 0; i < s_n_sec; i++) {
@@ -301,10 +359,13 @@ int main(int argc, char* argv[]) {
     /* 拷贝 stub 数据 */
     memcpy(out, stub, stub_size);
 
-    /* 重新解析指针到 out 缓冲区（避免悬空指针）*/
+    /* 重新解析指针到 out 缓冲区（避免悬空指针）
+     * 按 stub 架构用对应 NT_HEADERS 类型 */
     IMAGE_DOS_HEADER* o_dos = (IMAGE_DOS_HEADER*)out;
-    IMAGE_NT_HEADERS64* o_nt = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
-    IMAGE_SECTION_HEADER* o_sec = IMAGE_FIRST_SECTION(o_nt);
+    IMAGE_NT_HEADERS32* o_nt32 = (IMAGE_NT_HEADERS32*)(out + o_dos->e_lfanew);
+    IMAGE_NT_HEADERS64* o_nt64 = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
+    IMAGE_SECTION_HEADER* o_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(o_nt64)
+                                              : IMAGE_FIRST_SECTION(o_nt32);
 
     /* 8. 添加 .payload 节头 */
     IMAGE_SECTION_HEADER* new_sec = &o_sec[s_n_sec];
@@ -322,14 +383,22 @@ int main(int argc, char* argv[]) {
     /* 9. 写入 payload 数据 */
     memcpy(out + new_raw_off, payload, total_payload_size);
 
-    /* 10. 更新 PE 头 */
-    o_nt->FileHeader.NumberOfSections++;
-    o_nt->OptionalHeader.SizeOfImage = new_va + new_vsize_aligned;
-    /* 继承原 PE 的 subsystem（让 GUI 程序保持 GUI）
-     * stub 编译为 console subsystem 便于开发，输出 EXE 改为原 PE 的 subsystem */
-    o_nt->OptionalHeader.Subsystem = info.subsystem;
-    /* 清零 CheckSum（让 OS 不校验，CRT 不依赖 CheckSum）*/
-    o_nt->OptionalHeader.CheckSum = 0;
+    /* 10. 更新 PE 头（按 stub 架构访问 OptionalHeader）*/
+    DWORD new_size_of_image = new_va + new_vsize_aligned;
+    if (stub_is_x64) {
+        o_nt64->FileHeader.NumberOfSections++;
+        o_nt64->OptionalHeader.SizeOfImage = new_size_of_image;
+        /* 继承原 PE 的 subsystem（让 GUI 程序保持 GUI）
+         * stub 编译为 console subsystem 便于开发，输出 EXE 改为原 PE 的 subsystem */
+        o_nt64->OptionalHeader.Subsystem = info.subsystem;
+        /* 清零 CheckSum（让 OS 不校验，CRT 不依赖 CheckSum）*/
+        o_nt64->OptionalHeader.CheckSum = 0;
+    } else {
+        o_nt32->FileHeader.NumberOfSections++;
+        o_nt32->OptionalHeader.SizeOfImage = new_size_of_image;
+        o_nt32->OptionalHeader.Subsystem = info.subsystem;
+        o_nt32->OptionalHeader.CheckSum = 0;
+    }
 
     /* 11. 写输出 */
     if (write_file(out_path, out, out_size) != 0) {
@@ -338,14 +407,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    WORD o_n_sec = stub_is_x64 ? o_nt64->FileHeader.NumberOfSections
+                               : o_nt32->FileHeader.NumberOfSections;
     printf("[+] Wrote output: %s (%zu bytes)\n", out_path, out_size);
     printf("[+]   Subsystem: %u(%s) (inherited from input PE)\n",
            info.subsystem, subsys_str);
-    printf("[+]   NumberOfSections: %u -> %u\n",
-           s_n_sec, o_nt->FileHeader.NumberOfSections);
+    printf("[+]   NumberOfSections: %u -> %u\n", s_n_sec, o_n_sec);
     printf("[+]   SizeOfImage: 0x%lx -> 0x%lx\n",
-           (unsigned long)s_nt->OptionalHeader.SizeOfImage,
-           (unsigned long)o_nt->OptionalHeader.SizeOfImage);
+           (unsigned long)s_size_of_image, (unsigned long)new_size_of_image);
     printf("[+]   Entry: stub mainCRTStartup (unchanged)\n");
     printf("[+] Done. Output will run stub -> reflective load -> jump to original OEP\n");
 

@@ -63,10 +63,12 @@ BLD_LDFLAGS  := -ladvapi32
 # === reflective stub / builder 编译参数 ===
 # - 开发优先：用 CRT + console subsystem，允许 printf 调试
 # - 不做 PIC / 无 CRT 限制（开发阶段便于调试）
-# - MVP 只支持 x64
+# - 支持 x64（w64devkit gcc）和 x86（msys2 mingw32 gcc）
 # - gcc 默认链接 msvcrt/kernel32/user32，无需显式 -l
 RFL_CFLAGS     := -Wall -Wextra -O2
 RFL_LDFLAGS    :=
+RFL_CFLAGS_X86 := -Wall -Wextra -O2
+RFL_LDFLAGS_X86 :=
 RFL_BLD_CFLAGS := -Wall -Wextra -O2
 RFL_BLD_LDFLAGS :=
 
@@ -91,7 +93,9 @@ BLD_EXE     := $(BLD_DIR)/builder.exe
 
 # === reflective 文件 ===
 RFL_SRC     := $(RFL_DIR)/loader.c
-RFL_EXE     := $(RFL_DIR)/loader_x64.exe
+RFL_EXE_X64 := $(RFL_DIR)/loader_x64.exe
+RFL_EXE_X86 := $(RFL_DIR)/loader_x86.exe
+RFL_EXE     := $(RFL_EXE_X64)   # 向后兼容：默认只编 x64
 RFL_BLD_SRC := $(BLD_DIR)/builder_reflective.c
 RFL_BLD_EXE := $(BLD_DIR)/builder_reflective.exe
 
@@ -103,7 +107,7 @@ NOTEPAD_SAMPLE := $(ROOT)/../temp/samples/Notepad4.exe
 NOTEPAD_OUT    := $(TST_DIR)/Notepad4_reflective.exe
 
 .PHONY: all all-x86 clean test run-stub run-protected \
-        reflective reflective-test reflective-clean
+        reflective reflective-all reflective-test reflective-clean
 
 # 默认只编 x64 + builder（保持快速）
 all: $(STUB_BIN_X64) $(BLD_EXE)
@@ -158,28 +162,44 @@ $(STUB_BIN_X86): $(STUB_EXE_X86)
 $(BLD_EXE): $(BLD_SRC) $(COMMON_DIR)/config.h
 	$(GCC_X64) $(BLD_CFLAGS) $< -o $@ $(BLD_LDFLAGS)
 
-# === 构建 reflective stub（loader_x64.exe） ===
+# === 构建 reflective stub x64（loader_x64.exe） ===
 # 开发优先：用 CRT + console subsystem，printf 调试可见
 # MVP 阶段直接编 exe，不做 objcopy 提取 .lock 节
-$(RFL_EXE): $(RFL_SRC) $(RFL_DIR)/payload.h
+$(RFL_EXE_X64): $(RFL_SRC) $(RFL_DIR)/payload.h
 	$(GCC_X64) $(RFL_CFLAGS) $< -o $@ $(RFL_LDFLAGS)
-	@echo === reflective stub built ===
+	@echo === reflective stub x64 built ===
+
+# === 构建 reflective stub x86（loader_x86.exe） ===
+# 用 MSYS2 mingw32 gcc（i686-w64-mingw32 工具链）
+# 需要先把 msys2 mingw32/bin 加入 PATH（Makefile 顶部已处理）
+$(RFL_EXE_X86): $(RFL_SRC) $(RFL_DIR)/payload.h check-x86-toolchain
+	$(GCC_X86) $(RFL_CFLAGS_X86) $< -o $@ $(RFL_LDFLAGS_X86)
+	@echo === reflective stub x86 built ===
 
 # === 构建 reflective builder（builder_reflective.exe） ===
 $(RFL_BLD_EXE): $(RFL_BLD_SRC) $(RFL_DIR)/payload.h
 	$(GCC_X64) $(RFL_BLD_CFLAGS) $< -o $@ $(RFL_BLD_LDFLAGS)
 	@echo === reflective builder built ===
 
-# === reflective 一键构建：stub + builder ===
-reflective: $(RFL_EXE) $(RFL_BLD_EXE)
+# === reflective 一键构建：x64 stub + builder ===
+reflective: $(RFL_EXE_X64) $(RFL_BLD_EXE)
 	@echo ""
-	@echo "=== Reflective build complete ==="
-	@echo "loader_x64.exe:           $(RFL_EXE)"
+	@echo "=== Reflective build complete (x64 only) ==="
+	@echo "loader_x64.exe:           $(RFL_EXE_X64)"
 	@echo "builder_reflective.exe:   $(RFL_BLD_EXE)"
+	@echo "Run 'make reflective-all' to also build x86 stub."
 	@echo "Run 'make reflective-test' to pack Notepad4.exe and verify."
 
+# === reflective 一键构建：x64 + x86 stub + builder ===
+reflective-all: $(RFL_EXE_X64) $(RFL_EXE_X86) $(RFL_BLD_EXE)
+	@echo ""
+	@echo "=== Reflective build complete (x64 + x86) ==="
+	@echo "loader_x64.exe:           $(RFL_EXE_X64)"
+	@echo "loader_x86.exe:           $(RFL_EXE_X86)"
+	@echo "builder_reflective.exe:   $(RFL_BLD_EXE)"
+
 # === reflective 端到端测试：加壳 Notepad4.exe ===
-reflective-test: $(RFL_EXE) $(RFL_BLD_EXE)
+reflective-test: $(RFL_EXE_X64) $(RFL_BLD_EXE)
 	@if [ ! -d "$(TST_DIR)" ]; then $(MKDIR) "$(TST_DIR)"; fi
 	@if [ ! -f "$(NOTEPAD_SAMPLE)" ]; then \
 		echo "[ERR] sample not found: $(NOTEPAD_SAMPLE)"; \
@@ -212,4 +232,4 @@ clean: reflective-clean
 
 # 清理 reflective 产物
 reflective-clean:
-	$(RM) "$(RFL_EXE)" "$(RFL_BLD_EXE)" "$(NOTEPAD_OUT)"
+	$(RM) "$(RFL_EXE_X64)" "$(RFL_EXE_X86)" "$(RFL_BLD_EXE)" "$(NOTEPAD_OUT)"

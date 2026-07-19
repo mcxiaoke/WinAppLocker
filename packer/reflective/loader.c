@@ -4,8 +4,8 @@
  * 设计原则（按 REFLECTIVE_DESIGN.md 阶段 1 MVP）：
  *   - 开发优先：用 Win32 API + CRT，允许 printf 调试
  *   - 不加密、不压缩、不反调试、不反 dump
- *   - 只支持 x64
- *   - reloc 只处理 DIR64（x64 PE 99% 够用）
+ *   - 支持 x64 和 x86（用 _WIN64 宏区分）
+ *   - reloc 5 类型全支持（ABS/DIR64/HIGHLOW/HIGH/LOW）
  *   - TLS 只调 ATTACH，不分配 TLS 数据块
  *   - IAT 用 LoadLibraryA + GetProcAddress（OS 自动处理 forwarder）
  *
@@ -14,13 +14,21 @@
  *   2. VirtualAlloc 分配 SizeOfImage 内存（优先 preferred ImageBase）
  *   3. 复制 PE headers + 各节
  *   4. 处理 IAT（LoadLibraryA + GetProcAddress）
- *   5. 应用 relocations（仅 DIR64）
- *   6. RtlAddFunctionTable 注册 .pdata
+ *   5. 应用 relocations（5 类型）
+ *   6. RtlAddFunctionTable 注册 .pdata（仅 x64，x86 SEH 走 FS:[0] 链无法手动注册）
  *   7. 初始化 SecurityCookie
  *   8. VirtualProtect 设置节权限
- *   9. 更新 PEB.ImageBaseAddress
+ *   9. 更新 PEB.ImageBaseAddress + PEB.Ldr 主 EXE 条目
  *  10. 调用原 PE 的 TLS callbacks（DLL_PROCESS_ATTACH）
  *  11. jump_to_oep(new_image + oep_rva)
+ *
+ * x86 vs x64 关键差异：
+ *   - PE 头：IMAGE_NT_HEADERS32 vs 64，OptionalHeader 布局不同
+ *   - IAT thunk：4 字节 vs 8 字节
+ *   - 重定位：x86 主要用 HIGHLOW，x64 主要用 DIR64
+ *   - 异常处理：x64 走 .pdata + RUNTIME_FUNCTION（可手动注册），
+ *               x86 走 FS:[0] SEH 链（无法手动注册，依赖编译器生成的 SEH 表）
+ *   - PEB 访问：fs:[0x30] vs gs:[0x60]
  */
 
 #include <stdio.h>
@@ -30,6 +38,30 @@
 #include <windows.h>
 
 #include "payload.h"
+
+/* ---- 架构相关类型别名 ----
+ * 让下面代码用统一的 IMAGE_NT_HEADERS_X / thunk_t 等符号，
+ * 实际类型由 _WIN64 宏决定。
+ * 这样 95% 的代码不需要 #ifdef 区分 */
+#ifdef _WIN64
+  typedef IMAGE_NT_HEADERS64            IMAGE_NT_HEADERS_X;
+  typedef IMAGE_TLS_DIRECTORY64         IMAGE_TLS_DIRECTORY_X;
+  typedef IMAGE_LOAD_CONFIG_DIRECTORY64 IMAGE_LOAD_CONFIG_X;
+  typedef ULONGLONG                     cookie_va_t;   /* SecurityCookie VA 类型 */
+  #define IMAGE_ORDINAL_FLAG_X    IMAGE_ORDINAL_FLAG64
+  #define IMAGE_ORDINAL_X(v)      IMAGE_ORDINAL64(v)
+  #define MY_MACHINE              IMAGE_FILE_MACHINE_AMD64
+  typedef uint64_t thunk_t;   /* IAT/ILT 表项类型 */
+#else
+  typedef IMAGE_NT_HEADERS32            IMAGE_NT_HEADERS_X;
+  typedef IMAGE_TLS_DIRECTORY32         IMAGE_TLS_DIRECTORY_X;
+  typedef IMAGE_LOAD_CONFIG_DIRECTORY32 IMAGE_LOAD_CONFIG_X;
+  typedef DWORD                         cookie_va_t;
+  #define IMAGE_ORDINAL_FLAG_X    IMAGE_ORDINAL_FLAG32
+  #define IMAGE_ORDINAL_X(v)      IMAGE_ORDINAL32(v)
+  #define MY_MACHINE              IMAGE_FILE_MACHINE_I386
+  typedef uint32_t thunk_t;
+#endif
 
 /* ---- 调试开关 ----
  * MVP 阶段开启 RDEBUG，日志写到 reflective_loader.log（与 EXE 同目录）
@@ -190,7 +222,7 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
     uint8_t* base = (uint8_t*)hSelf;
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
@@ -210,7 +242,7 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
  * GetProcAddress 自动处理 forwarder，MVP 不用自己实现递归 */
 static int process_iat(uint8_t* img) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
         DBG("iat: no import directory, skip\n");
@@ -229,15 +261,16 @@ static int process_iat(uint8_t* img) {
         }
 
         /* OriginalFirstThunk = ILT (Import Lookup Table)，FirstThunk = IAT
-         * 有些 PE 的 OriginalFirstThunk 为 0（绑定导入），用 FirstThunk 兜底 */
-        uint64_t* ilt = (uint64_t*)(img + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        uint64_t* iat = (uint64_t*)(img + imp->FirstThunk);
+         * 有些 PE 的 OriginalFirstThunk 为 0（绑定导入），用 FirstThunk 兜底
+         * x64 thunk 8 字节，x86 thunk 4 字节，用 thunk_t 统一 */
+        thunk_t* ilt = (thunk_t*)(img + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        thunk_t* iat = (thunk_t*)(img + imp->FirstThunk);
 
         for (; *ilt != 0; ilt++, iat++) {
             const char* func_name = NULL;
             WORD ord = 0;
-            if (*ilt & IMAGE_ORDINAL_FLAG64) {
-                ord = (WORD)IMAGE_ORDINAL64(*ilt);
+            if (*ilt & IMAGE_ORDINAL_FLAG_X) {
+                ord = (WORD)IMAGE_ORDINAL_X(*ilt);
             } else {
                 IMAGE_IMPORT_BY_NAME* iibn = (IMAGE_IMPORT_BY_NAME*)(img + (*ilt & 0x7FFFFFFF));
                 func_name = (const char*)iibn->Name;
@@ -264,7 +297,7 @@ static int process_iat(uint8_t* img) {
                 *iat = 0;
                 continue;
             }
-            *iat = (uint64_t)fn;
+            *iat = (thunk_t)fn;
             func_count++;
         }
         dll_count++;
@@ -293,7 +326,7 @@ static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base)
         return 1;
     }
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
         DBG("reloc: no reloc table, but base delta != 0, FAIL\n");
@@ -359,10 +392,22 @@ static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base)
 /* ---- 注册 .pdata（异常处理表）----
  * x64 的 SEH 走 .pdata + RUNTIME_FUNCTION 表
  * RtlAddFunctionTable 告诉 OS 这块内存的异常处理表
- * 不注册的话，原 PE 内的异常（如除零、栈溢出）无法被捕获 */
+ * 不注册的话，原 PE 内的异常（如除零、栈溢出）无法被捕获
+ *
+ * x86 SEH 走 FS:[0] 链（每个函数 prolog 把 EXCEPTION_RECORD 注册到 TIB），
+ * 这是编译器在函数 prolog/epilog 自动维护的，无法手动注册。
+ * x86 反射式加载的 PE 无法让 OS 知道 .pdata 等价信息（x86 实际上没有 .pdata），
+ * 所以本函数在 x86 下直接返回 1（成功），让流程继续。
+ * 风险：x86 PE 内的异常（如除零）可能无法被 __try/__except 捕获。
+ *      现代 MinGW/MSVC 编译的 x86 PE 在函数 prolog 自己注册 SEH，能工作。 */
 static int register_exception_table(uint8_t* img) {
+#ifndef _WIN64
+    (void)img;
+    DBG("pdata: x86 SEH uses FS:[0] chain, skip RtlAddFunctionTable\n");
+    return 1;
+#else
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
         DBG("pdata: no exception table, skip\n");
@@ -374,6 +419,7 @@ static int register_exception_table(uint8_t* img) {
     DBG("pdata: RtlAddFunctionTable(%p, %lu, %p) = %d\n",
         (void*)rf, count, (void*)img, (int)ok);
     return ok ? 1 : 0;
+#endif
 }
 
 /* ---- 初始化 SecurityCookie ----
@@ -386,37 +432,42 @@ static int register_exception_table(uint8_t* img) {
  */
 static void init_security_cookie(uint8_t* img) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
     if (dir->VirtualAddress == 0 ||
-        dir->Size < offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + sizeof(ULONGLONG)) {
+        dir->Size < offsetof(IMAGE_LOAD_CONFIG_X, SecurityCookie) + sizeof(cookie_va_t)) {
         DBG("cookie: no load config or no SecurityCookie field, skip\n");
         return;
     }
-    IMAGE_LOAD_CONFIG_DIRECTORY64* lc = (IMAGE_LOAD_CONFIG_DIRECTORY64*)(img + dir->VirtualAddress);
+    IMAGE_LOAD_CONFIG_X* lc = (IMAGE_LOAD_CONFIG_X*)(img + dir->VirtualAddress);
     if (lc->SecurityCookie == 0) {
         DBG("cookie: SecurityCookie VA is 0, skip\n");
         return;
     }
 
-    ULONGLONG cookie_va = lc->SecurityCookie;
+    cookie_va_t cookie_va = lc->SecurityCookie;
     ULONG_PTR* cookie_ptr;
     /* 判断 reloc 是否已修复：cookie_va 在 image 范围内则已修复为绝对地址 */
-    if (cookie_va >= (ULONGLONG)img &&
-        cookie_va < (ULONGLONG)img + nt->OptionalHeader.SizeOfImage) {
-        cookie_ptr = (ULONG_PTR*)cookie_va;
+    if ((uintptr_t)cookie_va >= (uintptr_t)img &&
+        (uintptr_t)cookie_va < (uintptr_t)img + nt->OptionalHeader.SizeOfImage) {
+        cookie_ptr = (ULONG_PTR*)(uintptr_t)cookie_va;
     } else {
         /* reloc 未修复，用 preferred_base 计算 RVA */
-        cookie_ptr = (ULONG_PTR*)(img + (cookie_va - nt->OptionalHeader.ImageBase));
+        cookie_ptr = (ULONG_PTR*)(img + ((uintptr_t)cookie_va - (uintptr_t)nt->OptionalHeader.ImageBase));
     }
 
     ULONG_PTR cur = *cookie_ptr;
+#ifdef _WIN64
     const ULONG_PTR default_cookie = 0x00002B992DDFA232ULL;
+#else
+    const ULONG_PTR default_cookie = 0x0000BB40ULL;  /* x86 MSVC 默认 cookie */
+#endif
     if (cur != default_cookie && cur != 0) {
         DBG("cookie: already initialized (0x%llx), skip\n", (unsigned long long)cur);
         return;
     }
-    /* KUSER_SHARED_DATA.InterruptTime (0x7FFE0008, 每 100ns 更新) */
+    /* KUSER_SHARED_DATA.InterruptTime (0x7FFE0008, 每 100ns 更新)
+     * x86/x64 都是 64 位 InterruptTime，用 ULONGLONG 读取 */
     volatile ULONGLONG* kuser_interrupt = (volatile ULONGLONG*)0x7FFE0008;
     *cookie_ptr = (ULONG_PTR)img ^ (ULONG_PTR)*kuser_interrupt;
     DBG("cookie: initialized to 0x%llx\n", (unsigned long long)*cookie_ptr);
@@ -427,7 +478,7 @@ static void init_security_cookie(uint8_t* img) {
  * PE 头单独置 PAGE_READONLY */
 static void set_section_permissions(uint8_t* img) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         DWORD prot = sec_char_to_prot(sec[i].Characteristics);
@@ -449,13 +500,13 @@ static void set_section_permissions(uint8_t* img) {
  * （MVP 接受此限制，后期阶段评估 AlushPacker TLS proxy 方案） */
 static void run_tls_callbacks(uint8_t* img) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
         DBG("tls: no TLS directory, skip\n");
         return;
     }
-    IMAGE_TLS_DIRECTORY64* tls = (IMAGE_TLS_DIRECTORY64*)(img + dir->VirtualAddress);
+    IMAGE_TLS_DIRECTORY_X* tls = (IMAGE_TLS_DIRECTORY_X*)(img + dir->VirtualAddress);
     if (tls->AddressOfCallBacks == 0) {
         DBG("tls: no callbacks, skip\n");
         return;
@@ -517,13 +568,13 @@ static void patch_peb_ldr_main_entry(void* new_img) {
         return;
     }
 
-    /* first 指向 LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks（偏移 0x10）
-     * 回退 0x10 字节得到结构头 */
+    /* first 指向 LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks 字段
+     * x64 偏移 0x10，x86 偏移 0x08。用 offsetof 自动适配架构。 */
     LDR_DATA_TABLE_ENTRY_X* entry = (LDR_DATA_TABLE_ENTRY_X*)
         ((uint8_t*)first - offsetof(LDR_DATA_TABLE_ENTRY_X, InMemoryOrderLinks));
 
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)new_img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)((uint8_t*)new_img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)((uint8_t*)new_img + dos->e_lfanew);
 
     DBG("peb: patch LDR entry %p: DllBase %p -> %p, SizeOfImage 0x%lx -> 0x%lx\n",
         (void*)entry, (void*)entry->DllBase, new_img,
@@ -555,7 +606,7 @@ static void patch_peb_ldr_main_entry(void* new_img) {
  * 返回：0 成功（context 已激活），1 无 manifest，-1 失败 */
 static int activate_manifest_from_image(uint8_t* img) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
         DBG("actctx: no .rsrc directory, skip\n");
@@ -688,14 +739,14 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
         DBG("map: bad DOS magic 0x%04x\n", dos->e_magic);
         return NULL;
     }
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(payload_data + dos->e_lfanew);
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(payload_data + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
         DBG("map: bad NT signature 0x%08lx\n", (unsigned long)nt->Signature);
         return NULL;
     }
-    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        DBG("map: not x64 PE (Machine=0x%04x), MVP only supports x64\n",
-            nt->FileHeader.Machine);
+    if (nt->FileHeader.Machine != MY_MACHINE) {
+        DBG("map: machine mismatch (PE=0x%04x, stub=0x%04x), refuse to load\n",
+            nt->FileHeader.Machine, (unsigned)MY_MACHINE);
         return NULL;
     }
 
@@ -835,15 +886,26 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
             fprintf(g_logf, "[VEH] ACCESS_VIOLATION %s address %p\n",
                     op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
         }
+#ifdef _WIN64
         fprintf(g_logf, "[VEH] RIP=%p RSP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p\n",
                 (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rsp,
                 (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
                 (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8,
                 (void*)ep->ContextRecord->R9);
+#else
+        fprintf(g_logf, "[VEH] EIP=%p ESP=%p EAX=%p ECX=%p EDX=%p EBX=%p ESI=%p EDI=%p EBP=%p\n",
+                (void*)ep->ContextRecord->Eip, (void*)ep->ContextRecord->Esp,
+                (void*)ep->ContextRecord->Eax, (void*)ep->ContextRecord->Ecx,
+                (void*)ep->ContextRecord->Edx, (void*)ep->ContextRecord->Ebx,
+                (void*)ep->ContextRecord->Esi, (void*)ep->ContextRecord->Edi,
+                (void*)ep->ContextRecord->Ebp);
+#endif
         fflush(g_logf);
-        /* 用 RtlVirtualUnwind 做正确的栈回溯
+#ifdef _WIN64
+        /* 用 RtlVirtualUnwind 做正确的栈回溯（x64 专用）
          * 根据已注册的 .pdata 表逐帧 unwind，得到真正的调用链
-         * 这样能精确定位抛异常的代码位置在 image 内的哪个函数 */
+         * 这样能精确定位抛异常的代码位置在 image 内的哪个函数
+         * x86 没有 RtlVirtualUnwind，跳过栈回溯 */
         CONTEXT ctx = *ep->ContextRecord;
         fprintf(g_logf, "[VEH] call stack (RtlVirtualUnwind):\n");
         fflush(g_logf);
@@ -890,6 +952,20 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
             if (ctx.Rsp <= rsp) break;
         }
         fflush(g_logf);
+#else
+        /* x86 简单栈扫描：从 esp 开始扫描 32 个 DWORD，找看起来像返回地址的值
+         * 不精确但能给个线索（真正的栈回溯需要 FS:[0] SEH 链） */
+        uint32_t* sp = (uint32_t*)ep->ContextRecord->Esp;
+        fprintf(g_logf, "[VEH] stack dump (x86, raw scan):\n");
+        for (int i = 0; i < 32; i++) {
+            uint32_t v = sp[i];
+            if (v >= 0x400000 && v < 0x500000) {
+                fprintf(g_logf, "  [esp+0x%02x] 0x%08x (IMG RVA=0x%x)\n",
+                        i*4, v, v - 0x400000);
+            }
+        }
+        fflush(g_logf);
+#endif
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }

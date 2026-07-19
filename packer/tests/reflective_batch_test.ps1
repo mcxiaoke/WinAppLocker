@@ -1,9 +1,9 @@
 ﻿<#
 .SYNOPSIS
-  批量测试反射式加壳：对每个 x64 样本加壳并运行验证。
+  批量测试反射式加壳：对每个样本（x86 + x64）加壳并运行验证。
 .DESCRIPTION
-  阶段 2 验证脚本：测试 reloc 补全后各样本的兼容性。
-  只测 x64 样本（阶段 2 loader 仍只支持 x64）。
+  阶段 2/3 验证脚本：测试 reloc/IAT/TLS/PEB 补全后各样本的兼容性。
+  同时测 x64 和 x86 样本（builder 按输入 PE 的 Machine 字段自动选 stub）。
   每个样本：加壳 -> 启动 -> 等待 -> 检查窗口/输出 -> 清理。
 #>
 
@@ -14,15 +14,15 @@ param(
 $ErrorActionPreference = "Continue"
 
 $Builder = "C:\Home\Projects\applocker\packer\builder\builder_reflective.exe"
-$Stub    = "C:\Home\Projects\applocker\packer\reflective\loader_x64.exe"
 $OutDir  = "C:\Home\Projects\applocker\packer\test\reflective_batch"
 $SampleDir = "C:\Home\Projects\applocker\temp\samples"
 
-# 只测 x64 样本
+# 不传 --stub，让 builder 按输入 PE 架构自动选 loader_x64.exe / loader_x86.exe
 $Samples = @(
     @{ Name = "Notepad4.exe";     Type = "GUI"; NeedWindow = $true;  WindowMatch = "Notepad4" },
     @{ Name = "DontSleep.exe";    Type = "GUI"; NeedWindow = $true;  WindowMatch = "DontSleep" },
     @{ Name = "helloguix64.exe";  Type = "GUI"; NeedWindow = $true;  WindowMatch = "HelloGUI" },
+    @{ Name = "helloguix86.exe";  Type = "GUI"; NeedWindow = $true;  WindowMatch = "hellogui" },  # x86 样本，窗口标题 "helloguiaslr"
     @{ Name = "hellocli.exe";     Type = "CUI"; NeedOutput = $true;  OutputMatch = "Hello" },
     @{ Name = "hellomingw.exe";   Type = "CUI"; NeedOutput = $true;  OutputMatch = "Hello" },
     @{ Name = "helloucrt.exe";    Type = "CUI"; NeedOutput = $true;  OutputMatch = "Hello" },
@@ -55,8 +55,16 @@ foreach ($s in $Samples) {
     }
 
     # 加壳
+    # builder 默认 stub 路径是相对路径（../reflective/loader_xXX.exe），
+    # 必须在 builder.exe 所在目录调用才能正确解析
     Write-Host "  [*] Packing..."
-    $packOut = & $Builder $inPath $outPath --stub $Stub 2>&1
+    $builderDir = Split-Path $Builder -Parent
+    Push-Location $builderDir
+    try {
+        $packOut = & $Builder $inPath $outPath 2>&1
+    } finally {
+        Pop-Location
+    }
     if (-not (Test-Path $outPath)) {
         Write-Host "  [FAIL] Pack failed" -ForegroundColor Red
         $results += @{ Name = $s.Name; Result = "FAIL"; Reason = "pack failed" }

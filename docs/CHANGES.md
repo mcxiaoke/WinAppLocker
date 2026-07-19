@@ -1,5 +1,54 @@
 # 变更记录
 
+## 变更记录 2026-07-19 反射式 Packer 阶段二续：x86 架构支持 + 9/9 样本通过
+
+在 x64 反射式 loader 基础上新增 x86 (i386) 架构支持，builder 按输入 PE 的 Machine 字段自动选 stub，**batch test 9/9 全部 PASS**（含 x86 样本 helloguix86.exe）。
+
+1. **`packer/reflective/loader.c` 双架构重构**
+   - 新增架构相关类型别名：`IMAGE_NT_HEADERS_X` / `thunk_t` / `IMAGE_ORDINAL_FLAG_X` / `MY_MACHINE` 等，用 `#ifdef _WIN64` 切换，让 95% 代码无需 #ifdef
+   - IAT 处理改用 `thunk_t`（x64=8字节 / x86=4字节）
+   - 重定位 5 类型全支持（x86 主要 HIGHLOW，x64 主要 DIR64）
+   - `init_security_cookie` x86 默认 cookie 0x0000BB40，x64 默认 0x00002B992DDFA232
+   - `register_exception_table` x86 跳过（x86 SEH 走 FS:[0] 链无法手动注册，x64 走 .pdata + RtlAddFunctionTable）
+   - VEH 函数 x86 分支输出 EIP/ESP 等 + 简单栈扫描；x64 分支输出 RIP/RSP 等 + RtlVirtualUnwind
+   - `map_image` Machine 检查用 MY_MACHINE，stub 与输入 PE 架构不匹配时拒绝加载
+   - PEB 访问：x64 `gs:[0x60]` / x86 `fs:[0x30]`，PEB 字段偏移用 offsetof 自动适配
+
+2. **`packer/Makefile` 新增 x86 编译规则**
+   - `RFL_EXE_X86 := $(RFL_DIR)/loader_x86.exe`
+   - x86 stub 用 MSYS2 mingw32 gcc（`C:/Home/Develop/msys64/mingw32/bin/gcc.exe`）编译
+   - 新增 `check-x86-toolchain` 目标检查工具链
+   - 新增 `reflective-all` 目标一键编译 x64+x86 stub + builder
+   - `reflective-clean` 清理 x86 产物
+
+3. **`packer/builder/builder_reflective.c` 架构自动选择**
+   - 按输入 PE 的 Machine 字段选默认 stub：x64→`loader_x64.exe`，x86→`loader_x86.exe`
+   - `--stub` 显式覆盖默认选择
+   - stub PE 头解析同时支持 IMAGE_NT_HEADERS32/64，按 Machine 字段决定用哪个类型
+   - 检查 stub 架构与输入 PE 架构匹配（防止用 x64 stub 加壳 x86 PE）
+   - 输出 PE 头更新按架构分支（x64 用 o_nt64，x86 用 o_nt32）
+
+4. **`packer/tests/reflective_batch_test.ps1` 加入 x86 样本**
+   - 新增 `helloguix86.exe` 测试项（WindowMatch="hellogui"）
+   - 移除写死的 `--stub $Stub`，让 builder 按架构自动选
+   - 修复 builder 默认 stub 相对路径问题：调用前 Push-Location 到 builder 目录
+
+5. **端到端测试结果**（`make reflective-all` + batch test）
+   - x86 样本 helloguix86.exe：加壳 → 反射加载 → IAT 解析 8 dlls/54 funcs → PEB.Ldr 覆写 → jump_to_oep → MessageBox 弹出 ✓
+   - 9/9 全部 PASS：Notepad4 / DontSleep / helloguix64 / **helloguix86** / hellocli / hellomingw / helloucrt / ddccli / sha256sum
+
+6. **参考项目调研**（`F:\Temp\pe`）
+   - AlushPacker：x86 SEH 方案 patch `ntdll!RtlIsValidHandler`（硬编码偏移，跨版本不可靠）
+   - peldr：只支持 x64，forwarder 不支持
+   - amber：仅 shellcode wrapper，非反射式 loader
+   - 当前实现：x86 SEH 暂跳过（简单 PE 如 helloguix86 无 SEH 依赖能正常跑），复杂 x86 SEH 程序支持留到阶段 3
+
+7. **遗留**
+   - x86 复杂 SEH 程序支持（需 VEH + RtlInsertInvertedFunctionTable 或 patch RtlIsValidHandler）
+   - 延迟导入表（`IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`）
+   - builder 端资源保留（`.rsrc` 节复制到 stub EXE）
+   - dotnet packer 集成
+
 ## 变更记录 2026-07-19 反射式 Packer 阶段二：PEB.Ldr 覆写修复 DontSleep 崩溃 + 8/8 样本通过
 
 阶段 2 核心障碍修复：反射式加载 DontSleep.exe 跳到 OEP 后被 MFC42u 内部抛出的 C++ 异常（0xE06D7363）终止。诊断并修复后 **8/8 x64 样本 round-trip 全部通过**。
