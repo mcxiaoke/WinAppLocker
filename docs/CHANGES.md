@@ -1,5 +1,44 @@
 # 变更记录
 
+## 变更记录 2026-07-19 dotnet packer GUI：WinLock/Reflective 不兼容时红字提示 + 禁用按钮
+
+**问题**：WinLock (InplaceBuilder) 不支持 .NET 程序和 Console 程序，Reflective 不支持 .NET 程序。之前只有用户点"执行加密"后才在 `PackCore.Pack` 里抛异常报错，体验差。`MainForm.WarnIfIncompatible` 虽然有检测但只对 WinLock 弹 MessageBox，没覆盖 Reflective，也没禁用按钮。
+
+**修复方案**（`dotnet/packer/MainForm.cs`）：
+
+1. **新增 `_lastPeInfo` / `_lastPePath` 缓存字段**：避免切换 stub 时重复读取大文件解析 PE
+
+2. **新增 `GetStubCompatibilityWarning(StubKind, PeInfo)` 方法**：返回 `(warning, blocking)` 元组
+   - `InplaceBuilder` + .NET → `⚠ WinLock 不支持 .NET 程序，请改用临时文件模式` (blocking)
+   - `InplaceBuilder` + Console → `⚠ WinLock 仅支持 GUI 程序，请改用临时文件或反射式模式` (blocking)
+   - `ReflectiveBuilder` + .NET → `⚠ 反射式加载不支持 .NET 程序（CLR 假设主模块由 OS loader 加载）` (blocking)
+   - `Tempfile` → 无限制
+   - 选中"自动"时不附加警告（让 PackCore 按子系统自己选合适的 stub）
+
+3. **重写 `UpdatePeInfoLabel`**：
+   - 解析 PE 后缓存到 `_lastPeInfo`，路径不变时复用缓存
+   - 在 PE 信息行末尾追加当前选中 stub 的兼容性警告，整体显示为红字
+   - 例：`x64 | GUI | ASLR✓ ... | .NET✓ | 8.5KB  |  ⚠ WinLock 不支持 .NET 程序，请改用临时文件模式`
+
+4. **重写 `UpdatePackButton`**：除原有字段非空检查外，加 stub 兼容性检查，blocking=true 时禁用按钮
+
+5. **替换 `WarnIfIncompatible` + 弹框逻辑**：去掉 MessageBox（红字提示已足够醒目，弹框反而打断流程）
+
+6. **`cbStubPreference_SelectedIndexChanged`**：切换 stub 时同时刷新 PE 信息行（重算警告）和按钮状态
+
+**测试结果**（`temp/test_compat_logic.py` 复用 packer `--pe-info` 验证逻辑）：
+
+| 程序 | 类型 | WinLock | Reflective | Tempfile |
+|---|---|---|---|---|
+| hellowinforms.exe | .NET GUI | ❌ 不支持 .NET | ❌ 不支持 .NET | ✓ |
+| hellocli.exe | Console | ❌ 仅支持 GUI | ✓ | ✓ |
+| helloguix64.exe | native GUI | ✓ | ✓ | ✓ |
+| helloguix86.exe | native GUI | ✓ | ✓ | ✓ |
+| ShanaEncoder.exe | .NET GUI | ❌ 不支持 .NET | ❌ 不支持 .NET | ✓ |
+| CC-Switch.exe | native GUI | ✓ | ✓ | ✓ |
+
+dotnet packer 编译通过（0 警告 0 错误）。
+
 ## 变更记录 2026-07-19 reflective builder 复制原图标/版本资源到输出 EXE
 
 **问题**：反射式加壳后的 EXE 在 Explorer 里显示的是 stub 的默认 MinGW 图标，不是原 PE 的图标。文件属性也没有原 PE 的版本信息。

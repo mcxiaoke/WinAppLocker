@@ -21,6 +21,11 @@ namespace WinAppLocker.Packer {
 
         private List<StubManifest> _availableStubs;
 
+        /// <summary>缓存最近一次解析的 PE 信息，避免每次切换 stub 都重读文件</summary>
+        private PeInfo _lastPeInfo;
+        /// <summary>缓存最近一次解析的 PE 文件路径（用于判断缓存是否还有效）</summary>
+        private string _lastPePath;
+
         public MainForm() {
             InitializeComponent();
             // 在构造函数里加载图标（不放 Designer.cs，避免 VS 设计器报 "未找到方法 Form.LoadIcon"）
@@ -141,11 +146,9 @@ namespace WinAppLocker.Packer {
                     string dir = System.IO.Path.GetDirectoryName(dlg.FileName);
                     string name = System.IO.Path.GetFileNameWithoutExtension(dlg.FileName);
                     txtOutputPath.Text = System.IO.Path.Combine(dir, name + "_locked.exe");
-                    UpdatePackButton();
-                    // 选了输入文件后立即显示 PE 信息
+                    // 解析 PE 信息并刷新 PE 信息行（含兼容性警告）和按钮状态
                     UpdatePeInfoLabel(dlg.FileName);
-                    // 选了输入文件后，检查 WinLock + Console 子系统组合，警告
-                    WarnIfIncompatible();
+                    UpdatePackButton();
                 }
             }
         }
@@ -176,41 +179,43 @@ namespace WinAppLocker.Packer {
             UpdatePackButton();
         }
 
-        /// <summary>当用户选了 WinLock 但原 EXE 是 Console 子系统时弹警告</summary>
-        private void WarnIfIncompatible()
+        /// <summary>
+        /// 检查当前选中的 stub 与原 PE 的兼容性。
+        /// 返回 (warningText, isBlocking)：
+        ///   - warningText：要显示的红字提示（null 表示无警告）
+        ///   - isBlocking：true 表示不兼容应禁用加密按钮
+        ///
+        /// 规则（参照 PackCore.Pack 的拒绝逻辑）：
+        ///   - InplaceBuilder (WinLock)：不支持 .NET，不支持 Console 子系统
+        ///   - ReflectiveBuilder：不支持 .NET（CLR 假设主模块由 OS loader 加载）
+        ///   - Tempfile：无限制（.NET / Console 都支持）
+        /// </summary>
+        private (string Warning, bool Blocking) GetStubCompatibilityWarning(StubKind kind, PeInfo peInfo)
         {
-            if (string.IsNullOrEmpty(txtInputPath.Text) || !File.Exists(txtInputPath.Text))
-                return;
-            if (!(cbStubPreference.SelectedItem is StubListItem item) || item.Manifest == null)
-                return;
-            if (item.Manifest.Kind != StubKind.InplaceBuilder)
-                return;
+            if (peInfo == null) return (null, false);
 
-            try
+            if (kind == StubKind.InplaceBuilder)
             {
-                byte[] pe = File.ReadAllBytes(txtInputPath.Text);
-                var peInfo = PeReader.Parse(pe);
                 if (peInfo.IsDotNet)
-                {
-                    MessageBox.Show(this,
-                        "WinLock 模式不支持 .NET CLR 托管 PE。\n请改用临时文件模式（applocker-gui / applocker-console）。",
-                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-                if (peInfo.Subsystem != 2 /* WindowsGui */)
-                {
-                    MessageBox.Show(this,
-                        "WinLock 模式仅支持 GUI 程序。\n建议改用 AppLocker Console 模式。",
-                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
+                    return ("⚠ WinLock 不支持 .NET 程序，请改用临时文件模式", true);
+                if (!peInfo.IsGui)
+                    return ("⚠ WinLock 仅支持 GUI 程序，请改用临时文件或反射式模式", true);
             }
-            catch { /* 解析失败不弹框，让 PackCore 报错 */ }
+            else if (kind == StubKind.ReflectiveBuilder)
+            {
+                if (peInfo.IsDotNet)
+                    return ("⚠ 反射式加载不支持 .NET 程序（CLR 假设主模块由 OS loader 加载）", true);
+                // 反射式支持 Console 和 x86，无其它限制
+            }
+            return (null, false);
         }
 
-        /// <summary>ComboBox 选中项变化时检查兼容性</summary>
+        /// <summary>ComboBox 选中项变化时刷新 PE 信息行（含兼容性警告）和按钮状态</summary>
         private void cbStubPreference_SelectedIndexChanged(object sender, EventArgs e)
         {
-            WarnIfIncompatible();
+            // stub 变化时，PE 信息行需要重算兼容性警告，按钮也需要重算启用状态
+            UpdatePeInfoLabel(txtInputPath.Text);
+            UpdatePackButton();
         }
 
         private void UpdatePackButton() {
@@ -218,59 +223,103 @@ namespace WinAppLocker.Packer {
                 && !string.IsNullOrEmpty(txtOutputPath.Text)
                 && !string.IsNullOrEmpty(txtPassword.Text)
                 && txtPassword.Text == txtConfirm.Text;
+
+            // 检查当前选中 stub 与 PE 的兼容性，不兼容禁用按钮
+            if (ready && _lastPeInfo != null)
+            {
+                var item = cbStubPreference.SelectedItem as StubListItem;
+                if (item != null && item.Manifest != null)
+                {
+                    var (_, blocking) = GetStubCompatibilityWarning(item.Manifest.Kind, _lastPeInfo);
+                    if (blocking) ready = false;
+                }
+                // 选中"自动"时不阻止（让 PackCore 自己按子系统选合适的 stub）
+            }
+
             btnPack.Enabled = ready;
         }
 
         /// <summary>
         /// 选择输入 exe 后，把 PE 关键信息（架构/子系统/ASLR/DEP/TLS/签名/.NET/大小）
         /// 显示在 lblPeInfo 上，放在"执行加密操作"按钮上方。
+        /// 同时根据当前选中的 stub 追加兼容性警告（红字），便于用户立刻发现不兼容组合。
         /// </summary>
         private void UpdatePeInfoLabel(string exePath)
         {
+            // 路径空或文件不存在：清空，重置缓存
             if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
             {
+                _lastPeInfo = null;
+                _lastPePath = null;
                 lblPeInfo.Text = "";
                 lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;
                 return;
             }
 
-            try
+            // 解析 PE（路径变化才重读文件，避免切换 stub 时重复 IO）
+            PeInfo info = _lastPeInfo;
+            if (!string.Equals(_lastPePath, exePath, StringComparison.OrdinalIgnoreCase))
             {
-                byte[] pe = File.ReadAllBytes(exePath);
-                var info = PeReader.Parse(pe);
+                try
+                {
+                    byte[] pe = File.ReadAllBytes(exePath);
+                    info = PeReader.Parse(pe);
+                    _lastPeInfo = info;
+                    _lastPePath = exePath;
+                }
+                catch (Exception ex)
+                {
+                    _lastPeInfo = null;
+                    _lastPePath = exePath;
+                    lblPeInfo.Text = $"PE 信息读取失败: {ex.Message}";
+                    lblPeInfo.ForeColor = System.Drawing.Color.Red;
+                    AppLogger.Warn($"PE 信息读取失败: {exePath}  异常: {ex.Message}");
+                    return;
+                }
+            }
 
-                // 大小用 KB 显示
-                double sizeKb = info.FileSize / 1024.0;
-                string sizeStr = sizeKb >= 1024
-                    ? $"{sizeKb / 1024.0:F1}MB"
-                    : $"{sizeKb:F0}KB";
+            // 大小用 KB 显示
+            double sizeKb = info.FileSize / 1024.0;
+            string sizeStr = sizeKb >= 1024
+                ? $"{sizeKb / 1024.0:F1}MB"
+                : $"{sizeKb:F0}KB";
 
-                // 格式：x64 | GUI | ASLR✓ DEP✓ CFG✗ HEVA✗ | TLS✗ Signed✗ Reloc✓ | .NET✗ | 523.0KB
-                // 用 ✓/✗ 直观表示开关
-                string text = string.Join(" | ",
-                    $"{info.MachineName}",
-                    $"{info.SubsystemName}",
-                    $"ASLR{(info.IsAslr ? "✓" : "✗")} DEP{(info.IsDep ? "✓" : "✗")} CFG{(info.IsCfg ? "✓" : "✗")} HEVA{(info.IsHighEntropyVA ? "✓" : "✗")}",
-                    $"TLS{(info.HasTls ? "✓" : "✗")} Signed{(info.IsSigned ? "✓" : "✗")} Reloc{(info.HasReloc ? "✓" : "✗")}",
-                    $".NET{(info.IsDotNet ? "✓" : "✗")}",
-                    sizeStr);
+            // 格式：x64 | GUI | ASLR✓ DEP✓ CFG✗ HEVA✗ | TLS✗ Signed✗ Reloc✓ | .NET✗ | 523.0KB
+            // 用 ✓/✗ 直观表示开关
+            string text = string.Join(" | ",
+                $"{info.MachineName}",
+                $"{info.SubsystemName}",
+                $"ASLR{(info.IsAslr ? "✓" : "✗")} DEP{(info.IsDep ? "✓" : "✗")} CFG{(info.IsCfg ? "✓" : "✗")} HEVA{(info.IsHighEntropyVA ? "✓" : "✗")}",
+                $"TLS{(info.HasTls ? "✓" : "✗")} Signed{(info.IsSigned ? "✓" : "✗")} Reloc{(info.HasReloc ? "✓" : "✗")}",
+                $".NET{(info.IsDotNet ? "✓" : "✗")}",
+                sizeStr);
 
+            // 追加当前选中 stub 的兼容性警告（红字提示）
+            // 选中"自动"时不附加 stub 相关警告（让 PackCore 自己选）
+            string warning = null;
+            var item = cbStubPreference?.SelectedItem as StubListItem;
+            if (item != null && item.Manifest != null)
+            {
+                var (w, _) = GetStubCompatibilityWarning(item.Manifest.Kind, info);
+                warning = w;
+            }
+
+            if (warning != null)
+            {
+                lblPeInfo.Text = $"{text}  |  {warning}";
+                lblPeInfo.ForeColor = System.Drawing.Color.Red;
+            }
+            else
+            {
                 lblPeInfo.Text = text;
-
                 // 警告色：.NET 程序或带签名（加壳后签名会失效）
                 if (info.IsDotNet || info.IsSigned)
                     lblPeInfo.ForeColor = System.Drawing.Color.OrangeRed;
                 else
                     lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;
+            }
 
-                AppLogger.Info($"PE 信息: {text}  路径: {exePath}");
-            }
-            catch (Exception ex)
-            {
-                lblPeInfo.Text = $"PE 信息读取失败: {ex.Message}";
-                lblPeInfo.ForeColor = System.Drawing.Color.Red;
-                AppLogger.Warn($"PE 信息读取失败: {exePath}  异常: {ex.Message}");
-            }
+            AppLogger.Info($"PE 信息: {text}{(warning != null ? "  警告: " + warning : "")}  路径: {exePath}");
         }
 
         private async void btnPack_Click(object sender, EventArgs e) {
