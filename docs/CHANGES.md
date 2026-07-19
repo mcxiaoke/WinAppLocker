@@ -1,5 +1,83 @@
 # 变更记录
 
+## 变更记录 2026-07-19 新增 TLS 专业文档 packer/docs/TLS_NOTES.md
+
+整理反射式 loader 的 TLS 处理经验，撰写专业文档供备忘和参考。
+
+**新增文件**：`packer/docs/TLS_NOTES.md`
+
+**内容大纲**：
+1. 为什么反射式 loader 必须专门处理 TLS（OS loader 自动完成的 6 件事）
+2. PE TLS 结构详解（`IMAGE_TLS_DIRECTORY` / TEB TLP / TLS Callback 签名）
+3. 反射式 loader 的 3 大 TLS 难题分解
+   - 难题 A：主线程 TLS 数据未初始化
+   - 难题 B：新线程 TLS 数据越界（CC-Switch / Rust 崩溃）
+   - 难题 C：TLS Callback 必须代理
+4. 最终方案：TLS Callback 代理 + 数据块分配（含整体架构图和关键代码片段）
+5. 踩坑历程时间线（5 个阶段，从 FastCopy 到 CC-Switch 的完整调试轨迹）
+6. 参考项目对比表（PELoader3 / Fatpack / AlushPacker / PolyEngine 等）
+7. 调试技巧（cdb 检查 TLP / `__fastfail` 类型区分 / stub 日志关键字）
+8. 边界情况与遗留问题（TLS index 不匹配 / index >= 64 / 动态 TLS / .NET / x86 SEH）
+9. 实测兼容性表（CC-Switch / FastCopy / Bandizip / BCompare / AutoHotkey 等）
+10. 参考资料索引（PELoader3 / Fatpack / AlushPacker / PolyEngine 源码 + maskray/kaimi 文章）
+
+**参考来源**：
+- `F:\Temp\pe\PELoader3` 的 README + TlsResolver.cpp + main.cpp
+- `F:\Temp\pe\Fatpack-main` 的 README + Shared/CRT/crt_tls.h + Shared/PELoader/TlsCallbackProxy
+- `F:\Temp\pe\PolyEngine-master` 的 Stub/TlsCallback.c（反调试 TLS callback 范例）
+- `F:\Temp\pe\AlushPacker-main` 的 Packer/tls.h（`.CRT$XLB` 4 reason 分发范例）
+- maskray 博客 "All about thread-local storage"（ELF 平台 TLS 理论参考）
+- 本项目 `packer/reflective/loader.c` 的完整修复历程
+
+## 变更记录 2026-07-19 reflective loader TLS callback 代理补齐：调用目标 PE 的 TLS callbacks
+
+**背景**：调研 `F:\Temp\pe` 中 Fatpack/PELoader3 的 TLS 实现（README + `TlsResolver.cpp` + `main.cpp`）后发现，上一版 TLS callback 代理只分配 TLS 数据块，**没有调用目标 PE 自己的 TLS callbacks**。PELoader3 的标准做法是：`DLL_THREAD_ATTACH` 时先 `InitializeTlsData` 再 `ExecuteCallbacks`；`DLL_THREAD_DETACH` 时先 `ExecuteCallbacks` 再 `ClearTlsData`；`DLL_PROCESS_DETACH` 也调 `ExecuteCallbacks`。
+
+**问题**：依赖 TLS callback 做线程级初始化的程序（如 Rust std::thread handle、Delphi 线程局部运行时）会因 callback 不被触发而出现隐蔽 bug。当前 CC-Switch 虽然 GUI 能起来，但 Rust 工作线程的 TLS callback 没被调，存在潜在风险。
+
+**改动**（`packer/reflective/loader.c`）：
+1. 新增 `run_target_tls_callbacks(reason, hModule, ctx)` 辅助函数，遍历 `g_target_tls->AddressOfCallBacks` 数组调用各 callback
+2. `tls_callback_proxy` 的 `DLL_THREAD_ATTACH` 分支：在 `TLP[0] = block` 之后调用目标 PE 的 callbacks（顺序很重要：先设 TLP 再调 callback）
+3. `DLL_THREAD_DETACH` 分支：先调目标 PE 的 callbacks，再 `VirtualFree(TLP[0])`（让 callback 在数据释放前做 cleanup）
+4. 新增 `DLL_PROCESS_DETACH` 分支：调用目标 PE 的 callbacks，不释放数据块（进程即将退出，OS 回收）
+5. `DLL_PROCESS_ATTACH` 仍由主流程 `run_tls_callbacks()` 在 OEP 前调用一次，代理不处理
+
+**测试结果**：
+- CC-Switch: ✅ TIMEOUT (GUI up) — 日志显示大量 `tls: proxy -> callback 140f69360 (reason=2)` 即 DLL_THREAD_ATTACH 调用，证明目标 PE TLS callback 被正确触发
+- Bandizip: ✅ exit=10 — 无回归
+- BCompare: ✅ TIMEOUT (GUI up) — 无回归
+- FastCopy: ✅ TIMEOUT (GUI up) — 无回归
+- AutoHotkey32 (x86): ❌ 仍 ACCESS_VIOLATION（"no TLS directory"，与 TLS 代理无关，是 x86 SEH 问题）
+
+## 变更记录 2026-07-19 reflective loader TLS callback 代理（修复 CC-Switch 崩溃）
+
+**问题**：CC-Switch（Rust/Tauri 程序）反射式加载后，创建工作线程时触发 `STATUS_STACK_BUFFER_OVERRUN (0xC0000409)`，错误信息 "fatal runtime error: current thread handle already set during thread spawn"。
+
+**根因**：
+- stub 有自己的 TLS 目录，OS 为 stub 分配 TLS index = 0
+- 目标 PE 的 `__tls_index` 编译时也 = 0，两者恰好匹配
+- 但新线程创建时，OS 只用 stub 的 TLS 模板（8 字节）初始化 `TLP[0]`
+- 目标 PE 访问 `TLP[0]+0x1e0` 等远偏移会读到越界数据（其他 TLS slot 的数据）
+- 导致 Rust std::thread 的线程句柄检查误判，触发 `__fastfail(7)`
+
+**修复方案**（参考 PELoader3 的 TlsCallbackProxy）：
+1. 在 stub 中注册 TLS callback（`.CRT$XLB` section），由 Windows 在线程创建/销毁时自动调用
+2. `DLL_THREAD_ATTACH` 时：手动为目标 PE 分配正确大小的 TLS 数据块（VirtualAlloc + 复制模板），设置 `TLP[0]`
+3. `DLL_THREAD_DETACH` 时：释放 TLS 数据
+4. `g_entry_point_called` 标志确保只在目标 PE 初始化完成后才处理 TLS 事件
+
+**改动文件**：
+- `packer/reflective/loader.c`：新增 `tls_callback_proxy()` 函数 + `g_target_tls`/`g_entry_point_called` 全局变量 + `.CRT$XLB` 注册
+- `packer/builder/builder_reflective.c`：扩展 stub 的 `.tls` 节 VirtualSize（配合 TLS 数据块大小）
+
+**测试结果**：
+- CC-Switch: ✅ TIMEOUT (GUI up) — 之前崩溃，现在修复
+- FastCopy: ✅ TIMEOUT (GUI up) — 无回归
+- Bandizip: ✅ exit=10 — 无回归
+- BCompare: ✅ TIMEOUT (GUI up) — 无回归
+- AutoHotkey64: ✅ TIMEOUT (GUI up) — 无回归
+- AutoHotkey32 (x86): ❌ 仍崩溃（x86 SEH 问题，与 TLS 无关）
+
 ## 变更记录 2026-07-19 dotnet packer 集成 reflective 加壳模式
 
 把反射式 packer 集成到 dotnet packer GUI，新增第三种加壳方案 `ReflectiveBuilder`（与现有 `Tempfile` / `InplaceBuilder` 并列）。

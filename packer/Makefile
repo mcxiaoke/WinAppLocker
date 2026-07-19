@@ -65,10 +65,23 @@ BLD_LDFLAGS  := -ladvapi32
 # - 不做 PIC / 无 CRT 限制（开发阶段便于调试）
 # - 支持 x64（w64devkit gcc）和 x86（msys2 mingw32 gcc）
 # - gcc 默认链接 msvcrt/kernel32/user32，无需显式 -l
+# - stub 禁用 ASLR（--dynamicbase,no），固定加载到 --image-base=0x10000，
+#   避免撞上输入 PE 的 preferred base（通常 0x400000 或 0x140000000）
+#   这样 VirtualAlloc(preferred_base) 更容易成功，避免无 reloc 表的 PE 加载失败
+# === reflective stub / builder 编译参数 ===
+# - 开发优先：用 CRT + console subsystem，允许 printf 调试
+# - 不做 PIC / 无 CRT 限制（开发阶段便于调试）
+# - 支持 x64（w64devkit gcc）和 x86（msys2 mingw32 gcc）
+# - gcc 默认链接 msvcrt/kernel32/user32，无需显式 -l
+# - x86 stub 设 image base=0x10000000（远离输入 PE 常用 0x400000），
+#   避免撞上无 reloc 表的 x86 PE（如 AutoHotkey32.exe）导致 VirtualAlloc 失败
+#   x64 stub 保持默认 0x140000000（x64 PE 通常有 reloc 表，能重定位）
 RFL_CFLAGS     := -Wall -Wextra -O2
 RFL_LDFLAGS    :=
 RFL_CFLAGS_X86 := -Wall -Wextra -O2
-RFL_LDFLAGS_X86 :=
+# x86 stub: 禁用 ASLR + image base=0x10000（最低安全地址）
+# 实验：让 OS 把 main thread stack 放到 0x400000 之外
+RFL_LDFLAGS_X86 := -Wl,--disable-dynamicbase,--image-base=0x10000,--stack,0x10000
 RFL_BLD_CFLAGS := -Wall -Wextra -O2
 RFL_BLD_LDFLAGS :=
 

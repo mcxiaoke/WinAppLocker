@@ -435,6 +435,129 @@ static int process_delay_imports(uint8_t* img) {
     return 1;
 }
 
+/* ---- Fallback 重定位：扫描节找绝对地址引用 ----
+ * 当 PE 没有 reloc 表但需要重定位时使用（如 AutoHotkey32.exe 无 reloc，
+ * 但 OS 把 stack 放在 preferred base 0x400000 导致必须重定位）
+ *
+ * 算法：扫描所有节（除 .rsrc）的 1 字节步长 4 字节读取，
+ * 如果 dword 在 [old_base, old_base + SizeOfImage) 范围内，
+ * 认为是绝对地址引用，改成 new_base + (dword - old_base)。
+ *
+ * 关键保护：用 skip bitmap 标记所有不能改的区域：
+ *   - IMPORT/IAT/DELAY_IMPORT 表本身（字段是 RVA，加 delta 会破坏）
+ *   - IMPORT 表里所有 DLL 名字字符串和函数名字字符串
+ *     （这些字符串在 .rdata 里，4 字节读可能恰好落在范围内被误改）
+ *
+ * 返回 1 成功，0 失败 */
+static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
+    uint32_t size_of_image = nt->OptionalHeader.SizeOfImage;
+    int32_t delta32 = (int32_t)(new_base - old_base);
+
+    uint64_t range_start = old_base;
+    uint64_t range_end = old_base + size_of_image;
+
+    /* 分配 skip bitmap：每字节标记一个 RVA 是否不能修改
+     * SizeOfImage 通常 1MB 左右，分配代价小 */
+    uint8_t* skip = (uint8_t*)calloc(size_of_image, 1);
+    if (!skip) {
+        DBG("reloc: fallback calloc(%u) failed\n", size_of_image);
+        return 0;
+    }
+
+    /* 标记 IMPORT/IAT/DELAY_IMPORT 表本身所在区域 */
+    uint32_t import_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    uint32_t import_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+    uint32_t iat_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+    uint32_t iat_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+    uint32_t delay_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+    uint32_t delay_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
+    if (import_rva && import_rva + import_size <= size_of_image)
+        memset(skip + import_rva, 1, import_size);
+    if (iat_rva && iat_rva + iat_size <= size_of_image)
+        memset(skip + iat_rva, 1, iat_size);
+    if (delay_rva && delay_rva + delay_size <= size_of_image)
+        memset(skip + delay_rva, 1, delay_size);
+
+    /* 遍历 IMPORT 表，标记每个 DLL 名字和函数名字字符串的范围
+     * 这些字符串在 .rdata 里，4 字节读可能恰好落在范围内被误改
+     * 例如 "PSAPI.DLL\0" 中第 6-9 字节读成 0x004C4C44 落在 [0x400000, 0x4f5000) */
+    int n_str = 0;
+    if (import_rva && import_size) {
+        IMAGE_IMPORT_DESCRIPTOR* imp = (IMAGE_IMPORT_DESCRIPTOR*)(img + import_rva);
+        for (; imp->Name != 0; imp++) {
+            /* DLL 名字字符串 */
+            uint32_t name_rva = imp->Name;
+            if (name_rva && name_rva < size_of_image) {
+                const char* p = (const char*)(img + name_rva);
+                size_t slen = strnlen(p, size_of_image - name_rva);
+                uint32_t end = name_rva + (uint32_t)slen + 1;
+                if (end <= size_of_image) {
+                    memset(skip + name_rva, 1, slen + 1);
+                    n_str++;
+                }
+            }
+            /* ILT 中的 IMAGE_IMPORT_BY_NAME 结构（hint + name） */
+            uint32_t ilt_rva = imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk;
+            if (ilt_rva && ilt_rva < size_of_image) {
+                thunk_t* ilt = (thunk_t*)(img + ilt_rva);
+                /* 防止 ILT 越界：限制最多扫 65536 项 */
+                for (int k = 0; k < 65536 && *ilt != 0; ilt++, k++) {
+                    if (*ilt & IMAGE_ORDINAL_FLAG_X) continue;
+                    uint32_t iibn_rva = (uint32_t)(*ilt & 0x7FFFFFFF);
+                    if (iibn_rva == 0 || iibn_rva >= size_of_image) continue;
+                    /* IMAGE_IMPORT_BY_NAME: WORD hint + char name[] + '\0' */
+                    const char* p = (const char*)(img + iibn_rva + 2);
+                    size_t slen = strnlen(p, size_of_image - iibn_rva - 2);
+                    uint32_t end = iibn_rva + 2 + (uint32_t)slen + 1;
+                    if (end <= size_of_image) {
+                        memset(skip + iibn_rva, 1, 2 + slen + 1);
+                        n_str++;
+                    }
+                }
+            }
+        }
+    }
+    DBG("reloc: fallback protected %d IAT string regions\n", n_str);
+
+    int count = 0;
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        /* 跳过 .rsrc（资源节很少有绝对地址引用） */
+        if (memcmp(sec[i].Name, ".rsrc", 5) == 0) continue;
+        if (sec[i].SizeOfRawData < 4) continue;
+
+        uint8_t* start = img + sec[i].VirtualAddress;
+        SIZE_T size = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        if (size > sec[i].SizeOfRawData) size = sec[i].SizeOfRawData;
+        int sec_count = 0;
+        /* 1 字节步长扫描（x86 absolute address 在指令中位置不固定，4 字节对齐会漏）
+         * 跳过任何与 skip bitmap 相交的 4 字节范围 */
+        for (SIZE_T off = 0; off + 4 <= size; off++) {
+            uint32_t rva_here = sec[i].VirtualAddress + (uint32_t)off;
+            /* 如果当前 4 字节范围内有任何 skip 标记，跳过这 4 字节
+             * （保护 IAT 表和字符串内容） */
+            if (rva_here + 4 <= size_of_image) {
+                if (skip[rva_here] | skip[rva_here+1] | skip[rva_here+2] | skip[rva_here+3])
+                    continue;
+            }
+            uint32_t val = *(uint32_t*)(start + off);
+            if (val >= range_start && val < range_end) {
+                *(uint32_t*)(start + off) = val + delta32;
+                count++;
+                sec_count++;
+            }
+        }
+        DBG("reloc: fallback scanned %*.8s VA=0x%lx size=0x%zx, fixed %d refs\n",
+            8, sec[i].Name, (unsigned long)sec[i].VirtualAddress, (size_t)size, sec_count);
+    }
+    free(skip);
+    DBG("reloc: fallback total fixed %d absolute refs (delta=0x%x)\n",
+        count, (unsigned)delta32);
+    return 1;  /* 即使 count=0 也返回成功，让流程继续（可能 PE 真的不需要 reloc） */
+}
+
 /* ---- 应用 relocations（完整 5 类型：ABS/DIR64/HIGHLOW/HIGH/LOW） ----
  * old_base = preferred ImageBase（PE 头里的值）
  * new_base = 实际加载地址
@@ -458,8 +581,14 @@ static int apply_relocations(uint8_t* img, uint64_t old_base, uint64_t new_base)
     IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (dir->VirtualAddress == 0 || dir->Size == 0) {
-        DBG("reloc: no reloc table, but base delta != 0, FAIL\n");
-        return 0;
+        /* Fallback: 无 reloc 表但 base 不匹配（如 AutoHotkey32.exe 无 reloc，OS 把 stack 放在 preferred base）
+         * 扫描所有可执行节，找指向 [old_base, old_base+SizeOfImage) 范围的 4 字节绝对地址引用，
+         * 修复为 new_base + RVA。
+         * 风险：可能误改非地址数据（如常量 0x400000），但对大部分 x86 PE 能工作。
+         * 仅作 fallback，正常 PE 走标准 reloc 路径 */
+        DBG("reloc: no reloc table, trying fallback scan (old=0x%llx new=0x%llx)\n",
+            (unsigned long long)old_base, (unsigned long long)new_base);
+        return fallback_relocations(img, old_base, new_base);
     }
 
     int64_t delta = (int64_t)(new_base - old_base);
@@ -587,16 +716,29 @@ static void init_security_cookie(uint8_t* img) {
 
     ULONG_PTR cur = *cookie_ptr;
 #ifdef _WIN64
-    const ULONG_PTR default_cookie = 0x00002B992DDFA232ULL;
+    const ULONG_PTR msvc_default = 0x00002B992DDFA232ULL;
+    const ULONG_PTR mingw_default = 0x0000BB40E64EULL;
 #else
-    const ULONG_PTR default_cookie = 0x0000BB40ULL;  /* x86 MSVC 默认 cookie */
+    const ULONG_PTR msvc_default = 0x0000BB40ULL;
+    const ULONG_PTR mingw_default = 0x0000BB40ULL;
 #endif
-    if (cur != default_cookie && cur != 0) {
+    /* 如果 cookie 已经是非默认值（已初始化），跳过 */
+    if (cur != 0 && cur != msvc_default && cur != mingw_default) {
         DBG("cookie: already initialized (0x%llx), skip\n", (unsigned long long)cur);
         return;
     }
-    /* KUSER_SHARED_DATA.InterruptTime (0x7FFE0008, 每 100ns 更新)
-     * x86/x64 都是 64 位 InterruptTime，用 ULONGLONG 读取 */
+    /* VS CRT 默认值：让原 PE 的 __security_init_cookie 自己处理
+     * VS CRT 的 mainCRTStartup 会调用 __security_init_cookie，
+     * 它会用 GetTickCount/QueryPerformanceCounter 生成安全的 cookie。
+     * 如果我们提前覆盖，__security_init_cookie 检测到非默认值会跳过初始化，
+     * 可能导致 cookie 熵不足或与 TLS 回调的 cookie 不一致 */
+    if (cur == msvc_default) {
+        DBG("cookie: VS CRT default value (0x%llx), let OEP __security_init_cookie handle\n",
+            (unsigned long long)cur);
+        return;
+    }
+    /* MinGW 默认值 (0xBB40E64E) 或 0：MinGW CRT 不调用 __security_init_cookie，
+     * 必须由我们初始化。熵源：KUSER_SHARED_DATA.InterruptTime XOR image_base */
     volatile ULONGLONG* kuser_interrupt = (volatile ULONGLONG*)0x7FFE0008;
     *cookie_ptr = (ULONG_PTR)img ^ (ULONG_PTR)*kuser_interrupt;
     DBG("cookie: initialized to 0x%llx\n", (unsigned long long)*cookie_ptr);
@@ -621,6 +763,199 @@ static void set_section_permissions(uint8_t* img) {
     /* PE 头单独置 PAGE_READONLY */
     DWORD old_prot = 0;
     VirtualProtect(img, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old_prot);
+}
+
+/* ---- 初始化原 PE 的 TLS 数据块 ----
+ * 反射式加载的 PE 没有经过 OS 加载器的 TLS 初始化，
+ * TEB->ThreadLocalStoragePointer (TLP) 仍指向 stub 的 TLS 数据。
+ *
+ * 问题：MinGW CRT 的动态 IAT 守卫逻辑读 TLP[0]+4 作为守卫值，
+ *   如果 TLP[0] 是 stub 的数据，守卫比较会误判（0 <= eax 成立），
+ *   跳过 GetProcAddress 路径，导致函数指针保持 NULL，call NULL 崩溃。
+ *   （FastCopy/Bandizip 的 InitializeConditionVariable 等即此问题）
+ *
+ * 解决：分配原 PE 的 TLS 数据块，设置 TLP[0] 指向它。
+ *   原 PE 编译时 __tls_index=0 被内联，所以代码硬编码读 TLP[0]。
+ *   覆盖 TLP[0] 不影响 stub（跳到 OEP 后 stub 不再执行）。
+ *
+ * TLS 目录字段（IMAGE_TLS_DIRECTORY64）：
+ *   StartAddressOfRawData - TLS 模板数据起始 VA（绝对地址）
+ *   EndAddressOfRawData   - TLS 模板数据结束 VA
+ *   AddressOfIndex        - 指向 DWORD，存放 TLS index（OS 加载器写入）
+ *   AddressOfCallBacks    - TLS 回调函数指针数组
+ *   SizeOfZeroFill        - 模板之后的零填充大小 */
+
+/* ---- TLS callback 代理（参考 PELoader3 的 TlsCallbackProxy 方案）----
+ * 问题：stub 有自己的 TLS 目录，OS 为 stub 分配 TLS index = 0
+ *   目标 PE 的 __tls_index 也编译为 0，两者恰好匹配
+ *   但新线程创建时，OS 只用 stub 的 TLS 模板（8 字节）初始化 TLP[0]
+ *   目标 PE 访问 TLP[0]+0x1e0 等远偏移会读到越界数据（其他 slot 的数据）
+ *   导致 Rust std::thread 的 "current thread handle already set" fastfail
+ *
+ * 解决：在 stub 中注册 TLS callback，当新线程创建时（DLL_THREAD_ATTACH）
+ *   手动为目标 PE 分配正确大小的 TLS 数据块并设置 TLP[0]
+ *   这样每个新线程都有正确的 TLS 数据 */
+static IMAGE_TLS_DIRECTORY_X* g_target_tls = NULL;   /* 目标 PE 的 TLS 目录（重定位后） */
+static volatile LONG g_entry_point_called = 0;        /* 目标 PE OEP 调用前为 0，之后为 1 */
+
+/* 调用目标 PE 的所有 TLS callbacks（参考 PELoader3 ExecuteCallbacks）
+ * AddressOfCallBacks 是 VA 数组（重定位后已是绝对地址），以 NULL 结尾
+ * 与 run_tls_callbacks() 不同：后者仅在主线程 DLL_PROCESS_ATTACH 时调用一次，
+ * 本函数供 TLS callback 代理在线程/进程事件时复用 */
+static void run_target_tls_callbacks(DWORD reason, PVOID hModule, PVOID ctx) {
+    if (!g_target_tls || g_target_tls->AddressOfCallBacks == 0) return;
+    PIMAGE_TLS_CALLBACK* cbs = (PIMAGE_TLS_CALLBACK*)g_target_tls->AddressOfCallBacks;
+    while (*cbs) {
+        DBG("tls: proxy -> callback %p (reason=%lu)\n", (void*)*cbs, reason);
+        (*cbs)(hModule, reason, ctx);
+        cbs++;
+    }
+}
+
+/* TLS callback 代理函数（参考 PELoader3 main.cpp 的 TlsCallbackProxy）
+ * Windows 在以下事件时自动调用：
+ *   DLL_PROCESS_ATTACH - 进程启动（此时 g_entry_point_called=0，跳过，由主流程处理）
+ *   DLL_THREAD_ATTACH  - 新线程创建（分配 TLS 数据 + 调用目标 PE callbacks）
+ *   DLL_THREAD_DETACH  - 线程退出（先调目标 PE callbacks，再释放 TLS 数据）
+ *   DLL_PROCESS_DETACH - 进程退出（调用目标 PE callbacks，cleanup）
+ *
+ * 关键：必须在 ATTACH/DETACH 时都调用目标 PE 的 TLS callbacks，
+ *   否则依赖 TLS callback 做线程级初始化的程序（如 Rust std::thread handle）会出问题 */
+static void NTAPI tls_callback_proxy(PVOID hModule, DWORD reason, PVOID ctx) {
+    /* 目标 PE 尚未加载完成，不处理 */
+    if (!g_entry_point_called || !g_target_tls) return;
+
+    if (reason == DLL_THREAD_ATTACH) {
+        /* 新线程创建：为目标 PE 分配 TLS 数据块 */
+        SIZE_T raw_size = (SIZE_T)(g_target_tls->EndAddressOfRawData -
+                                   g_target_tls->StartAddressOfRawData);
+        SIZE_T total = raw_size + (SIZE_T)g_target_tls->SizeOfZeroFill;
+        if (total == 0) {
+            /* 没有 TLS 数据要分配，但仍需调用 callbacks（PE 可能用 callback 做其他线程初始化） */
+            run_target_tls_callbacks(reason, hModule, ctx);
+            return;
+        }
+
+        uint8_t* block = (uint8_t*)VirtualAlloc(NULL, total, MEM_COMMIT, PAGE_READWRITE);
+        if (!block) return;
+
+        /* 复制模板数据（StartAddressOfRawData 是 VA，重定位后指向目标 PE 内存） */
+        if (raw_size > 0 && g_target_tls->StartAddressOfRawData) {
+            memcpy(block, (const void*)g_target_tls->StartAddressOfRawData, raw_size);
+        }
+        /* ZeroFill 部分已经是 0（VirtualAlloc 自动清零） */
+
+        /* 设置 TLP[0] = 新的 TLS 数据块
+         * x64: TEB->ThreadLocalStoragePointer 在 gs:[0x58]
+         * x86: TEB->ThreadLocalStoragePointer 在 fs:[0x2C] */
+#ifdef _WIN64
+        PVOID* tlp = (PVOID*)__readgsqword(0x58);
+#else
+        PVOID* tlp = (PVOID*)(uintptr_t)__readfsdword(0x2C);
+#endif
+        if (tlp) {
+            /* 释放 OS 为 stub 分配的旧 TLS 数据块（8 字节，小，不释放也无害） */
+            if (tlp[0]) VirtualFree(tlp[0], 0, MEM_RELEASE);
+            tlp[0] = block;
+        }
+
+        /* 数据块就绪后，调用目标 PE 的 TLS callbacks（DLL_THREAD_ATTACH）
+         * 顺序很重要：必须先设置 TLP[0] 再调 callback，callback 内部可能读 TLS 数据 */
+        run_target_tls_callbacks(reason, hModule, ctx);
+    } else if (reason == DLL_THREAD_DETACH) {
+        /* 线程退出：先调目标 PE callbacks（让 callback 在 TLS 数据释放前做 cleanup）
+         * 然后再释放 TLS 数据块 */
+        run_target_tls_callbacks(reason, hModule, ctx);
+
+#ifdef _WIN64
+        PVOID* tlp = (PVOID*)__readgsqword(0x58);
+#else
+        PVOID* tlp = (PVOID*)(uintptr_t)__readfsdword(0x2C);
+#endif
+        if (tlp && tlp[0]) {
+            VirtualFree(tlp[0], 0, MEM_RELEASE);
+            tlp[0] = NULL;
+        }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        /* 进程退出：调用目标 PE 的 TLS callbacks（DLL_PROCESS_DETACH）
+         * 不释放主线程 TLS 数据块（进程即将退出，OS 会回收） */
+        run_target_tls_callbacks(reason, hModule, ctx);
+    }
+    /* DLL_PROCESS_ATTACH 不处理：由主流程 run_tls_callbacks() 在 OEP 前调用一次 */
+}
+
+/* 注册 TLS callback 到 stub 的 .CRT$XLB section
+ * MinGW CRT 会合并 .CRT$XLA/XLB/XLZ 为一个数组
+ * _tls_used.AddressOfCallBacks 指向 &__xl_a + 1（跳过首部 0）
+ * 我们的 callback 在 .CRT$XLB 中，位于 __xl_a 和 __xl_z 之间 */
+__attribute__((section(".CRT$XLB"), used))
+static const PIMAGE_TLS_CALLBACK g_tls_cb_ptr = tls_callback_proxy;
+
+static int init_tls_data(uint8_t* img, uint64_t preferred_base) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
+    IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (dir->VirtualAddress == 0 || dir->Size == 0) {
+        DBG("tls: no TLS directory, skip init\n");
+        return 1;
+    }
+
+    IMAGE_TLS_DIRECTORY_X* tls = (IMAGE_TLS_DIRECTORY_X*)(img + dir->VirtualAddress);
+
+    /* TLS 目录里的地址是 VA（绝对地址），转成 RVA 后用 img+RVA 访问 */
+    uint32_t raw_rva = (uint32_t)(tls->StartAddressOfRawData - preferred_base);
+    SIZE_T raw_size = (SIZE_T)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+    SIZE_T total_size = raw_size + tls->SizeOfZeroFill;
+
+    DBG("tls: raw_rva=0x%x raw_size=%zu zero_fill=%lu total=%zu\n",
+        raw_rva, raw_size, tls->SizeOfZeroFill, total_size);
+
+    /* 分配 TLS 数据块（VirtualAlloc 自动清零，满足 SizeOfZeroFill） */
+    uint8_t* tls_block = VirtualAlloc(NULL, total_size ? total_size : 1,
+                                       MEM_COMMIT, PAGE_READWRITE);
+    if (!tls_block) {
+        DBG("tls: VirtualAlloc failed err=%lu\n", GetLastError());
+        return 0;
+    }
+
+    /* 复制模板数据（RawData 是初始化好的静态 TLS 变量值） */
+    if (raw_size > 0) {
+        memcpy(tls_block, img + raw_rva, raw_size);
+    }
+
+    DBG("tls: block at %p, size %zu\n", tls_block, total_size);
+
+    /* 设置 TLP[0] = TLS 数据块
+     * x64: TEB->ThreadLocalStoragePointer 在 gs:[0x58]
+     * x86: TEB->ThreadLocalStoragePointer 在 fs:[0x2C]
+     * 原 PE 代码内联 __tls_index=0，读 TLP[0]，所以直接设置 TLP[0] */
+#ifdef _WIN64
+    PVOID* tlp = (PVOID*)__readgsqword(0x58);
+#else
+    PVOID* tlp = (PVOID*)(uintptr_t)__readfsdword(0x2C);
+#endif
+    if (tlp) {
+        DBG("tls: TLP=%p, old TLP[0]=%p -> new %p\n", tlp, tlp[0], tls_block);
+        tlp[0] = tls_block;
+    } else {
+        DBG("tls: TLP is NULL, cannot set\n");
+    }
+
+    /* 确保 AddressOfIndex = 0（和代码内联的 __tls_index 一致）
+     * 某些 CRT 代码会读此值确认 TLS 已初始化 */
+    if (tls->AddressOfIndex) {
+        uint32_t* index_ptr = (uint32_t*)(img + (tls->AddressOfIndex - preferred_base));
+        DBG("tls: AddressOfIndex at %p, old=%u -> 0\n", index_ptr, *index_ptr);
+        *index_ptr = 0;
+    }
+
+    /* 保存 TLS 目录指针供 TLS callback 代理使用
+     * tls 指向目标 PE 内存中的 TLS 目录（重定位后）
+     * callback 中直接用 tls->StartAddressOfRawData（VA）访问模板数据 */
+    g_target_tls = tls;
+    DBG("tls: saved g_target_tls=%p for TLS callback proxy\n", (void*)g_target_tls);
+
+    return 1;
 }
 
 /* ---- 调用 TLS callbacks（仅 DLL_PROCESS_ATTACH）----
@@ -830,16 +1165,21 @@ static int activate_manifest_from_image(uint8_t* img) {
 
     /* 创建 activation context
      * lpSource 指向 manifest XML 文件（不是 PE 文件），
-     * 所以不需要 ACTCTX_FLAG_RESOURCE_NAME_VALID */
+     * 所以不需要 ACTCTX_FLAG_RESOURCE_NAME_VALID
+     * 不用 ACTCTX_FLAG_SET_PROCESS_DEFAULT（mingw CRT 可能已设置 default，
+     * 重复设置会失败；改用 ActivateActCtx 推入当前线程栈） */
     ACTCTXA act = { 0 };
     act.cbSize = sizeof(act);
-    act.dwFlags = ACTCTX_FLAG_SET_PROCESS_DEFAULT;
+    act.dwFlags = 0;
     act.lpSource = tmp_path;
     act.lpResourceName = NULL;
 
     HANDLE hActCtx = CreateActCtxA(&act);
-    if (hActCtx == INVALID_HANDLE_VALUE) {
-        DBG("actctx: CreateActCtxA failed err=%lu\n", GetLastError());
+    /* CreateActCtx 失败可能返回 NULL 或 INVALID_HANDLE_VALUE，都要判断
+     * 实测某些 manifest（如依赖 SxS 程序集）会返回 NULL 而非 -1 */
+    if (hActCtx == NULL || hActCtx == INVALID_HANDLE_VALUE) {
+        DBG("actctx: CreateActCtxA failed err=%lu (hActCtx=%p)\n",
+            GetLastError(), hActCtx);
         DeleteFileA(tmp_path);
         return -1;
     }
@@ -890,8 +1230,28 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     uint8_t* new_img = (uint8_t*)VirtualAlloc((void*)preferred_base, size_of_image,
                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!new_img) {
-        DBG("map: VirtualAlloc(preferred=%p) failed (err=%lu), trying arbitrary\n",
-            (void*)preferred_base, GetLastError());
+        DWORD err = GetLastError();
+        DBG("map: VirtualAlloc(preferred=%p, size=0x%zx) failed (err=%lu), trying arbitrary\n",
+            (void*)preferred_base, (size_t)size_of_image, err);
+        /* 失败时打印 preferred_base 周围内存状态，便于诊断为何 err=487 */
+        if (err == 487 /* ERROR_INVALID_ADDRESS */) {
+            MEMORY_BASIC_INFORMATION mbi;
+            uint8_t* q = (uint8_t*)preferred_base;
+            for (int i = 0; i < 16 && q < (uint8_t*)preferred_base + size_of_image; i++) {
+                if (VirtualQueryEx(GetCurrentProcess(), q, &mbi, sizeof(mbi)) == 0) break;
+                const char* state = (mbi.State == 0x1000) ? "COMMIT" :
+                                    (mbi.State == 0x2000) ? "RESERVE" :
+                                    (mbi.State == 0x10000) ? "FREE" : "?";
+                const char* type = (mbi.Type == 0x20000) ? "PRIVATE" :
+                                   (mbi.Type == 0x40000) ? "MAPPED" :
+                                   (mbi.Type == 0x1000000) ? "IMAGE" : "?";
+                DBG("map:   0x%p-0x%p state=%s type=%s prot=0x%lx size=0x%zx allocBase=0x%p\n",
+                    (void*)mbi.BaseAddress, (void*)((uint8_t*)mbi.BaseAddress + mbi.RegionSize),
+                    state, type, (unsigned long)mbi.Protect, (size_t)mbi.RegionSize,
+                    (void*)mbi.AllocationBase);
+                q = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+            }
+        }
         new_img = (uint8_t*)VirtualAlloc(NULL, size_of_image,
                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     }
@@ -941,6 +1301,12 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     update_peb_image_base(new_img);
     patch_peb_ldr_main_entry(new_img);
 
+    /* 4.6 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
+     * 必须在 IAT 处理之前激活，LoadLibraryA("comctl32.dll") 才能走 SxS 找到 v6
+     * 否则只能加载默认的 v5，TaskDialogIndirect 等 v6 函数解析失败为 NULL。
+     * actctx 是线程局栈式激活，必须在主线程调用；激活后到 DeactivateActCtx 之前有效 */
+    activate_manifest_from_image(new_img);
+
     /* 5. 处理 IAT */
     if (!process_iat(new_img)) {
         DBG("map: process_iat failed\n");
@@ -967,12 +1333,13 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     /* 8. 设置节权限 */
     set_section_permissions(new_img);
 
-    /* 9. 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
-     * 必须在 IAT 处理之后（LoadLibrary 才能走 manifest）
-     * 必须在 TLS callbacks 之前（TLS 可能也依赖 manifest） */
-    activate_manifest_from_image(new_img);
+    /* 8.5 初始化原 PE 的 TLS 数据块
+     * 必须在 TLS callbacks 和 jump_to_oep 之前完成，
+     * 否则原 PE 的 MinGW CRT 守卫逻辑读 TLP[0] 会得到 stub 的数据，
+     * 导致动态 IAT 解析被跳过（FastCopy/Bandizip 的 call NULL 问题） */
+    init_tls_data(new_img, preferred_base);
 
-    /* 10. 调用 TLS callbacks */
+    /* 9. 调用 TLS callbacks（actctx 已在 4.6 激活，TLS 数据已初始化） */
     run_tls_callbacks(new_img);
 
     return new_img;
@@ -1047,6 +1414,15 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
         CONTEXT ctx = *ep->ContextRecord;
         fprintf(g_logf, "[VEH] call stack (RtlVirtualUnwind):\n");
         fflush(g_logf);
+        /* 特殊处理 RIP=0：通常是 call NULL，caller 在 [RSP] */
+        if (ctx.Rip == 0 && ctx.Rsp != 0) {
+            uint64_t ret_addr = *(uint64_t*)ctx.Rsp;
+            fprintf(g_logf, "  [0] ? rip=0x0 (NULL call, ret_addr=0x%llx at RSP=0x%llx)\n",
+                    (unsigned long long)ret_addr, (unsigned long long)ctx.Rsp);
+            fflush(g_logf);
+            ctx.Rip = ret_addr;
+            ctx.Rsp = ctx.Rsp + 8;
+        }
         for (int depth = 0; depth < 32; depth++) {
             uint64_t rip = ctx.Rip;
             uint64_t rsp = ctx.Rsp;
@@ -1190,6 +1566,11 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     DBG("=== image mapped at %p, jumping to OEP ===\n", (void*)new_img);
+
+    /* 标记目标 PE 已初始化完成，TLS callback 代理开始工作
+     * 此后新线程创建时（DLL_THREAD_ATTACH），callback 会为目标 PE 分配 TLS 数据 */
+    InterlockedExchange(&g_entry_point_called, 1);
+    DBG("tls: callback proxy enabled (g_entry_point_called=1)\n");
 
     /* 4. 跳 OEP */
     void* oep = new_img + hdr->oep_rva;

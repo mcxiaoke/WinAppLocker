@@ -300,6 +300,117 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* 5.5 扩展 stub 的 TLS 模板大小（解决反射式加载 PE 的新线程 TLS 越界问题）
+     *
+     * 背景：
+     *   - stub 是 EXE，TLS slot 0 归 stub 所有
+     *   - 原 PE 是反射式加载，OS 不为它分配 TLS slot
+     *   - loader.c 设置原 PE 的 __tls_index = 0，让它复用 stub 的 slot 0
+     *   - 但 stub 的 TLS 模板很小（如 8 字节），原 PE 的 TLS 可能很大（如 708 字节）
+     *   - 新线程创建时，OS 用 stub 的模板初始化 TLP[0]，数据块只有 stub 的大小
+     *   - 原 PE 在新线程里访问 TLP[0] + offset（offset > stub 大小）会越界读垃圾数据
+     *   - 导致 std::thread 等检查 TLS 标志的代码崩溃（如 __fastfail(7)）
+     *
+     * 解决方案：
+     *   - 增大 stub 的 TLS SizeOfZeroFill，使总大小 >= 原 PE 的 TLS 总大小
+     *   - 这样 OS 为每个新线程分配的 TLS 数据块足够大，原 PE 访问不会越界
+     *   - ZeroFill 部分 OS 自动填 0，原 PE 的 TLS 初始化代码会正确设置值
+     *
+     * 注意：这里只扩展 ZeroFill 大小，不修改 raw data 模板内容。
+     *       如果原 PE 的 TLS 模板有非 0 初始值，新线程里这些值会是 0 而不是原模板值。
+     *       但大多数程序的 TLS 初始值为 0，且 CRT 初始化会重新设置，所以这是可接受的 MVP 方案。
+     */
+    if (stub_is_x64) {
+        IMAGE_DATA_DIRECTORY* s_tls_dir =
+            &s_nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        IMAGE_DATA_DIRECTORY* in_tls_dir =
+            (IMAGE_DATA_DIRECTORY*)&((IMAGE_NT_HEADERS64*)(in_pe +
+            ((IMAGE_DOS_HEADER*)in_pe)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+
+        if (s_tls_dir->VirtualAddress && s_tls_dir->Size &&
+            in_tls_dir->VirtualAddress && in_tls_dir->Size) {
+            /* 原 PE 有 TLS 目录 */
+            IMAGE_TLS_DIRECTORY64* s_tls = (IMAGE_TLS_DIRECTORY64*)
+                (stub + s_tls_dir->VirtualAddress);  /* 注意：stub 映射到 0 基址读 RVA */
+            /* 实际上 stub 不是按 image base 加载到内存的，RVA 就是文件偏移（对于有文件数据的节）
+             * 但 TLS 目录可能在 .rdata 节，有文件数据，所以 RVA ≈ 文件偏移（需要节表转换）*/
+
+            /* 用节表把 stub 的 TLS RVA 转成文件偏移 */
+            DWORD s_tls_foff = 0;
+            for (WORD i = 0; i < s_n_sec; i++) {
+                if (s_sec[i].VirtualAddress <= s_tls_dir->VirtualAddress &&
+                    s_tls_dir->VirtualAddress < s_sec[i].VirtualAddress +
+                    (s_sec[i].Misc.VirtualSize ? s_sec[i].Misc.VirtualSize : s_sec[i].SizeOfRawData)) {
+                    s_tls_foff = s_tls_dir->VirtualAddress - s_sec[i].VirtualAddress + s_sec[i].PointerToRawData;
+                    break;
+                }
+            }
+
+            /* 用节表把输入 PE 的 TLS RVA 转成文件偏移 */
+            IMAGE_DOS_HEADER* in_dos = (IMAGE_DOS_HEADER*)in_pe;
+            IMAGE_NT_HEADERS64* in_nt64 = (IMAGE_NT_HEADERS64*)(in_pe + in_dos->e_lfanew);
+            IMAGE_SECTION_HEADER* in_sec = IMAGE_FIRST_SECTION(in_nt64);
+            WORD in_n_sec = in_nt64->FileHeader.NumberOfSections;
+
+            DWORD in_tls_foff = 0;
+            for (WORD i = 0; i < in_n_sec; i++) {
+                if (in_sec[i].VirtualAddress <= in_tls_dir->VirtualAddress &&
+                    in_tls_dir->VirtualAddress < in_sec[i].VirtualAddress +
+                    (in_sec[i].Misc.VirtualSize ? in_sec[i].Misc.VirtualSize : in_sec[i].SizeOfRawData)) {
+                    in_tls_foff = in_tls_dir->VirtualAddress - in_sec[i].VirtualAddress + in_sec[i].PointerToRawData;
+                    break;
+                }
+            }
+
+            if (s_tls_foff && in_tls_foff) {
+                IMAGE_TLS_DIRECTORY64* s_tls = (IMAGE_TLS_DIRECTORY64*)(stub + s_tls_foff);
+                IMAGE_TLS_DIRECTORY64* in_tls = (IMAGE_TLS_DIRECTORY64*)(in_pe + in_tls_foff);
+
+                ULONGLONG s_image_base = s_nt64->OptionalHeader.ImageBase;
+                ULONGLONG in_image_base = in_nt64->OptionalHeader.ImageBase;
+
+                /* 计算 stub TLS 总大小（raw + zero fill） */
+                DWORD s_raw_size = (DWORD)(s_tls->EndAddressOfRawData - s_tls->StartAddressOfRawData);
+                DWORD s_total = s_raw_size + (DWORD)s_tls->SizeOfZeroFill;
+
+                /* 计算原 PE TLS 总大小 */
+                DWORD in_raw_size = (DWORD)(in_tls->EndAddressOfRawData - in_tls->StartAddressOfRawData);
+                DWORD in_total = in_raw_size + (DWORD)in_tls->SizeOfZeroFill;
+
+                if (in_total > s_total) {
+                    /* 需要扩展 stub 的 TLS 数据块大小
+                     * 1. 增加 SizeOfZeroFill 使总大小 >= 原 PE 的总大小
+                     * 2. 扩展 .tls 节的 VirtualSize（OS 可能根据节大小分配 TLS 数据块） */
+                    DWORD new_zero_fill = in_total - s_raw_size;
+                    printf("[+] Extending stub TLS size: %u -> %u (raw=%u, new ZeroFill=%u)\n",
+                           s_total, in_total, s_raw_size, new_zero_fill);
+                    s_tls->SizeOfZeroFill = (ULONG)new_zero_fill;
+
+                    /* 找到 .tls 节并扩展其 VirtualSize */
+                    for (WORD i = 0; i < s_n_sec; i++) {
+                        if (memcmp(s_sec[i].Name, ".tls", 4) == 0) {
+                            DWORD old_vs = s_sec[i].Misc.VirtualSize;
+                            if (in_total > old_vs) {
+                                s_sec[i].Misc.VirtualSize = in_total;
+                                printf("[+]   .tls section VirtualSize: 0x%x -> 0x%x\n",
+                                       old_vs, in_total);
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    printf("[+] Stub TLS size (%u) >= payload TLS size (%u), no extension needed\n",
+                           s_total, in_total);
+                }
+            }
+        } else if (!s_tls_dir->VirtualAddress) {
+            printf("[+] Stub has no TLS directory, skip TLS extension\n");
+        } else if (!in_tls_dir->VirtualAddress) {
+            printf("[+] Payload PE has no TLS directory, skip TLS extension\n");
+        }
+    }
+    /* TODO: x86 TLS 扩展（x86 的 TLS 目录结构不同，后续支持） */
+
     /* 找最后一个节的 VA 结束位置和文件结束位置
      * 新节的 VA 必须在所有现有节之后，按 SectionAlignment 对齐
      * 新节的 RawOffset 必须在所有现有节之后，按 FileAlignment 对齐 */
