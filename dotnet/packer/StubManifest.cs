@@ -5,7 +5,7 @@ using System.Text.Json.Serialization;
 
 namespace WinAppLocker.Packer
 {
-    /// <summary>stub 加壳方案（区分 tempfile 与 in-place 加壳）</summary>
+    /// <summary>stub 加壳方案（区分 tempfile / in-place / reflective 加壳）</summary>
     public enum StubKind
     {
         /// <summary>临时文件模式：原 EXE 作为 payload 附加在 stub 后，运行时释放临时文件</summary>
@@ -13,6 +13,14 @@ namespace WinAppLocker.Packer
 
         /// <summary>in-place 加壳模式：原 EXE 被原地修改，stub 嵌入 .lock 节（WinLock）</summary>
         InplaceBuilder,
+
+        /// <summary>反射式加壳模式：原 EXE 作为 .payload 节嵌入 stub，运行时反射式加载（WinLock Reflective）</summary>
+        /// <remarks>
+        /// 与 InplaceBuilder 区别：原 PE 完整保留在 .payload 节，stub 通过反射式 loader
+        /// 在内存中加载原 PE 并跳到其 OEP。支持 x86/x64/Console/.NET（简单）。
+        /// 当前为 MVP v1 明文模式（无加密）。
+        /// </remarks>
+        ReflectiveBuilder,
     }
 
     /// <summary>stub 支持的子系统</summary>
@@ -80,7 +88,12 @@ namespace WinAppLocker.Packer
 
         /// <summary>解析后的加壳方案</summary>
         [JsonIgnore]
-        public StubKind Kind => KindStr == "inplace-builder" ? StubKind.InplaceBuilder : StubKind.Tempfile;
+        public StubKind Kind => KindStr switch
+        {
+            "inplace-builder" => StubKind.InplaceBuilder,
+            "reflective-builder" => StubKind.ReflectiveBuilder,
+            _ => StubKind.Tempfile,
+        };
 
         /// <summary>解析后的子系统</summary>
         [JsonIgnore]

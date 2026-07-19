@@ -106,7 +106,7 @@ if (-not $SkipWinLock) {
                 Write-Host "    [警告] 找不到 mingw32-make / make，跳过 WinLock 编译" -ForegroundColor Yellow
                 Write-Host "           请安装 w64devkit 或 msys2，并确保在 PATH 中" -ForegroundColor Yellow
             } else {
-                & $make.Name all all-x86 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+                & $make.Name all all-x86 reflective-all 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
                 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "WinLock build failed" }
                 Write-Host "==> WinLock 编译完成" -ForegroundColor Green
             }
@@ -158,9 +158,29 @@ if (-not $SkipWinLock) {
             Write-Host "    [警告] 缺失: $($s.Src)" -ForegroundColor Yellow
         }
     }
+
+    # 2b. WinLock Reflective 产物（reflective-builder 模式，内存加载）
+    #     builder_reflective.exe → winlock_reflective_builder.exe（meta.json 主文件名匹配）
+    #     loader_x64.exe / loader_x86.exe（reflective stub，按 PE 架构自动选）
+    #     需要 'make reflective-all'（默认 'make all all-x86' 不编 reflective）
+    $reflectiveArtifacts = @(
+        @{ Src = "$winlockDir\builder\builder_reflective.exe"; Dst = "winlock_reflective_builder.exe" },
+        @{ Src = "$winlockDir\reflective\loader_x64.exe";      Dst = "loader_x64.exe" },
+        @{ Src = "$winlockDir\reflective\loader_x86.exe";      Dst = "loader_x86.exe" }
+    )
+    $hasReflective = $true
+    foreach ($s in $reflectiveArtifacts) {
+        if (Test-Path $s.Src) {
+            Copy-Item $s.Src (Join-Path $stubOutDir $s.Dst) -Force
+            Write-Host "    + $($s.Dst)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "    [警告] 缺失: $($s.Src)（运行 'make reflective-all' 生成）" -ForegroundColor Yellow
+            $hasReflective = $false
+        }
+    }
 }
 
-# 3. 生成 4 个 .meta.json 文件（packer 通过它们识别 stub 类型）
+# 3. 生成 5 个 .meta.json 文件（packer 通过它们识别 stub 类型）
 # 注意：stub_x64.bin / stub_x86.bin 不需要 meta.json，它们被 winlock_builder.exe.meta.json
 # 的 components 字段引用，packer 通过 builder 的 meta 间接验证它们的存在。
 $metaFiles = @(
@@ -207,6 +227,23 @@ $metaFiles = @(
             components = @{
                 stub_x64 = "winlock_stub_x64.bin"
                 stub_x86 = "winlock_stub_x86.bin"
+            }
+            supported_machines = @("amd64", "i386")
+        }
+    },
+    @{
+        Path = "$stubOutDir\winlock_reflective_builder.exe.meta.json"
+        Json = @{
+            name = "winlock-reflective"
+            kind = "reflective-builder"
+            subsystem = "gui"
+            description = "WinLock reflective packer (memory load, supports x86/x64/.NET, plaintext v1)"
+            version = "1.0.0"
+            # components 文件名与分发文件名一致
+            # builder_reflective.exe 运行时 --stub 指向此目录的 loader_xXX.exe
+            components = @{
+                stub_x64 = "loader_x64.exe"
+                stub_x86 = "loader_x86.exe"
             }
             supported_machines = @("amd64", "i386")
         }

@@ -1,5 +1,55 @@
 # 变更记录
 
+## 变更记录 2026-07-19 dotnet packer 集成 reflective 加壳模式
+
+把反射式 packer 集成到 dotnet packer GUI，新增第三种加壳方案 `ReflectiveBuilder`（与现有 `Tempfile` / `InplaceBuilder` 并列）。
+
+1. **新增 `StubKind.ReflectiveBuilder` 枚举值**（`dotnet/packer/StubManifest.cs`）
+   - `Kind` 属性加 switch 分支：`"reflective-builder"` → `ReflectiveBuilder`
+
+2. **新增 `dotnet/packer/ReflectivePacker.cs`**
+   - 调用 `builder_reflective.exe` 加壳
+   - 命令行格式与 WinLockPacker 不同：位置参数 + `--stub`（不是 `-i/-o` + `--stub-dir`）
+   - 按输入 PE 的 Machine 字段选 loader_x64.exe / loader_x86.exe
+
+3. **新增 `dotnet/packer/stub/winlock_reflective_builder.exe.meta.json`**
+   - `kind=reflective-builder`，`components` 引用 `loader_x64.exe` / `loader_x86.exe`
+
+4. **修改 `dotnet/packer/PackCore.cs`**
+   - 主分支加 `else if (selected.Kind == StubKind.ReflectiveBuilder)` 调用 `PackWithReflective`
+   - 新增 `PackWithReflective` 方法：复制输入到临时文件 → 调用 builder → 复制输出
+   - 不限制子系统（GUI/Console 都支持，stub 继承原 PE subsystem）
+   - 不调用 IconCopier（原 PE .rsrc 已完整保留在 .payload 节）
+
+5. **修改 `dotnet/packer/MainForm.cs`**
+   - UI 标签加 "(内存加载，支持 Console/x86)" 区分 reflective 模式
+   - 结果显示 modeTag 加 `[Reflective]`
+
+6. **修改 `dotnet/build.ps1`**
+   - WinLock 编译命令从 `all all-x86` 改为 `all all-x86 reflective-all`
+   - 新增 reflective 产物拷贝：`builder_reflective.exe` → `winlock_reflective_builder.exe`，`loader_x64.exe` / `loader_x86.exe`
+   - 新增第 5 个 meta.json 生成（reflective-builder）
+
+7. **测试结果**（CLI `--pack --stub-name winlock-reflective`）
+   - helloguix64.exe (x64 GUI) → 自动选 loader_x64.exe ✓
+   - helloguix86.exe (x86 GUI) → 自动选 loader_x86.exe ✓
+   - hellocli.exe (x64 Console) → 自动选 loader_x64.exe，Subsystem=3(CUI) ✓
+   - 加壳后 EXE 运行：反射式加载成功，jump_to_oep，窗口弹出 ✓
+   - `--list-stubs` 显示 5 个 stub（3 tempfile + 1 inplace + 1 reflective）全部 OK
+
+8. **三种加壳方案对比**
+
+| 方案 | Kind | 密码 | 支持 .NET | 支持 Console | 支持 x86 | 原文件完整性 |
+|------|------|------|----------|-------------|---------|------------|
+| Tempfile | `Tempfile` | ✓ AES+HMAC | ✓ | ✓ | ✓ | 完整（作为 payload 附加） |
+| InplaceBuilder (WinLock) | `InplaceBuilder` | ✓ XTEA | ✗ | ✗ | ✓ | 修改 .text 节 |
+| ReflectiveBuilder (新) | `ReflectiveBuilder` | ✗ MVP v1 明文 | 部分 | ✓ | ✓ | 完整（作为 .payload 节） |
+
+9. **遗留**
+   - reflective MVP v1 是明文模式，后续可加 AES 加密 + 密码弹框（payload.h 已预留字段）
+   - .NET 程序支持不保证（CLR 内部假设主模块通过 OS loader 加载，反射式内存无 Section backing）
+   - 复杂 .NET 程序可能需要补强 PEB.Ldr 的 BaseDllName/FullDllName 字段
+
 ## 变更记录 2026-07-19 反射式 Packer 阶段二续2：延迟导入表处理 + 大型 app 测试通过
 
 实现 `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` 延迟导入表处理，CCleaner（45MB, 12 个延迟 DLL）从"OEP 后立即崩"修复到"OEP reached"。

@@ -63,6 +63,8 @@ namespace WinAppLocker.Packer {
                     label += " (缺失文件)";
                 else if (s.Kind == StubKind.InplaceBuilder)
                     label += " (兼容性较低)";
+                else if (s.Kind == StubKind.ReflectiveBuilder)
+                    label += " (内存加载，支持 Console/x86)";
                 cbStubPreference.Items.Add(new StubListItem(s, label));
             }
             cbStubPreference.SelectedIndex = 0;
@@ -350,7 +352,10 @@ namespace WinAppLocker.Packer {
                             AppLogger.Info(msg);
                     }));
 
-                string modeTag = report.UsedKind == StubKind.InplaceBuilder ? " [WinLock]" : "";
+                // modeTag 显示加壳方案：[WinLock] / [Reflective] / 空（tempfile）
+                string modeTag = report.UsedKind == StubKind.InplaceBuilder ? " [WinLock]"
+                               : report.UsedKind == StubKind.ReflectiveBuilder ? " [Reflective]"
+                               : "";
                 lblResult.Text = $"✓ 加密成功{modeTag}：{report.InputSize / 1024.0:F1}KB → {report.OutputSize / 1024.0:F1}KB";
                 lblResult.ForeColor = System.Drawing.Color.Green;
 

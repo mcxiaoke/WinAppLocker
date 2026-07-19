@@ -1,0 +1,15 @@
+{
+  "name": "winlock-reflective",
+  "kind": "reflective-builder",
+  "subsystem": "gui",
+  "version": "1.0.0",
+  "description": "WinLock reflective packer (memory load, supports x86/x64/.NET, plaintext v1)",
+  "components": {
+    "stub_x64": "loader_x64.exe",
+    "stub_x86": "loader_x86.exe"
+  },
+  "supported_machines": [
+    "amd64",
+    "i386"
+  ]
+}

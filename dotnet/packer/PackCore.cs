@@ -114,6 +114,13 @@ namespace WinAppLocker.Packer
 
                 report = PackWithWinLock(selected, opts, progress, logger);
             }
+            else if (selected.Kind == StubKind.ReflectiveBuilder)
+            {
+                // Reflective 模式：支持 x86/x64 native PE + 简单 .NET 程序
+                // MVP v1 明文模式（无密码），原 PE 完整保留在 .payload 节
+                // 不限制子系统（GUI/Console 都支持，stub 继承原 PE subsystem）
+                report = PackWithReflective(selected, opts, peInfo, progress, logger);
+            }
             else
             {
                 report = PackWithTempfile(selected, original, peInfo, opts, progress, logger);
@@ -181,6 +188,75 @@ namespace WinAppLocker.Packer
                     OutputPath = opts.OutputPath,
                     UsedStubName = stub.Name,
                     UsedKind = StubKind.InplaceBuilder,
+                };
+            }
+            finally
+            {
+                try { File.Delete(tempInput); } catch { }
+                try { File.Delete(tempOutput); } catch { }
+            }
+        }
+
+        /// <summary>Reflective 加壳分支：调用 builder_reflective.exe 做反射式加壳</summary>
+        private static PackReport PackWithReflective(
+            StubManifest stub,
+            PackOptions opts,
+            PeInfo peInfo,
+            IProgress<int> progress,
+            Action<string> logger)
+        {
+            logger?.Invoke($"[Reflective] 使用 {stub.Name} 加壳（MVP v1 明文模式）...");
+
+            // builder 不能原地覆盖输入文件，复制到临时文件
+            string tempInput = Path.Combine(Path.GetTempPath(),
+                $"refl_in_{Guid.NewGuid():N}.exe");
+            string tempOutput = Path.Combine(Path.GetTempPath(),
+                $"refl_out_{Guid.NewGuid():N}.exe");
+            try
+            {
+                File.Copy(opts.InputPath, tempInput, true);
+
+                string builderExe = stub.MainFilePath;
+                string stubDir = stub.StubDir;
+
+                // 调用 builder_reflective.exe
+                // 命令行：builder_reflective.exe <input> <output> --stub <stub_path>
+                // builder 按 PE 架构自动选 stub（x64→loader_x64.exe，x86→loader_x86.exe）
+                var result = ReflectivePacker.Pack(
+                    builderExe, stubDir, tempInput, tempOutput, peInfo.Machine);
+
+                // 输出 builder 日志
+                if (!string.IsNullOrEmpty(result.Stdout))
+                    foreach (var line in result.Stdout.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            logger?.Invoke($"[Reflective] {line}");
+                if (!string.IsNullOrEmpty(result.Stderr))
+                    foreach (var line in result.Stderr.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            logger?.Invoke($"[Reflective] [stderr] {line}");
+
+                if (!result.Success)
+                    throw new Exception(
+                        $"Reflective builder 失败 (exit={result.ExitCode})\n" +
+                        $"stdout: {result.Stdout}\nstderr: {result.Stderr}");
+
+                // 把输出复制到目标路径
+                string outDir = Path.GetDirectoryName(Path.GetFullPath(opts.OutputPath));
+                if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+                File.Copy(tempOutput, opts.OutputPath, true);
+
+                // Reflective 模式不调用 IconCopier（原 PE 的 .rsrc 节已完整保留在 .payload 中，
+                // stub 加载原 PE 后通过 PEB.Ldr 覆写让 OS 找到原 PE 的资源；再调 UpdateResourceW
+                // 会改 stub 自己的资源段，与原 PE 资源无关，反而可能干扰）
+
+                progress?.Report(100);
+                return new PackReport
+                {
+                    InputSize = new FileInfo(opts.InputPath).Length,
+                    OutputSize = new FileInfo(opts.OutputPath).Length,
+                    OutputPath = opts.OutputPath,
+                    UsedStubName = stub.Name,
+                    UsedKind = StubKind.ReflectiveBuilder,
                 };
             }
             finally
