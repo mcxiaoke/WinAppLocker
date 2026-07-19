@@ -200,11 +200,15 @@ namespace WinAppLocker.Packer {
                     return ("⚠ WinLock 不支持 .NET 程序，请改用临时文件模式", true);
                 if (!peInfo.IsGui)
                     return ("⚠ WinLock 仅支持 GUI 程序，请改用临时文件或反射式模式", true);
+                if (peInfo.IsChromiumLike)
+                    return ("⚠ WinLock 不支持 Chromium 系浏览器（Chrome/Edge/Doubao），请改用临时文件模式", true);
             }
             else if (kind == StubKind.ReflectiveBuilder)
             {
                 if (peInfo.IsDotNet)
                     return ("⚠ 反射式加载不支持 .NET 程序（CLR 假设主模块由 OS loader 加载）", true);
+                if (peInfo.IsChromiumLike)
+                    return ("⚠ 反射式加载不支持 Chromium 系浏览器（Chrome/Edge/Doubao，依赖版本化子目录 DLL），请改用临时文件模式", true);
                 // 反射式支持 Console 和 x86，无其它限制
             }
             return (null, false);
@@ -312,8 +316,8 @@ namespace WinAppLocker.Packer {
             else
             {
                 lblPeInfo.Text = text;
-                // 警告色：.NET 程序或带签名（加壳后签名会失效）
-                if (info.IsDotNet || info.IsSigned)
+                // 警告色：.NET / Chromium 系浏览器 / 带签名（加壳后签名会失效）
+                if (info.IsDotNet || info.IsChromiumLike || info.IsSigned)
                     lblPeInfo.ForeColor = System.Drawing.Color.OrangeRed;
                 else
                     lblPeInfo.ForeColor = System.Drawing.Color.DarkSlateGray;

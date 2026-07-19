@@ -111,12 +111,26 @@ namespace WinAppLocker.Packer
                 if (originalSubsystem != StubSubsystem.Gui)
                     throw new InvalidOperationException(
                         "WinLock 模式当前仅支持 GUI 程序（Console 程序请改用 AppLocker Console 模式）");
+                // Chromium 系浏览器（Chrome/Edge/Doubao）依赖版本化子目录 DLL，
+                // 加壳后必定 crash，拒绝（UI 也会禁用按钮，这里是防御性检查）
+                if (peInfo.IsChromiumLike)
+                    throw new InvalidOperationException(
+                        "WinLock 模式不支持 Chromium 系浏览器（Chrome/Edge/Doubao），请改用临时文件模式");
 
                 report = PackWithWinLock(selected, opts, progress, logger);
             }
             else if (selected.Kind == StubKind.ReflectiveBuilder)
             {
-                // Reflective 模式：支持 x86/x64 native PE + 简单 .NET 程序
+                // Reflective 模式：不支持 .NET（CLR 假设主模块由 OS loader 加载）
+                if (peInfo.IsDotNet)
+                    throw new InvalidOperationException(
+                        "反射式加载不支持 .NET 程序（CLR 假设主模块由 OS loader 加载），请改用临时文件模式");
+                // Chromium 系浏览器依赖版本化子目录 DLL（如 chrome_elf.dll 在 145.0.7632.68\），
+                // 浏览器自己有特殊 DLL 加载逻辑，反射式 loader 无法模拟，加壳后必定 crash
+                if (peInfo.IsChromiumLike)
+                    throw new InvalidOperationException(
+                        "反射式加载不支持 Chromium 系浏览器（Chrome/Edge/Doubao，依赖版本化子目录 DLL），请改用临时文件模式");
+                // Reflective 模式：支持 x86/x64 native PE
                 // MVP v1 明文模式（无密码），原 PE 完整保留在 .payload 节
                 // 不限制子系统（GUI/Console 都支持，stub 继承原 PE subsystem）
                 report = PackWithReflective(selected, opts, peInfo, progress, logger);

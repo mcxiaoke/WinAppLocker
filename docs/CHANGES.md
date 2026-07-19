@@ -1,5 +1,47 @@
 # 变更记录
 
+## 变更记录 2026-07-19 dotnet packer 检测 Chromium 系浏览器并禁用加壳按钮
+
+**问题**：Chrome / Edge / Doubao 等 Chromium 系浏览器不适合反射式加壳（依赖版本化子目录 DLL，浏览器有自己的 DLL 加载逻辑）。之前用户选这些程序加壳后会 crash，没有任何提示。
+
+**检测方案**（`dotnet/packer/PeReader.cs`）：
+- 新增 `IsChromiumLike` 字段
+- 新增 `DetectChromiumLike(pe)` 方法：解析 PE 导入表，遍历每个导入的 DLL 名字，匹配 `*_elf.dll` 后缀（`chrome_elf.dll`/`doubao_elf.dll` 等 Chromium 系浏览器特征）
+- 新增 `RvaToFileOffset` 辅助函数：PE RVA 转文件偏移（遍历节表）
+- 新增 `ReadAsciiString` 辅助函数：读 null-terminated ASCII 字符串
+
+**UI 提示 + 禁用按钮**（`dotnet/packer/MainForm.cs/GetStubCompatibilityWarning`）：
+- WinLock + Chromium → `⚠ WinLock 不支持 Chromium 系浏览器（Chrome/Edge/Doubao），请改用临时文件模式` (blocking)
+- Reflective + Chromium → `⚠ 反射式加载不支持 Chromium 系浏览器（Chrome/Edge/Doubao，依赖版本化子目录 DLL），请改用临时文件模式` (blocking)
+- `UpdatePeInfoLabel`：Chromium 程序即使选 Tempfile 也用 OrangeRed 显示（提醒这是特殊程序）
+
+**CLI 防御性检查**（`dotnet/packer/PackCore.cs`）：
+- WinLock/Reflective + Chromium → 抛 `InvalidOperationException`（万一 UI 检测失效）
+
+**CLI `--pe-info` 输出**（`dotnet/packer/Program.cs`）：
+- 新增 `Chromium 系浏览器: True/False` 行
+
+**测试结果**（`temp/test_chromium_detect.py` 11/11 ALL PASS）：
+
+| 程序 | 期望 | 实际 | 结果 |
+|---|---|---|---|
+| Doubao | True | True | ✓ |
+| Chrome | True | True | ✓ |
+| FastCopy | False | False | ✓ |
+| Bandizip | False | False | ✓ |
+| BCompare | False | False | ✓ |
+| CC-Switch | False | False | ✓ |
+| FreeFileSync | False | False | ✓ |
+| AutoHotkey64 | False | False | ✓ |
+| hellowinforms (.NET) | False | False | ✓ |
+| helloguix64 | False | False | ✓ |
+| hellocli | False | False | ✓ |
+
+**限制说明**：
+- 此检测覆盖 Chrome / Edge / Doubao / Brave 等 Chromium 原生浏览器（导入 `*_elf.dll`）
+- Electron 程序不在此列（Electron 主 EXE 不引用 `*_elf.dll`，但 Electron 程序的反射式加壳可行性需单独评估）
+- 检测基于 PE 导入表，纯静态分析，不需要文件系统访问
+
 ## 变更记录 2026-07-19 reflective loader 修复 x86 TLS 重定位 + 设置 DLL 搜索路径
 
 **修复 1：x86 TLS 重定位导致 FreeFileSync 崩溃**

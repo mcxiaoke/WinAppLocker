@@ -306,9 +306,10 @@ namespace WinAppLocker.Packer
                 Console.WriteLine($"  TLS 目录:              {info.HasTls}");
                 Console.WriteLine($"  Authenticode 签名:     {info.IsSigned}");
                 Console.WriteLine($"  重定位表 (.reloc):     {info.HasReloc}");
+                Console.WriteLine($"  Chromium 系浏览器:     {info.IsChromiumLike}");
                 Console.WriteLine($"  文件大小:              {info.FileSize:N0} bytes ({info.FileSize / 1024.0:F1} KB)");
 
-                AppLogger.Info($"--pe-info {exePath}: machine={info.MachineName} subsystem={info.SubsystemName} dotnet={info.IsDotNet} aslr={info.IsAslr} dep={info.IsDep} tls={info.HasTls} signed={info.IsSigned} size={info.FileSize}");
+                AppLogger.Info($"--pe-info {exePath}: machine={info.MachineName} subsystem={info.SubsystemName} dotnet={info.IsDotNet} chromium={info.IsChromiumLike} aslr={info.IsAslr} dep={info.IsDep} tls={info.HasTls} signed={info.IsSigned} size={info.FileSize}");
                 return 0;
             }
             catch (Exception ex)

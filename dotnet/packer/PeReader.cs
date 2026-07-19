@@ -25,6 +25,15 @@ namespace WinAppLocker.Packer
         public bool IsSigned;          // IMAGE_DIRECTORY_ENTRY_SECURITY (index 4) — Authenticode 签名
         public bool HasReloc;          // IMAGE_DIRECTORY_ENTRY_BASERELOC (index 5) — ASLR 重定位表
 
+        /// <summary>
+        /// Chromium 系浏览器特征：导入表引用 *_elf.dll（chrome_elf.dll/doubao_elf.dll 等）。
+        /// 这类程序依赖版本化子目录下的 DLL（如 145.0.7632.68\chrome_elf.dll），
+        /// 反射式 loader 无法模拟 Chrome 自定义的 DLL 加载逻辑，加壳后必定 crash。
+        /// 典型例子：Chrome / Edge / Doubao / Brave 等 Chromium 原生浏览器。
+        /// 注意：Electron 程序不在此列（Electron 主 EXE 不引用 *_elf.dll）。
+        /// </summary>
+        public bool IsChromiumLike;
+
         // 文件大小（字节）
         public long FileSize;
 
@@ -89,6 +98,7 @@ namespace WinAppLocker.Packer
         private const int DIR_SECURITY  = 4;  // Authenticode 签名
         private const int DIR_BASERELOC = 5;  // .reloc 重定位表（ASLR 必需）
         private const int DIR_TLS       = 9;  // TLS callbacks
+        private const int DIR_IMPORT    = 1;  // Import Directory（导入表）
 
         public static PeInfo Parse(byte[] peBytes)
         {
@@ -118,7 +128,112 @@ namespace WinAppLocker.Packer
             info.HasReloc = reloc;
             info.HasTls = tls;
 
+            // Chromium 系浏览器检测：导入表是否引用 *_elf.dll
+            info.IsChromiumLike = DetectChromiumLike(peBytes);
+
             return info;
+        }
+
+        /// <summary>
+        /// 检测 Chromium 系浏览器（Chrome / Edge / Doubao / Brave 等）。
+        ///
+        /// 特征：导入表引用 *_elf.dll（chrome_elf.dll / doubao_elf.dll 等）。
+        /// 这类程序的 *_elf.dll 在版本化子目录（如 145.0.7632.68\），
+        /// 浏览器自己有特殊 DLL 加载逻辑，反射式 loader 无法模拟。
+        ///
+        /// 检测方式：解析 PE 导入表，遍历每个导入的 DLL 名字，
+        /// 匹配 *_elf.dll 后缀（大小写不敏感）。
+        /// </summary>
+        private static bool DetectChromiumLike(byte[] pe)
+        {
+            try
+            {
+                int nt = ReadInt32(pe, 0x3C);
+                int optStart = nt + 24;
+                if (optStart + 2 > pe.Length) return false;
+                ushort magic = ReadUInt16(pe, optStart);
+
+                int dataDirStart;
+                if (magic == 0x20b) dataDirStart = optStart + 112;      // PE32+
+                else if (magic == 0x10b) dataDirStart = optStart + 96;  // PE32
+                else return false;
+
+                // DataDirectory[1] = Import Directory
+                int importEntryOffset = dataDirStart + DIR_IMPORT * 8;
+                if (importEntryOffset + 8 > pe.Length) return false;
+                uint importRva = ReadUInt32(pe, importEntryOffset);
+                uint importSize = ReadUInt32(pe, importEntryOffset + 4);
+                if (importRva == 0 || importSize == 0) return false;
+
+                // RVA 转文件偏移
+                int importFileOffset = RvaToFileOffset(pe, nt, importRva);
+                if (importFileOffset < 0) return false;
+
+                // 遍历 IMAGE_IMPORT_DESCRIPTOR（20 字节/项）
+                // 结构：OriginalFirstThunk(4) + TimeDateStamp(4) + ForwarderChain(4) + Name(4) + FirstThunk(4)
+                // Name 字段（offset 12）是 DLL 名字的 RVA
+                // 表以全 0 项结束
+                int maxDescriptors = (int)(importSize / 20) + 1;
+                for (int i = 0; i < maxDescriptors && i < 1024; i++)
+                {
+                    int descOffset = importFileOffset + i * 20;
+                    if (descOffset + 20 > pe.Length) break;
+                    uint nameRva = ReadUInt32(pe, descOffset + 12);
+                    if (nameRva == 0) break;  // 结束标记
+
+                    int nameFileOffset = RvaToFileOffset(pe, nt, nameRva);
+                    if (nameFileOffset < 0 || nameFileOffset >= pe.Length) continue;
+
+                    string dllName = ReadAsciiString(pe, nameFileOffset);
+                    if (string.IsNullOrEmpty(dllName)) continue;
+
+                    // 匹配 *_elf.dll（Chrome/Doubao/Edge 等 Chromium 系浏览器特征）
+                    if (dllName.EndsWith("_elf.dll", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                return false;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// PE RVA 转文件偏移：遍历节表，找包含该 RVA 的节，
+        /// 返回 RVA - 节.VirtualAddress + 节.PointerToRawData。
+        /// 找不到返回 -1。
+        /// </summary>
+        private static int RvaToFileOffset(byte[] pe, int ntHeaderOffset, uint rva)
+        {
+            int fileHeaderOffset = ntHeaderOffset + 4;  // 跳过 PE 签名
+            if (fileHeaderOffset + 20 > pe.Length) return -1;
+            ushort numSections = ReadUInt16(pe, fileHeaderOffset + 2);
+            ushort optHeaderSize = ReadUInt16(pe, fileHeaderOffset + 16);
+            int sectionTableOffset = ntHeaderOffset + 24 + optHeaderSize;
+
+            for (int i = 0; i < numSections; i++)
+            {
+                int secOffset = sectionTableOffset + i * 40;
+                if (secOffset + 40 > pe.Length) break;
+                uint virtualSize = ReadUInt32(pe, secOffset + 8);
+                uint virtualAddress = ReadUInt32(pe, secOffset + 12);
+                uint rawSize = ReadUInt32(pe, secOffset + 16);
+                uint rawOffset = ReadUInt32(pe, secOffset + 20);
+
+                // 优先用 VirtualSize 判断（实际映射大小）
+                uint sectionSize = virtualSize > 0 ? virtualSize : rawSize;
+                if (rva >= virtualAddress && rva < virtualAddress + sectionSize)
+                {
+                    return (int)(rva - virtualAddress + rawOffset);
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>读 null-terminated ASCII 字符串</summary>
+        private static string ReadAsciiString(byte[] pe, int offset)
+        {
+            int end = offset;
+            while (end < pe.Length && pe[end] != 0) end++;
+            return System.Text.Encoding.ASCII.GetString(pe, offset, end - offset);
         }
 
         /// <summary>
