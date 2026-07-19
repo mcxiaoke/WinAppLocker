@@ -186,16 +186,13 @@ namespace WinAppLocker.Packer
             // cbStubPreference
             // 
             this.cbStubPreference.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
-            this.cbStubPreference.Items.AddRange(new object[] {
-            "自动",
-            "GUI",
-            "Console",
-            "Test"});
+            // 注意：Items 不在 Designer 里硬编码，由 MainForm.LoadStubList() 在 Load 时动态填充
             this.cbStubPreference.Location = new System.Drawing.Point(112, 206);
             this.cbStubPreference.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.cbStubPreference.Name = "cbStubPreference";
-            this.cbStubPreference.Size = new System.Drawing.Size(177, 36);
+            this.cbStubPreference.Size = new System.Drawing.Size(397, 36);
             this.cbStubPreference.TabIndex = 12;
+            this.cbStubPreference.SelectedIndexChanged += new System.EventHandler(this.cbStubPreference_SelectedIndexChanged);
             // 
             // lblIterations
             // 

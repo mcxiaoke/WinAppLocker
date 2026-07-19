@@ -1,0 +1,15 @@
+{
+  "subsystem": "gui",
+  "kind": "inplace-builder",
+  "description": "WinLock in-place packer (GUI dialog, no plaintext tempfile, XTEA + SHA-256)",
+  "version": "2.0.0",
+  "name": "winlock",
+  "supported_machines": [
+    "amd64",
+    "i386"
+  ],
+  "components": {
+    "stub_x64": "stub_x64.bin",
+    "stub_x86": "stub_x86.bin"
+  }
+}

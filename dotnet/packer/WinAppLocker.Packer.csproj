@@ -18,6 +18,9 @@
     <PackageReference Include="AsmResolver.PE" Version="6.0.0" />
     <!-- Costura.Fody：将所有依赖 DLL（AsmResolver 链等）嵌入 exe，生成单文件可执行程序 -->
     <PackageReference Include="Costura.Fody" Version="6.0.0" PrivateAssets="all" />
+    <!-- System.Text.Json：用于反序列化 .meta.json（.NET Framework 4.7.2 不内置）。
+         Costura.Fody 会把它的依赖 DLL 也嵌入到 exe 中。 -->
+    <PackageReference Include="System.Text.Json" Version="8.0.4" />
   </ItemGroup>
 
   <ItemGroup>
@@ -35,7 +38,8 @@
 
   <!-- 在编译前从 stub/bin/$(Configuration)、stub.console/bin/$(Configuration)、stub.test/bin/$(Configuration)
        复制 stub exe 到 Resources/ 作为嵌入资源。
-       三个项目已分开，输出路径不再有 Gui/Console/Test 子目录。 -->
+       三个项目已分开，输出路径不再有 Gui/Console/Test 子目录。
+       这是单文件发布模式的兜底：当 stub/ 目录不存在时，packer 仍能用嵌入资源。 -->
   <Target Name="CopyStubs" BeforeTargets="BeforeBuild">
     <PropertyGroup>
       <StubGuiDir>$(MSBuildThisFileDirectory)..\stub\bin\$(Configuration)</StubGuiDir>
@@ -60,5 +64,17 @@
       <EmbeddedResource Include="Resources\stub_test.exe" Condition="Exists('Resources\stub_test.exe')" />
     </ItemGroup>
   </Target>
+
+  <!-- 新增：把项目内 stub/ 目录所有文件（stub exe/bin + .meta.json）拷贝到输出目录的 stub/ 子目录。
+       build.ps1 会先把所有 stub 产物（包括 winlock_builder.exe + stub_x64.bin + 6 个 .meta.json）
+       汇集到 dotnet/packer/stub/，然后 dotnet build 时这里会把它们拷到 bin/$(Configuration)/stub/。
+       packer 运行时通过 StubLoader.FindStubDir() 找到这个目录。 -->
+  <ItemGroup>
+    <None Include="stub\**\*"
+          Condition="Exists('$(MSBuildProjectDirectory)\stub')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>stub\%(RecursiveDir)%(FileName)%(Extension)</Link>
+    </None>
+  </ItemGroup>
 
 </Project>

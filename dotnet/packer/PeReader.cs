@@ -16,10 +16,11 @@ namespace WinAppLocker.Packer
     }
 
     /// <summary>
-    /// stub 选择偏好。
+    /// stub 选择偏好（按子系统）。
     /// Auto = 根据 PE 子系统自动选择；Gui/Console = 强制；Test = 测试 stub（内置密码）。
+    /// 注意：与 StubManifest.StubKind（加壳方案）不同，此处仅表示子系统偏好。
     /// </summary>
-    public enum StubKind
+    public enum StubPreference
     {
         Auto = 0,
         Gui = 1,

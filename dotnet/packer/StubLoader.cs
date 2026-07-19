@@ -6,26 +6,29 @@ using WinAppLocker.Shared;
 namespace WinAppLocker.Packer
 {
     /// <summary>
-    /// 从 packer 的嵌入资源中加载 stub 字节，并提供基于 PE 子系统的自动选择。
+    /// stub 字节加载器：支持两种来源
+    ///   1. 嵌入资源（兼容旧发布模式：单文件 exe）
+    ///   2. stub/ 目录（新发布模式：exe + stub/ 目录，支持 WinLock）
+    /// 优先用 stub/ 目录，找不到则退回嵌入资源。
     /// </summary>
     internal static class StubLoader
     {
         /// <summary>选择 stub 字节。</summary>
-        public static byte[] SelectStub(ushort subsystem, StubKind pref)
+        public static byte[] SelectStub(ushort subsystem, StubPreference pref)
         {
             string name;
             switch (pref)
             {
-                case StubKind.Gui:
+                case StubPreference.Gui:
                     name = "stub_gui.exe";
                     break;
-                case StubKind.Console:
+                case StubPreference.Console:
                     name = "stub_console.exe";
                     break;
-                case StubKind.Test:
+                case StubPreference.Test:
                     name = "stub_test.exe";
                     break;
-                case StubKind.Auto:
+                case StubPreference.Auto:
                     name = subsystem == (ushort)2 /* WindowsGui */
                         ? "stub_gui.exe"
                         : "stub_console.exe";
@@ -33,7 +36,40 @@ namespace WinAppLocker.Packer
                 default:
                     throw new ArgumentException($"unknown stub preference {pref}");
             }
+            // 优先从 stub/ 目录读
+            string stubDir = FindStubDir();
+            string stubPath = Path.Combine(stubDir, name);
+            if (File.Exists(stubPath))
+            {
+                return File.ReadAllBytes(stubPath);
+            }
+            // 退回嵌入资源
             return LoadEmbedded(name);
+        }
+
+        /// <summary>从 stub/ 目录加载指定文件名的 stub 字节。不存在则抛异常。</summary>
+        public static byte[] LoadFromStubDir(string stubDir, string fileName)
+        {
+            string path = Path.Combine(stubDir, fileName);
+            if (!File.Exists(path))
+                throw new FileNotFoundException($"stub 文件不存在: {path}");
+            return File.ReadAllBytes(path);
+        }
+
+        /// <summary>
+        /// 定位 stub/ 目录：
+        ///   1. packer exe 同目录的 stub/
+        ///   2. （fallback）当前工作目录的 stub/
+        /// </summary>
+        public static string FindStubDir()
+        {
+            string exeDir = Path.GetDirectoryName(
+                Assembly.GetExecutingAssembly().Location);
+            string stubDir = Path.Combine(exeDir, "stub");
+            if (Directory.Exists(stubDir)) return stubDir;
+            // fallback
+            string cwdStub = Path.Combine(Directory.GetCurrentDirectory(), "stub");
+            return cwdStub;
         }
 
         private static byte[] LoadEmbedded(string name)
@@ -60,7 +96,9 @@ namespace WinAppLocker.Packer
                     }
                 }
             }
-            throw new InvalidOperationException($"嵌入资源 {name} 未找到。请先构建 stub。");
+            throw new InvalidOperationException(
+                $"找不到 stub：既不在 stub/ 目录，也不在嵌入资源。请先构建 stub 或检查 stub/ 目录。\n" +
+                $"期望文件: {name}");
         }
 
         /// <summary>

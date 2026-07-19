@@ -1,16 +1,23 @@
 # WinAppLocker .NET 构建脚本
 # 用法：
 #   .\build.ps1              # Debug 构建（不拷到 dist）
-#   .\build.ps1 -Release     # Release 构建，输出 dist/WinAppLocker.exe（单文件）
+#   .\build.ps1 -Release     # Release 构建，输出 dist/WinAppLocker.exe + dist/stub/
 #   .\build.ps1 -Clean       # 清理后构建
+#   .\build.ps1 -SkipWinLock # 跳过 WinLock 编译（仅 dotnet 部分，调试用）
 param(
     [switch]$Release,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$SkipWinLock
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
+
+# applocker 仓库根目录（build.ps1 在 dotnet/ 下，根目录是上一层）
+$applockerRoot = Split-Path -Parent $root
+# WinLock 源码目录（packer 子目录是 winlock 项目的代码）
+$winlockDir = Join-Path $applockerRoot "packer"
 
 $config = if ($Release) { "Release" } else { "Debug" }
 Write-Host "==> 配置: $config" -ForegroundColor Cyan
@@ -29,6 +36,7 @@ if ($Clean) {
         }
     }
     if (Test-Path "$root\packer\Resources") { Remove-Item "$root\packer\Resources" -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path "$root\packer\stub") { Remove-Item "$root\packer\stub" -Recurse -Force -ErrorAction SilentlyContinue }
     if (Test-Path "$root\dist") { Remove-Item "$root\dist" -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
@@ -61,22 +69,182 @@ Write-Host "==> 编译 stub_test..." -ForegroundColor Cyan
 dotnet build stub.test -c $config
 if ($LASTEXITCODE -ne 0) { throw "stub_test build failed" }
 
-# ---- 编译 packer（会自动嵌入 stub_gui/console/test + Costura 嵌入依赖 DLL）----
-Write-Host "==> 编译 packer（Costura 嵌入依赖）..." -ForegroundColor Cyan
+# ---- 编译 WinLock（in-place 加壳器，C + 内联汇编）----
+# 产物：
+#   packer/builder/builder.exe        → dotnet/packer/stub/winlock_builder.exe
+#   packer/stub/stub_x64.bin          → dotnet/packer/stub/stub_x64.bin
+#   packer/stub/stub_x86.bin          → dotnet/packer/stub/stub_x86.bin
+#   packer/stub/stub_x86.exe          → dotnet/packer/stub/stub_x86.exe（builder 读 .reloc 用）
+if (-not $SkipWinLock) {
+    if (-not (Test-Path $winlockDir)) {
+        Write-Host "==> 跳过 WinLock（找不到源码目录: $winlockDir）" -ForegroundColor Yellow
+    } else {
+        Write-Host "==> 编译 WinLock（mingw32-make all all-x86）..." -ForegroundColor Cyan
+        # Makefile 内部已配置 w64devkit + msys2 mingw32 PATH（用于 gcc/objcopy/nm），
+        # 但调用 make 本身需要先把这些目录加到 PowerShell 的 PATH 中
+        $w64devkitBin = "C:\Home\Develop\w64devkit\bin"
+        $msysMingw32Bin = "C:\Home\Develop\msys64\mingw32\bin"
+        $msysUsrBin = "C:\Home\Develop\msys64\usr\bin"
+        $origPath = $env:PATH
+        $extraPath = @()
+        if ((Test-Path $w64devkitBin) -and ($env:PATH -notlike "*$w64devkitBin*")) { $extraPath += $w64devkitBin }
+        if ((Test-Path $msysMingw32Bin) -and ($env:PATH -notlike "*$msysMingw32Bin*")) { $extraPath += $msysMingw32Bin }
+        if ((Test-Path $msysUsrBin) -and ($env:PATH -notlike "*$msysUsrBin*")) { $extraPath += $msysUsrBin }
+        if ($extraPath.Count -gt 0) {
+            $env:PATH = ($extraPath -join ";") + ";$env:PATH"
+        }
+
+        Push-Location $winlockDir
+        try {
+            $make = Get-Command mingw32-make -ErrorAction SilentlyContinue
+            if (-not $make) {
+                $make = Get-Command make -ErrorAction SilentlyContinue
+            }
+            if (-not $make) {
+                Write-Host "    [警告] 找不到 mingw32-make / make，跳过 WinLock 编译" -ForegroundColor Yellow
+                Write-Host "           请安装 w64devkit 或 msys2，并确保在 PATH 中" -ForegroundColor Yellow
+            } else {
+                & $make.Name all all-x86 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+                if ($LASTEXITCODE -ne 0) { Pop-Location; throw "WinLock build failed" }
+                Write-Host "==> WinLock 编译完成" -ForegroundColor Green
+            }
+        } finally {
+            Pop-Location
+            # 恢复原 PATH，避免污染后续 dotnet build
+            $env:PATH = $origPath
+        }
+    }
+} else {
+    Write-Host "==> 跳过 WinLock 编译（-SkipWinLock）" -ForegroundColor DarkGray
+}
+
+# ---- 汇集所有 stub 到 dotnet/packer/stub/（packer csproj 会拷到输出目录）----
+$stubOutDir = "$root\packer\stub"
+if (-not (Test-Path $stubOutDir)) { New-Item -ItemType Directory -Path $stubOutDir -Force | Out-Null }
+Write-Host "==> 汇集 stub 到 $stubOutDir ..." -ForegroundColor Cyan
+
+# 1. dotnet 三个 stub exe（tempfile 模式）
+$dotnetStubs = @(
+    @{ Src = "$root\stub\bin\$config\stub_gui.exe";     Dst = "stub_gui.exe" },
+    @{ Src = "$root\stub.console\bin\$config\stub_console.exe"; Dst = "stub_console.exe" },
+    @{ Src = "$root\stub.test\bin\$config\stub_test.exe";      Dst = "stub_test.exe" }
+)
+foreach ($s in $dotnetStubs) {
+    if (Test-Path $s.Src) {
+        Copy-Item $s.Src (Join-Path $stubOutDir $s.Dst) -Force
+        Write-Host "    + $($s.Dst)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "    [警告] 缺失: $($s.Src)" -ForegroundColor Yellow
+    }
+}
+
+# 2. WinLock 产物（inplace-builder 模式）
+if (-not $SkipWinLock) {
+    $winlockArtifacts = @(
+        @{ Src = "$winlockDir\builder\builder.exe";  Dst = "winlock_builder.exe" },
+        @{ Src = "$winlockDir\stub\stub_x64.bin";    Dst = "stub_x64.bin" },
+        @{ Src = "$winlockDir\stub\stub_x86.bin";    Dst = "stub_x86.bin" },
+        @{ Src = "$winlockDir\stub\stub_x86.exe";    Dst = "stub_x86.exe" }
+    )
+    foreach ($s in $winlockArtifacts) {
+        if (Test-Path $s.Src) {
+            Copy-Item $s.Src (Join-Path $stubOutDir $s.Dst) -Force
+            Write-Host "    + $($s.Dst)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "    [警告] 缺失: $($s.Src)" -ForegroundColor Yellow
+        }
+    }
+}
+
+# 3. 生成 4 个 .meta.json 文件（packer 通过它们识别 stub 类型）
+# 注意：stub_x64.bin / stub_x86.bin 不需要 meta.json，它们被 winlock_builder.exe.meta.json
+# 的 components 字段引用，packer 通过 builder 的 meta 间接验证它们的存在。
+$metaFiles = @(
+    @{
+        Path = "$stubOutDir\stub_gui.exe.meta.json"
+        Json = @{
+            name = "applocker-gui"
+            kind = "tempfile"
+            subsystem = "gui"
+            description = "AppLocker GUI stub (tempfile mode, password dialog)"
+            version = $version
+        }
+    },
+    @{
+        Path = "$stubOutDir\stub_console.exe.meta.json"
+        Json = @{
+            name = "applocker-console"
+            kind = "tempfile"
+            subsystem = "console"
+            description = "AppLocker Console stub (tempfile mode, stdin password)"
+            version = $version
+        }
+    },
+    @{
+        Path = "$stubOutDir\stub_test.exe.meta.json"
+        Json = @{
+            name = "applocker-test"
+            kind = "tempfile"
+            subsystem = "test"
+            description = "AppLocker Test stub (hardcoded password test1234, for testing only)"
+            version = $version
+        }
+    },
+    @{
+        Path = "$stubOutDir\winlock_builder.exe.meta.json"
+        Json = @{
+            name = "winlock"
+            kind = "inplace-builder"
+            subsystem = "gui"
+            description = "WinLock in-place packer (GUI dialog, no plaintext tempfile, XTEA + SHA-256)"
+            version = "2.0.0"
+            components = @{
+                stub_x64 = "stub_x64.bin"
+                stub_x86 = "stub_x86.bin"
+            }
+            supported_machines = @("amd64", "i386")
+        }
+    }
+)
+foreach ($m in $metaFiles) {
+    $m.Json | ConvertTo-Json -Depth 5 | Set-Content -Path $m.Path -Encoding UTF8
+    Write-Host "    + $(Split-Path -Leaf $m.Path)" -ForegroundColor DarkGray
+}
+
+# ---- 编译 packer（会自动拷贝 stub/ 到输出目录 + Costura 嵌入依赖 DLL）----
+Write-Host "==> 编译 packer（Costura 嵌入依赖 + 拷贝 stub/ 到输出）..." -ForegroundColor Cyan
 dotnet build packer -c $config
 if ($LASTEXITCODE -ne 0) { throw "packer build failed" }
 
+# ---- 验证 packer 输出目录的 stub/ 子目录 ----
+$packerOutStub = "$root\packer\bin\$config\stub"
+if (Test-Path $packerOutStub) {
+    Write-Host "==> packer 输出 stub/ 目录内容:" -ForegroundColor Cyan
+    Get-ChildItem $packerOutStub | Format-Table Name, Length
+} else {
+    Write-Host "==> [警告] packer 输出目录未生成 stub/ 子目录: $packerOutStub" -ForegroundColor Yellow
+}
+
 if ($Release) {
-    New-Item -ItemType Directory -Path "$root\dist" -Force | Out-Null
+    $distDir = "$root\dist"
+    New-Item -ItemType Directory -Path $distDir -Force | Out-Null
     # 清空 dist 避免残留旧文件
-    Get-ChildItem "$root\dist" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $distDir -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     # Costura 已将所有依赖 DLL 嵌入 exe，只需复制 WinAppLocker.exe + exe.config
     # exe.config 不能内嵌，WinForms 高 DPI 配置必须在 CLR 初始化前从外部 config 读取
-    Copy-Item "$root\packer\bin\$config\WinAppLocker.exe" "$root\dist\WinAppLocker.exe" -Force
-    Copy-Item "$root\packer\bin\$config\WinAppLocker.exe.config" "$root\dist\WinAppLocker.exe.config" -Force
+    Copy-Item "$root\packer\bin\$config\WinAppLocker.exe" "$distDir\WinAppLocker.exe" -Force
+    Copy-Item "$root\packer\bin\$config\WinAppLocker.exe.config" "$distDir\WinAppLocker.exe.config" -Force
+    # 拷贝整个 stub/ 目录（WinLock 模式运行 packer 时需要）
+    if (Test-Path "$root\packer\bin\$config\stub") {
+        Copy-Item "$root\packer\bin\$config\stub" "$distDir\stub" -Recurse -Force
+    }
 
-    Write-Host "==> dist/WinAppLocker.exe 准备就绪（单文件 exe + .config）" -ForegroundColor Green
-    Get-ChildItem "$root\dist" | Format-Table Name, Length
+    Write-Host "==> dist/ 准备就绪（packer exe + .config + stub/ 目录）" -ForegroundColor Green
+    Get-ChildItem $distDir | Format-Table Name, Length
+    if (Test-Path "$distDir\stub") {
+        Write-Host "==> dist/stub/ 内容:" -ForegroundColor Cyan
+        Get-ChildItem "$distDir\stub" | Format-Table Name, Length
+    }
 } else {
     Write-Host "==> packer/bin/$config/WinAppLocker.exe 准备就绪" -ForegroundColor Green
     Get-ChildItem "$root\packer\bin\$config" -Filter "WinAppLocker*" | Format-Table Name, Length

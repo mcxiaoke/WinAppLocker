@@ -32,14 +32,15 @@ Write-Host "==> packer: $packer" -ForegroundColor Cyan
 & $packer --version
 Write-Host ""
 
-$samplesDir = Resolve-Path "$root\..\tests\samples"
+# 样本目录：项目根目录下的 temp/samples（参考 AGENTS.md，测试样本放 temp 目录）
+$samplesDir = Resolve-Path "$root\..\temp\samples"
 
 # 默认测试样本：CLI 程序可直接验证 stdout；GUI 程序验证进程启动
 if ($Samples) {
     $sampleList = $Samples -split ','
 } else {
     # CLI 程序（可通过 stdout 验证）
-    $cliSamples = @('hellocli.exe', 'hellomingw.exe', 'helloucrt.exe', 'sha512sum.exe')
+    $cliSamples = @('hellocli.exe', 'hellomingw.exe', 'helloucrt.exe', 'sha256sum.exe')
     # GUI 程序（通过进程存活验证）
     $guiSamples = @('hellogui.exe')
     $sampleList = $cliSamples + $guiSamples

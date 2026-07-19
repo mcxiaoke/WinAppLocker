@@ -423,7 +423,7 @@ static void print_usage(const char* prog) {
     printf("WinLock v2 - PE Password Gate Packer\n");
     printf("\n");
     printf("Usage:\n");
-    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t] [-d]\n", prog);
+    printf("  %s -i <input.exe> [-o <output.exe>] [-p <password>] [-t] [-d] [--stub-dir <path>]\n", prog);
     printf("\n");
     printf("Options:\n");
     printf("  -i, --input <file>    Input PE EXE (x86 or x64)\n");
@@ -433,6 +433,8 @@ static void print_usage(const char* prog) {
     printf("                        (overrides -p)\n");
     printf("  -d, --antidebug       Enable PEB anti-debug (default OFF for dev)\n");
     printf("                        Checks BeingDebugged / NtGlobalFlag / KdDebuggerEnabled\n");
+    printf("  --stub-dir <path>     Directory to search stub_x64.bin / stub_x86.bin / stub_x86.exe\n");
+    printf("                        (default: ./stub/)\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -440,10 +442,11 @@ int main(int argc, char* argv[]) {
     const char* in_path = NULL;
     const char* out_path = NULL;
     const char* pwd_arg = NULL;
+    const char* stub_dir = NULL;   /* --stub-dir 参数：覆盖 stub.bin 搜索目录 */
     int test_mode = 0;
     int antidebug = 0;
 
-    /* 参数解析：只支持 -i/-o/-p/-t/-d/-h，不再支持位置参数 */
+    /* 参数解析：只支持 -i/-o/-p/-t/-d/--stub-dir/-h，不再支持位置参数 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
             if (i + 1 >= argc) { printf("[-] -i requires argument\n"); return 1; }
@@ -458,6 +461,10 @@ int main(int argc, char* argv[]) {
             test_mode = 1;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--antidebug") == 0) {
             antidebug = 1;
+        } else if (strcmp(argv[i], "--stub-dir") == 0) {
+            /* 新增：指定 stub_x64.bin / stub_x86.bin / stub_x86.exe 的搜索目录 */
+            if (i + 1 >= argc) { printf("[-] --stub-dir requires argument\n"); return 1; }
+            stub_dir = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -785,9 +792,22 @@ int main(int argc, char* argv[]) {
     xtea_encrypt_buf(pe + text_sec->PointerToRawData, enc_size, key);
 
     /* 7. 读 stub.bin（按输入 PE 架构选择 stub_x64.bin 或 stub_x86.bin；
+     *    优先用 --stub-dir 指定目录，否则按原相对路径搜索（向后兼容）。
      *    向后兼容：x64 时也尝试 stub.bin） */
-    const char* stub_candidates[4];
+    const char* stub_candidates[6];
     int n_candidates = 0;
+    char stub_dir_path[512];
+    if (stub_dir) {
+        /* --stub-dir 优先：<stub_dir>/stub_x64.bin 或 <stub_dir>/stub_x86.bin */
+        snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub_%s.bin",
+                 stub_dir, g_is_x64 ? "x64" : "x86");
+        stub_candidates[n_candidates++] = strdup(stub_dir_path);
+        if (g_is_x64) {
+            /* x64 向后兼容：也尝试 <stub_dir>/stub.bin */
+            snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub.bin", stub_dir);
+            stub_candidates[n_candidates++] = strdup(stub_dir_path);
+        }
+    }
     if (g_is_x64) {
         stub_candidates[n_candidates++] = "stub/stub_x64.bin";
         stub_candidates[n_candidates++] = "stub_x64.bin";
@@ -831,8 +851,17 @@ int main(int argc, char* argv[]) {
     uint32_t stub_lock_rva = 0;
     uint32_t stub_lock_size = 0;
     if (!g_is_x64) {
-        const char* exe_candidates[2] = {"stub/stub_x86.exe", "stub_x86.exe"};
-        for (int i = 0; i < 2 && !stub_exe; i++) {
+        const char* exe_candidates[4];
+        int n_exe = 0;
+        char exe_dir_path[512];
+        if (stub_dir) {
+            /* --stub-dir 优先 */
+            snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/stub_x86.exe", stub_dir);
+            exe_candidates[n_exe++] = strdup(exe_dir_path);
+        }
+        exe_candidates[n_exe++] = "stub/stub_x86.exe";
+        exe_candidates[n_exe++] = "stub_x86.exe";
+        for (int i = 0; i < n_exe && !stub_exe; i++) {
             stub_exe = read_file(exe_candidates[i], &stub_exe_size);
         }
         if (!stub_exe) {

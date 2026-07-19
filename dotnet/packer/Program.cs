@@ -37,6 +37,12 @@ namespace WinAppLocker.Packer
                 return PackInfo.Inspect(args[1]);
             }
 
+            // --list-stubs: 列出 stub/ 目录下所有 stub manifest
+            if (args.Length > 0 && (args[0] == "--list-stubs" || args[0] == "-list-stubs"))
+            {
+                return ListStubs();
+            }
+
             // CLI 模式：dotnet WinAppLocker.exe --pack -i input.exe -o output.exe -p password [--stub auto|gui|console|test] [--iterations N]
             if (args.Length > 0 && (args[0] == "--pack" || args[0] == "-pack"))
             {
@@ -92,7 +98,11 @@ namespace WinAppLocker.Packer
             Console.WriteLine("  -o, --output <path>       输出 EXE 路径");
             Console.WriteLine("  -p, --password <pass>     密码（至少 4 字符）");
             Console.WriteLine("      --stub <Auto|Gui|Console|Test>");
-            Console.WriteLine("                            stub 类型（默认 Auto，Test=内置密码测试 stub）");
+            Console.WriteLine("                            旧 stub 偏好（按子系统选 tempfile 模式）");
+            Console.WriteLine("      --stub-name <name>    指定 stub manifest 名称（优先级高于 --stub）");
+            Console.WriteLine("                            如 applocker-gui / applocker-console / winlock 等");
+            Console.WriteLine("                            用 --list-stubs 查看可用 stub");
+            Console.WriteLine("      --list-stubs          列出 stub/ 目录下所有可用 stub");
             Console.WriteLine("      --iterations <N>      PBKDF2 迭代次数（默认 200000）");
         }
 
@@ -101,8 +111,24 @@ namespace WinAppLocker.Packer
             string inputPath = null;
             string outputPath = null;
             string password = null;
-            var stubPref = StubKind.Auto;
+            var stubPref = StubPreference.Auto;
+            string stubName = null;
             int iterations = PayloadFormat.DefaultKdfIterations;
+
+            // --list-stubs 提前处理：列出 stub/ 目录所有可用 stub 后退出
+            bool listStubs = false;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--list-stubs")
+                {
+                    listStubs = true;
+                    break;
+                }
+            }
+            if (listStubs)
+            {
+                return ListStubs();
+            }
 
             for (int i = 1; i < args.Length; i++)
             {
@@ -123,6 +149,9 @@ namespace WinAppLocker.Packer
                     case "--stub":
                         Enum.TryParse(args[++i], true, out stubPref);
                         break;
+                    case "--stub-name":
+                        stubName = args[++i];
+                        break;
                     case "--iterations":
                         int.TryParse(args[++i], out iterations);
                         break;
@@ -135,12 +164,12 @@ namespace WinAppLocker.Packer
 
             if (string.IsNullOrEmpty(inputPath) || string.IsNullOrEmpty(outputPath) || string.IsNullOrEmpty(password))
             {
-                Console.Error.WriteLine("用法: WinAppLocker.exe --pack -i input.exe -o output.exe -p password [--stub Auto|Gui|Console|Test]");
+                Console.Error.WriteLine("用法: WinAppLocker.exe --pack -i input.exe -o output.exe -p password [--stub Auto|Gui|Console|Test] [--stub-name <name>]");
                 return 2;
             }
 
             // --stub Test 警告：测试 stub 内置密码 test1234，必须用相同密码打包
-            if (stubPref == StubKind.Test && password != "test1234")
+            if (stubPref == StubPreference.Test && string.IsNullOrEmpty(stubName) && password != "test1234")
             {
                 Console.Error.WriteLine("[警告] --stub Test 使用内置密码 test1234，但你提供了不同的密码。");
                 Console.Error.WriteLine("[警告] 加密后的 EXE 将无法解密。请使用 -p test1234 配合 --stub Test。");
@@ -153,6 +182,7 @@ namespace WinAppLocker.Packer
                 OutputPath = outputPath,
                 Password = password,
                 StubPreference = stubPref,
+                PreferStubName = stubName,
                 KdfIterations = iterations
             };
 
@@ -165,10 +195,7 @@ namespace WinAppLocker.Packer
                 Console.WriteLine();
                 Console.WriteLine($"✓ 加密成功: {report.InputSize} bytes → {report.OutputSize} bytes");
                 Console.WriteLine($"  输出: {report.OutputPath}");
-                if (stubPref == StubKind.Test)
-                {
-                    Console.WriteLine($"  [测试] 使用 stub_test（内置密码），运行时无需输入密码");
-                }
+                Console.WriteLine($"  使用 stub: {report.UsedStubName} ({report.UsedKind})");
                 return 0;
             }
             catch (Exception ex)
@@ -176,6 +203,29 @@ namespace WinAppLocker.Packer
                 Console.Error.WriteLine($"✗ 失败: {ex.Message}");
                 return 3;
             }
+        }
+
+        /// <summary>--list-stubs：扫描 stub/ 目录并列出所有 stub manifest</summary>
+        private static int ListStubs()
+        {
+            string stubDir = StubLoader.FindStubDir();
+            Console.WriteLine($"stub 目录: {stubDir}");
+            var stubs = StubRegistry.LoadAll(stubDir);
+            if (stubs.Count == 0)
+            {
+                Console.WriteLine("  (无可用 stub，请先运行 build.ps1 生成 stub/)");
+                return 0;
+            }
+            Console.WriteLine($"共 {stubs.Count} 个 stub:");
+            foreach (var s in stubs)
+            {
+                string status = s.IsAvailable ? "OK" : $"缺失({string.Join(",", s.MissingComponents)})";
+                Console.WriteLine($"  - {s.Name,-20} kind={s.KindStr,-15} subsystem={s.SubsystemStr,-8} version={s.Version ?? "?"} [{status}]");
+                Console.WriteLine($"    desc: {s.Description}");
+                if (s.SupportedMachines != null && s.SupportedMachines.Count > 0)
+                    Console.WriteLine($"    arch: {string.Join(", ", s.SupportedMachines)}");
+            }
+            return 0;
         }
     }
 }

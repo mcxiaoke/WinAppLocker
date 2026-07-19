@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using WinAppLocker.Shared;
 
@@ -9,7 +10,10 @@ namespace WinAppLocker.Packer
         public string InputPath;
         public string OutputPath;
         public string Password;
-        public StubKind StubPreference = StubKind.Auto;
+        /// <summary>旧字段：子系统偏好（Auto/Gui/Console/Test），保留向后兼容</summary>
+        public StubPreference StubPreference = StubPreference.Auto;
+        /// <summary>新字段：指定 stub manifest name（如 "winlock"、"applocker-gui"）。优先级高于 StubPreference</summary>
+        public string PreferStubName = null;
         public int KdfIterations = PayloadFormat.DefaultKdfIterations;
     }
 
@@ -18,18 +22,19 @@ namespace WinAppLocker.Packer
         public long InputSize;
         public long OutputSize;
         public string OutputPath;
+        /// <summary>实际使用的 stub 名称（用于日志）</summary>
+        public string UsedStubName;
+        /// <summary>实际使用的加壳方案</summary>
+        public StubKind UsedKind;
     }
 
     /// <summary>
     /// packer 主流程：
     ///   1. 读取原 EXE
     ///   2. PE 解析
-    ///   3. 选择 stub
-    ///   4. 生成 salt / nonce
-    ///   5. KDF 派生密钥
-    ///   6. AES-CBC+HMAC 加密
-    ///   7. 组装 payload
-    ///   8. 写入 stub -> UpdateResource 复制图标 -> 追加 payload
+    ///   3. 扫描 stub 目录，按偏好选 stub
+    ///   4a. tempfile 模式：生成 salt/nonce → KDF → AES-CBC+HMAC → 组装 payload → 写入 stub + 追加 payload
+    ///   4b. WinLock 模式：调用 winlock_builder.exe 做 in-place 加壳 → 复制图标
     /// </summary>
     internal static class PackCore
     {
@@ -51,8 +56,158 @@ namespace WinAppLocker.Packer
             // .NET EXE 也支持（payload 不区分），只是 stub 启动它作为子进程即可
             progress?.Report(25);
 
-            // 3. 选择 stub
-            byte[] stubBytes = StubLoader.SelectStub(peInfo.Subsystem, opts.StubPreference);
+            // 3. 扫描 stub 目录，选 stub
+            string stubDir = StubLoader.FindStubDir();
+            var allStubs = StubRegistry.LoadAll(stubDir);
+            var originalSubsystem = MapSubsystem(peInfo.Subsystem);
+
+            // 选 stub：优先用户指定的 PreferStubName
+            StubManifest selected = null;
+            if (!string.IsNullOrEmpty(opts.PreferStubName))
+            {
+                selected = StubRegistry.Select(allStubs, originalSubsystem, peInfo.Machine, opts.PreferStubName);
+                if (selected == null)
+                {
+                    throw new InvalidOperationException(
+                        $"找不到指定的 stub: {opts.PreferStubName}（可能缺失文件或不支持该架构）");
+                }
+            }
+
+            // 如果没有指定 PreferStubName，按旧的 StubPreference 走（向后兼容）
+            if (selected == null)
+            {
+                selected = SelectByLegacyPreference(allStubs, opts.StubPreference, originalSubsystem, peInfo.Machine);
+            }
+
+            // 兜底：按子系统自动选
+            if (selected == null)
+            {
+                selected = StubRegistry.Select(allStubs, originalSubsystem, peInfo.Machine);
+            }
+
+            if (selected == null || !selected.IsAvailable)
+            {
+                throw new InvalidOperationException(
+                    $"没有可用的 stub。请检查 stub/ 目录: {stubDir}\n" +
+                    $"可用 stub 数量: {allStubs.Count}");
+            }
+
+            logger?.Invoke($"[packer] 使用 stub: {selected.Name} ({selected.Kind}/{selected.Subsystem})");
+            progress?.Report(30);
+
+            // 4. 分支：按 stub kind 走不同路径
+            PackReport report;
+            if (selected.Kind == StubKind.InplaceBuilder)
+            {
+                // WinLock 模式：不能加壳 .NET CLR 托管 PE
+                if (peInfo.IsDotNet)
+                    throw new InvalidOperationException("WinLock 模式不支持 .NET CLR 托管 PE，请改用临时文件模式");
+                // WinLock 模式：当前仅支持 GUI 程序
+                if (originalSubsystem != StubSubsystem.Gui)
+                    throw new InvalidOperationException(
+                        "WinLock 模式当前仅支持 GUI 程序（Console 程序请改用 AppLocker Console 模式）");
+
+                report = PackWithWinLock(selected, opts, progress, logger);
+            }
+            else
+            {
+                report = PackWithTempfile(selected, original, peInfo, opts, progress, logger);
+            }
+            return report;
+        }
+
+        /// <summary>WinLock 加壳分支：调用 builder.exe 做 in-place 加壳</summary>
+        private static PackReport PackWithWinLock(
+            StubManifest stub,
+            PackOptions opts,
+            IProgress<int> progress,
+            Action<string> logger)
+        {
+            logger?.Invoke($"[WinLock] 使用 {stub.Name} 加壳...");
+
+            // WinLock builder 不能原地覆盖输入文件，需要先复制到临时文件
+            string tempInput = Path.Combine(Path.GetTempPath(),
+                $"winlock_in_{Guid.NewGuid():N}.exe");
+            string tempOutput = Path.Combine(Path.GetTempPath(),
+                $"winlock_out_{Guid.NewGuid():N}.exe");
+            try
+            {
+                File.Copy(opts.InputPath, tempInput, true);
+
+                string builderExe = stub.MainFilePath;
+                string stubDir = stub.StubDir;
+
+                // 测试模式判断：当用户选 StubPreference.Test 或 PreferStubName="applocker-test" 时
+                // 但 WinLock 不使用 stub_test.exe，这里 test mode 由 builder 的 -t 参数控制
+                // 暂不自动启用 test mode，由用户显式调用 builder
+                bool testMode = false;
+
+                var result = WinLockPacker.Pack(
+                    builderExe, stubDir, tempInput, tempOutput, opts.Password, testMode);
+
+                // 输出 builder 日志（每行加前缀）
+                if (!string.IsNullOrEmpty(result.Stdout))
+                    foreach (var line in result.Stdout.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            logger?.Invoke($"[WinLock] {line}");
+                if (!string.IsNullOrEmpty(result.Stderr))
+                    foreach (var line in result.Stderr.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+                        if (!string.IsNullOrWhiteSpace(line))
+                            logger?.Invoke($"[WinLock] [stderr] {line}");
+
+                if (!result.Success)
+                    throw new Exception(
+                        $"WinLock builder 失败 (exit={result.ExitCode})\n" +
+                        $"stdout: {result.Stdout}\nstderr: {result.Stderr}");
+
+                // 把输出复制到目标路径
+                string outDir = Path.GetDirectoryName(Path.GetFullPath(opts.OutputPath));
+                if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+                File.Copy(tempOutput, opts.OutputPath, true);
+
+                // 注意：WinLock 模式下不调用 IconCopier！
+                // WinLock 加壳时原 PE 的 .rsrc 节被完整保留（图标已在），
+                // 此时再调用 UpdateResourceW 会重新布局资源段，可能改变 .lock 节的
+                // RawOffset 或破坏 stub 内的绝对地址引用，导致 stub 运行时崩溃。
+                // tempfile 模式才需要 IconCopier（因为 stub 是另一个 exe，没原 PE 图标）。
+
+                progress?.Report(100);
+                return new PackReport
+                {
+                    InputSize = new FileInfo(opts.InputPath).Length,
+                    OutputSize = new FileInfo(opts.OutputPath).Length,
+                    OutputPath = opts.OutputPath,
+                    UsedStubName = stub.Name,
+                    UsedKind = StubKind.InplaceBuilder,
+                };
+            }
+            finally
+            {
+                try { File.Delete(tempInput); } catch { }
+                try { File.Delete(tempOutput); } catch { }
+            }
+        }
+
+        /// <summary>临时文件加壳分支：原 PackCore.Pack 逻辑</summary>
+        private static PackReport PackWithTempfile(
+            StubManifest stub,
+            byte[] original,
+            PeInfo peInfo,
+            PackOptions opts,
+            IProgress<int> progress,
+            Action<string> logger)
+        {
+            // 从 stub/ 目录或嵌入资源读 stub 字节
+            byte[] stubBytes;
+            if (stub.StubDir != null && File.Exists(stub.MainFilePath))
+            {
+                stubBytes = File.ReadAllBytes(stub.MainFilePath);
+            }
+            else
+            {
+                // 兜底：用旧的 StubLoader（嵌入资源）
+                stubBytes = StubLoader.SelectStub(peInfo.Subsystem, opts.StubPreference);
+            }
             progress?.Report(30);
 
             // 4. 生成 salt / nonce
@@ -116,8 +271,53 @@ namespace WinAppLocker.Packer
             {
                 InputSize = original.Length,
                 OutputSize = new FileInfo(opts.OutputPath).Length,
-                OutputPath = opts.OutputPath
+                OutputPath = opts.OutputPath,
+                UsedStubName = stub.Name,
+                UsedKind = StubKind.Tempfile,
             };
+        }
+
+        /// <summary>PE 子系统数值映射到 StubSubsystem 枚举</summary>
+        private static StubSubsystem MapSubsystem(ushort raw)
+        {
+            // IMAGE_SUBSYSTEM_WINDOWS_GUI = 2, IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
+            return raw == 2 ? StubSubsystem.Gui : StubSubsystem.Console;
+        }
+
+        /// <summary>
+        /// 旧的 StubPreference（Auto/Gui/Console/Test）映射到 stub manifest。
+        /// 优先 tempfile 模式（兼容性更好）。
+        /// </summary>
+        private static StubManifest SelectByLegacyPreference(
+            List<StubManifest> all,
+            StubPreference pref,
+            StubSubsystem originalSubsystem,
+            ushort machine)
+        {
+            if (all == null || all.Count == 0) return null;
+
+            // Auto：按子系统自动选（tempfile 优先）
+            if (pref == StubPreference.Auto)
+            {
+                var wantSubsystem = originalSubsystem == StubSubsystem.Console
+                    ? StubSubsystem.Console
+                    : StubSubsystem.Gui;
+                return all.Find(m =>
+                    m.IsAvailable &&
+                    m.Kind == StubKind.Tempfile &&
+                    m.Subsystem == wantSubsystem &&
+                    m.SupportsMachine(machine));
+            }
+
+            // Gui/Console/Test：按对应子系统选
+            StubSubsystem wantSub = pref == StubPreference.Gui ? StubSubsystem.Gui
+                : pref == StubPreference.Console ? StubSubsystem.Console
+                : StubSubsystem.Test;
+            return all.Find(m =>
+                m.IsAvailable &&
+                m.Kind == StubKind.Tempfile &&
+                m.Subsystem == wantSub &&
+                m.SupportsMachine(machine));
         }
     }
 }
