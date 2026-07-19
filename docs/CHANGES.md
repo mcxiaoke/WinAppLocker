@@ -1,5 +1,26 @@
 # 变更记录
 
+## 变更记录 2026-07-19 新增 PE 加壳方案技术对比文档
+
+新增 `packer/docs/PACKER_TECHNIQUES.md`（约 400 行），系统对比主流 PE 加壳方案的原理、优缺点、适用场景，并给出本项目的选型决策与演进路线。
+
+**文档结构**：
+1. 加壳方案分类（OS Loader 加载 / 手动加载 / 环境模拟 三大流派）
+2. 已实现方案详解（Tempfile / Inplace / Reflective）
+3. 未实现的成熟方案（Process Hollowing / RunPE / VFS / Shellcode / AppInit_DLLs / .NET 加壳 / 代码虚拟化）
+4. 横向对比表（10 个方案 × 9 个维度）
+5. 本项目选型决策（为什么选这三种、为什么不选其他）
+6. 演进路线（短期 v1→v2 加密 / 中期资源保留反 dump / 长期 VFS）
+7. 已知限制与兼容性矩阵
+8. 参考资料索引
+
+**关键结论**：
+- 已实现的三种方案（Tempfile / Inplace / Reflective）覆盖了 native PE 保护的主要场景
+- Process Hollowing / RunPE 被杀软重点监控，与"合法 EXE 保护"目标冲突，不推荐
+- VFS 是解决 Chrome/Electron 类程序的长期方案，但工作量极大
+- .NET 加壳技术栈不同，引导用户用 ConfuserEx 等专用工具
+- 短期最值得做的是 Reflective 加密版（v1 明文 → v2 AES + 密码弹框）
+
 ## 变更记录 2026-07-19 dotnet packer 检测 Chromium 系浏览器并禁用加壳按钮
 
 **问题**：Chrome / Edge / Doubao 等 Chromium 系浏览器不适合反射式加壳（依赖版本化子目录 DLL，浏览器有自己的 DLL 加载逻辑）。之前用户选这些程序加壳后会 crash，没有任何提示。
