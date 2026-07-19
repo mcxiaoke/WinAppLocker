@@ -1,5 +1,58 @@
 # 变更记录
 
+## 变更记录 2026-07-19 reflective loader 修复 x86 TLS 重定位 + 设置 DLL 搜索路径
+
+**修复 1：x86 TLS 重定位导致 FreeFileSync 崩溃**
+
+**问题**：FreeFileSync (x86) 反射式加载后，`init_tls_data` 计算 `raw_rva` 错误，`memcpy` 读到未映射内存触发 ACCESS_VIOLATION。
+
+**根因**：
+- `init_tls_data` 用 `preferred_base` 计算 `raw_rva`：`raw_rva = tls->StartAddressOfRawData - preferred_base`
+- 但 `apply_relocations` 已在 `init_tls_data` 之前执行，TLS 目录的 VA 字段（`StartAddressOfRawData`/`EndAddressOfRawData`/`AddressOfIndex`）已被 HIGHLOW 重定位修复
+- x86 FreeFileSync 的 `StartAddressOfRawData` 从 `0x447fec`（preferred_base + RVA）变成 `0x6f7fec`（new_img + RVA，delta=0x2b0000）
+- `raw_rva = 0x6f7fec - 0x400000 = 0x2f7fec`（错误，应该是 `0x47fec`）
+- `img + raw_rva = 0x6b0000 + 0x2f7fec = 0x9a7fec` 远超 SizeOfImage（0xb0000），读到未映射内存 crash
+
+**修复**（`packer/reflective/loader.c/init_tls_data`）：
+- 判断 `StartAddressOfRawData` 是否在 `[img, img+SizeOfImage]` 范围内
+  - 是：说明已被重定位，用 `img` 作为 base 算 RVA
+  - 否：说明未重定位，用 `preferred_base` 作为 base 算 RVA
+- `AddressOfIndex` 同样用 `base_for_rva` 算 RVA
+- 新增 `tls_relocated` 标志和 `base_for_rva` 变量，日志显示判断结果
+
+**测试**：FreeFileSync (x86) 之前 ACCESS_VIOLATION 崩溃，现在 `tls: start_va=0x727fec base_for_rva=0x6e0000 (relocated=1) raw_rva=0x47fec`，GUI 正常启动。
+
+---
+
+**修复 2：DLL 搜索路径导致 Chrome/Doubao 找不到同目录 DLL**
+
+**问题**：Chrome 反射式加载后 `LoadLibraryA(chrome_elf.dll) failed err=126`，Doubao 类似。
+
+**根因**：stub EXE 可能在不同目录（如 `temp/reflective_tests/`），`LoadLibraryA` 默认用 stub 当前目录搜索，找不到原 PE 目录下的 DLL（如 `chrome_elf.dll`）。
+
+**修复**（`packer/reflective/loader.c/map_image` 步骤 4.55）：
+- 在 IAT 处理之前，`GetModuleFileNameW(NULL)` 拿到 stub EXE 路径
+- 提取目录部分，`SetCurrentDirectoryW` + `SetDllDirectoryW` 设置为 stub EXE 所在目录
+- 前提：用户把加壳后 EXE 放在原程序目录（常见做法）
+
+**效果**：Doubao 的 `doubao_elf.dll` 现在能成功加载（之前 err=126）。Chrome 的 `chrome_elf.dll` 在版本子目录（`145.0.7632.68\`），仍找不到（Chrome 自身有特殊 DLL 加载逻辑，反射式 loader 无法自动处理）。
+
+---
+
+**已知限制**：Chrome/Doubao 等浏览器程序不适合反射式加壳
+- Chrome 的 `chrome_elf.dll` 在版本化子目录（如 `145.0.7632.68\`），Chrome 原版 EXE 有特殊逻辑加载子目录 DLL
+- Doubao 的 actctx 失败（err=14001 SXS_ASSEMBLY_NOT_FOUND），manifest 引用的 SxS 程序集找不到，OEP 后崩溃
+- 这类浏览器程序有自己的 DLL 加载和 SxS 逻辑，反射式 loader 无法完全模拟 OS loader 行为
+- 建议这类程序使用临时文件模式（Tempfile），让 OS loader 完整加载
+
+---
+
+**回归测试**（`temp/retest_all.py`）：所有之前通过的程序无回归
+- FreeFileSync: ✅ 修复（之前崩，现在 GUI up）
+- FastCopy / BCompare / CC-Switch: ✅ 仍正常
+- Bandizip: ✅ exit=10
+- AutoHotkey32 (x86): ❌ 仍 x86 SEH 问题（与本次修复无关）
+
 ## 变更记录 2026-07-19 dotnet packer GUI：WinLock/Reflective 不兼容时红字提示 + 禁用按钮
 
 **问题**：WinLock (InplaceBuilder) 不支持 .NET 程序和 Console 程序，Reflective 不支持 .NET 程序。之前只有用户点"执行加密"后才在 `PackCore.Pack` 里抛异常报错，体验差。`MainForm.WarnIfIncompatible` 虽然有检测但只对 WinLock 弹 MessageBox，没覆盖 Reflective，也没禁用按钮。

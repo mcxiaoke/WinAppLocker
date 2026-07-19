@@ -902,12 +902,44 @@ static int init_tls_data(uint8_t* img, uint64_t preferred_base) {
 
     IMAGE_TLS_DIRECTORY_X* tls = (IMAGE_TLS_DIRECTORY_X*)(img + dir->VirtualAddress);
 
-    /* TLS 目录里的地址是 VA（绝对地址），转成 RVA 后用 img+RVA 访问 */
-    uint32_t raw_rva = (uint32_t)(tls->StartAddressOfRawData - preferred_base);
-    SIZE_T raw_size = (SIZE_T)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+    /* TLS 目录里的地址是 VA（绝对地址），转成 RVA 后用 img+RVA 访问
+     *
+     * 注意：apply_relocations 已经在前面执行，TLS 目录里的 VA 字段
+     *      （StartAddressOfRawData/EndAddressOfRawData/AddressOfIndex/AddressOfCallBacks）
+     *      可能已被重定位修复，值变成 img + RVA。
+     *
+     * 兼容两种情况：
+     *   - 已重定位：StartAddressOfRawData = img + RVA，所以 raw_rva = StartAddressOfRawData - img
+     *   - 未重定位：StartAddressOfRawData = preferred_base + RVA，所以 raw_rva = StartAddressOfRawData - preferred_base
+     *
+     * 判断方法：如果 StartAddressOfRawData 在 [img, img+SizeOfImage] 范围内，
+     *          说明已被重定位，用 img 算；否则用 preferred_base 算。
+     *
+     * 实测 x86 FreeFileSync 的 TLS 字段会被 HIGHLOW 重定位修复（delta=0x2b0000），
+     * 导致 raw_rva 计算错误（0x2f7fec 而非 0x47fec），memcpy 读到未映射内存 crash。 */
+    uint64_t img_base = (uint64_t)(uintptr_t)img;
+    uint64_t img_end = img_base + nt->OptionalHeader.SizeOfImage;
+    uint64_t start_va, end_va, idx_va;
+#ifdef _WIN64
+    start_va = tls->StartAddressOfRawData;
+    end_va   = tls->EndAddressOfRawData;
+    idx_va   = tls->AddressOfIndex;
+#else
+    start_va = (uint64_t)tls->StartAddressOfRawData;
+    end_va   = (uint64_t)tls->EndAddressOfRawData;
+    idx_va   = (uint64_t)tls->AddressOfIndex;
+#endif
+
+    /* 判断 TLS VA 字段是否已被重定位修复 */
+    int tls_relocated = (start_va >= img_base && start_va < img_end);
+    uint64_t base_for_rva = tls_relocated ? img_base : preferred_base;
+
+    uint32_t raw_rva = (uint32_t)(start_va - base_for_rva);
+    SIZE_T raw_size = (SIZE_T)(end_va - start_va);
     SIZE_T total_size = raw_size + tls->SizeOfZeroFill;
 
-    DBG("tls: raw_rva=0x%x raw_size=%zu zero_fill=%lu total=%zu\n",
+    DBG("tls: start_va=0x%llx base_for_rva=0x%llx (relocated=%d) raw_rva=0x%x raw_size=%zu zero_fill=%lu total=%zu\n",
+        (unsigned long long)start_va, (unsigned long long)base_for_rva, tls_relocated,
         raw_rva, raw_size, tls->SizeOfZeroFill, total_size);
 
     /* 分配 TLS 数据块（VirtualAlloc 自动清零，满足 SizeOfZeroFill） */
@@ -942,10 +974,13 @@ static int init_tls_data(uint8_t* img, uint64_t preferred_base) {
     }
 
     /* 确保 AddressOfIndex = 0（和代码内联的 __tls_index 一致）
-     * 某些 CRT 代码会读此值确认 TLS 已初始化 */
-    if (tls->AddressOfIndex) {
-        uint32_t* index_ptr = (uint32_t*)(img + (tls->AddressOfIndex - preferred_base));
-        DBG("tls: AddressOfIndex at %p, old=%u -> 0\n", index_ptr, *index_ptr);
+     * 某些 CRT 代码会读此值确认 TLS 已初始化
+     * AddressOfIndex 同样可能被重定位，用 base_for_rva 算 RVA */
+    if (idx_va) {
+        uint32_t idx_rva = (uint32_t)(idx_va - base_for_rva);
+        uint32_t* index_ptr = (uint32_t*)(img + idx_rva);
+        DBG("tls: AddressOfIndex at %p (rva=0x%x), old=%u -> 0\n",
+            index_ptr, idx_rva, *index_ptr);
         *index_ptr = 0;
     }
 
@@ -1300,6 +1335,34 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
      *      需要 OS 识别，覆写主 EXE 条目是安全的。 */
     update_peb_image_base(new_img);
     patch_peb_ldr_main_entry(new_img);
+
+    /* 4.55 设置 DLL 搜索路径 + 当前目录为 stub EXE 所在目录
+     *
+     * 背景：Chrome/Doubao 等程序依赖同目录下的 DLL（chrome_elf.dll/doubao_elf.dll）。
+     * 但 stub EXE 可能在不同目录（如 temp/reflective_tests/），LoadLibraryA 默认
+     * 用 stub 当前目录搜索，找不到原 PE 目录下的 DLL，报 ERROR_MOD_NOT_FOUND (126)。
+     *
+     * 方案：把当前目录和 DLL 搜索路径都设为 stub EXE 所在目录。
+     * 前提：用户把加壳后 EXE 放在原程序目录（常见做法，否则外部 DLL 也找不到）。
+     *
+     * SetCurrentDirectoryW：影响 LoadLibrary 的"当前目录"搜索路径
+     * SetDllDirectoryW：额外添加一个搜索路径（不影响后续 SetCurrentDirectory） */
+    {
+        wchar_t stub_path_w[MAX_PATH];
+        DWORD n = GetModuleFileNameW(NULL, stub_path_w, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            /* 提取目录部分（去掉文件名） */
+            for (DWORD i = n; i > 0; i--) {
+                if (stub_path_w[i-1] == L'\\' || stub_path_w[i-1] == L'/') {
+                    stub_path_w[i-1] = 0;
+                    break;
+                }
+            }
+            SetCurrentDirectoryW(stub_path_w);
+            SetDllDirectoryW(stub_path_w);
+            DBG("map: set current dir + dll dir to stub EXE directory: %ls\n", stub_path_w);
+        }
+    }
 
     /* 4.6 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
      * 必须在 IAT 处理之前激活，LoadLibraryA("comctl32.dll") 才能走 SxS 找到 v6
