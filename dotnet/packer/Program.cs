@@ -117,6 +117,8 @@ namespace WinAppLocker.Packer
             Console.WriteLine("                            用 --list-stubs 查看可用 stub");
             Console.WriteLine("      --list-stubs          列出 stub/ 目录下所有可用 stub");
             Console.WriteLine("      --iterations <N>      PBKDF2 迭代次数（默认 200000）");
+            Console.WriteLine("      --test                WinLock 测试模式：builder 用 -t，stub 跳过密码弹框");
+            Console.WriteLine("                            用硬编码密码 test123 解密（仅 --stub-name winlock 有效）");
         }
 
         private static int RunCliPack(string[] args)
@@ -127,6 +129,8 @@ namespace WinAppLocker.Packer
             var stubPref = StubPreference.Auto;
             string stubName = null;
             int iterations = PayloadFormat.DefaultKdfIterations;
+            // WinLock 测试模式：--test 传给 builder -t，stub 跳过弹框用硬编码 test123 解密
+            bool winLockTestMode = false;
 
             // --list-stubs 提前处理：列出 stub/ 目录所有可用 stub 后退出
             bool listStubs = false;
@@ -168,6 +172,10 @@ namespace WinAppLocker.Packer
                     case "--iterations":
                         int.TryParse(args[++i], out iterations);
                         break;
+                    case "--test":
+                        // WinLock 测试模式：builder 用 -t，stub 跳过弹框，密码硬编码为 test123
+                        winLockTestMode = true;
+                        break;
                     case "-h":
                     case "--help":
                         PrintHelp();
@@ -177,7 +185,7 @@ namespace WinAppLocker.Packer
 
             if (string.IsNullOrEmpty(inputPath) || string.IsNullOrEmpty(outputPath) || string.IsNullOrEmpty(password))
             {
-                Console.Error.WriteLine("用法: WinAppLocker.exe --pack -i input.exe -o output.exe -p password [--stub Auto|Gui|Console|Test] [--stub-name <name>]");
+                Console.Error.WriteLine("用法: WinAppLocker.exe --pack -i input.exe -o output.exe -p password [--stub Auto|Gui|Console|Test] [--stub-name <name>] [--test]");
                 return 2;
             }
 
@@ -189,6 +197,14 @@ namespace WinAppLocker.Packer
                 Console.Error.WriteLine("[警告] 继续加密（按 Ctrl+C 中止）...");
             }
 
+            // --test 警告：WinLock 测试模式密码硬编码为 test123，-p 会被 builder 忽略
+            if (winLockTestMode && password != "test123")
+            {
+                Console.Error.WriteLine($"[警告] --test 模式 WinLock builder 用硬编码密码 test123，你提供的 -p {password} 会被忽略。");
+                Console.Error.WriteLine($"[警告] 加密后的 EXE 仅能用密码 test123 解密。");
+                Console.Error.WriteLine("[警告] 继续加密（按 Ctrl+C 中止）...");
+            }
+
             var opts = new PackOptions
             {
                 InputPath = inputPath,
@@ -196,7 +212,8 @@ namespace WinAppLocker.Packer
                 Password = password,
                 StubPreference = stubPref,
                 PreferStubName = stubName,
-                KdfIterations = iterations
+                KdfIterations = iterations,
+                WinLockTestMode = winLockTestMode
             };
 
             try

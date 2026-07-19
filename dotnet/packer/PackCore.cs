@@ -15,6 +15,11 @@ namespace WinAppLocker.Packer
         /// <summary>新字段：指定 stub manifest name（如 "winlock"、"applocker-gui"）。优先级高于 StubPreference</summary>
         public string PreferStubName = null;
         public int KdfIterations = PayloadFormat.DefaultKdfIterations;
+        /// <summary>
+        /// WinLock 测试模式：传给 builder 的 -t 参数，stub 跳过密码弹框，用硬编码 "test123" 解密。
+        /// 用于 CI/自动化测试（auto_test.ps1 -WinLock）。密码 -p 会被 builder 忽略。
+        /// </summary>
+        public bool WinLockTestMode = false;
     }
 
     public sealed class PackReport
@@ -137,13 +142,10 @@ namespace WinAppLocker.Packer
                 string builderExe = stub.MainFilePath;
                 string stubDir = stub.StubDir;
 
-                // 测试模式判断：当用户选 StubPreference.Test 或 PreferStubName="applocker-test" 时
-                // 但 WinLock 不使用 stub_test.exe，这里 test mode 由 builder 的 -t 参数控制
-                // 暂不自动启用 test mode，由用户显式调用 builder
-                bool testMode = false;
-
+                // WinLock 测试模式：由 PackOptions.WinLockTestMode 显式控制（CLI --test 开关）
+                // 启用后 builder 用 -t 参数，stub 跳过密码弹框，用硬编码 "test123" 解密
                 var result = WinLockPacker.Pack(
-                    builderExe, stubDir, tempInput, tempOutput, opts.Password, testMode);
+                    builderExe, stubDir, tempInput, tempOutput, opts.Password, opts.WinLockTestMode);
 
                 // 输出 builder 日志（每行加前缀）
                 if (!string.IsNullOrEmpty(result.Stdout))

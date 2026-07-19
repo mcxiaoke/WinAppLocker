@@ -1,129 +1,46 @@
 # WinAppLocker (.NET)
 
-一个把 EXE 加密码保护的工具：用密码（PBKDF2 派生密钥）对原程序进行 AES-256-CBC + HMAC-SHA256
-加密，打包进一个带密码输入框的"壳"程序（stub）。运行时输入正确密码，壳程序在内存解密并启动
-原程序（以隐藏临时文件方式运行，退出后自动删除）。
+WinAppLocker 主项目，提供 GUI / CLI 两种界面，把 EXE 加密码保护后输出新的 EXE。
 
-**1.0.0** 新增 **WinLock 模式**（in-place 加壳）：原 EXE 被原地修改，stub 嵌入 `.lock` 节，
-运行时在内存中解密 `.text` 节，**不释放任何临时文件**，单文件运行。详见下文"WinLock 模式"。
+完整的项目介绍、构建/测试/使用流程见根目录 [../README.md](../README.md)，本文档仅描述 dotnet 子项目本身。
 
-当前版本：**1.0.0**
+## 项目组成
 
----
+| 项目 | 输出 | 角色 |
+|------|------|------|
+| `shared/` | WinAppLocker.Shared.dll | 共享库（ByteSearch / Crc32 / PayloadFormat） |
+| `stub/` | stub_gui.exe | GUI 模式 stub（WinForms 密码框，临时文件模式） |
+| `stub.console/` | stub_console.exe | Console 模式 stub（stdin 密码输入，临时文件模式） |
+| `stub.test/` | stub_test.exe | 测试 stub（内置密码 test1234，跳过输入 UI） |
+| `packer/` | WinAppLocker.exe | packer 主程序（GUI + CLI，含 stub 注册表与加壳流程） |
 
-## 功能特性
+`packer/stub/` 是构建时汇集的所有 stub 文件目录（dotnet stub + WinLock builder/bin + `.meta.json` 清单），csproj 自动拷贝到输出目录。
 
-- **密码保护**：对 EXE 进行强加密，无正确密码无法运行。
-- **算法**：
-  - 临时文件模式：PBKDF2-HMAC-SHA256（默认 20 万次迭代）+ AES-256-CBC + HMAC-SHA256
-  - WinLock 模式：SHA-256(password+salt) 校验 + XTEA 加密 `.text` 节
-- **自动适配**：根据原 EXE 子系统（GUI / 控制台）自动选择对应 stub，也可手动指定。
-- **图标继承**：打包后保留原程序的主图标和版本信息（仅临时文件模式）。
-- **跨类型支持**：原生 EXE 与 .NET EXE 均支持（临时文件模式）；WinLock 模式仅原生 EXE。
-- **两种加壳方案**：
-  - **临时文件模式**（`applocker-gui` / `applocker-console` / `applocker-test`）：
-    原 EXE 作为 payload 附加在 stub 后，运行时释放隐藏临时文件并启动，退出后删除。
-  - **WinLock in-place 模式**（`winlock`）：
-    原 EXE 被原地修改，新增 `.lock` 节嵌入 stub，`.text` 节被 XTEA 加密；
-    运行时 stub 在内存中解密 `.text`，不释放任何文件，单文件独立运行。
-- **自检命令**：`--info` 可解析已加密 EXE 的头部/尾部/扩展元数据并校验完整性。
-- **stub 清单**：`--list-stubs` 列出 `stub/` 目录下所有可用 stub 及其属性。
+## 加壳方案
 
----
+dotnet 主项目支持两种加壳方案，统一通过 `PackOptions.PreferStubName` 或 `--stub` / `--stub-name` 参数选择：
 
-## 使用方法
+### 临时文件模式（`applocker-*` stub）
 
-### 1. 构建
+- 原 EXE 作为加密 payload 附加在 stub 后
+- 算法：PBKDF2-HMAC-SHA256（默认 20 万次迭代）+ AES-256-CBC + HMAC-SHA256
+- 运行时 stub 在内存解密，释放隐藏临时文件并启动，原程序退出后删除
+- 兼容性最高：支持任意架构、.NET / 原生 / Console 程序
+- 图标继承：打包后保留原程序的主图标和版本信息
 
-```powershell
-# Debug 构建（产物在 packer/bin/Debug，含 stub/ 子目录）
-.\build.ps1
+### WinLock in-place 模式（`winlock` stub）
 
-# Release 构建，输出 dist/WinAppLocker.exe + dist/stub/
-.\build.ps1 -Release
+- 原 EXE 被原地修改，新增 `.lock` 节嵌入 stub，加密 `.text` 节
+- 算法：SHA-256(password+salt) 校验 + XTEA 加密
+- 运行时 stub 在内存解密 `.text`，不释放任何文件，单文件独立运行
+- 限制：仅原生 GUI EXE（x64/x86），不支持 .NET / Console / DLL
+- 详细工作原理与限制见 [../packer/README.md](../packer/README.md)
 
-# 清理后重建
-.\build.ps1 -Release -Clean
-
-# 跳过 WinLock 编译（仅 dotnet 部分，调试用）
-.\build.ps1 -SkipWinLock
-```
-
-构建顺序：
-1. 编译三个 dotnet stub（GUI / 控制台 / 测试）→ `stub/bin/<Config>/stub_*.exe`
-2. 编译 WinLock（`packer/` 子目录的 C + 内联汇编项目，用 w64devkit + msys2 mingw32）
-   → `packer/builder/builder.exe` + `packer/stub/stub_x{64,86}.bin`
-3. 汇集所有 stub 到 `packer/stub/`（dotnet stub exe + WinLock builder/bin + 4 个 `.meta.json`）
-4. 编译 packer（Costura 嵌入依赖 DLL，csproj 自动把 `packer/stub/` 拷到输出目录）
-
-> **依赖**：WinLock 编译需要 `w64devkit` 和 `msys2 mingw32` 工具链，默认路径
-> `C:\Home\Develop\w64devkit` 和 `C:\Home\Develop\msys64`。若未安装，加 `-SkipWinLock` 跳过。
-
-### 2. 发布格式
-
-Release 构建产物在 `dist/` 目录：
-
-```
-dist/
-├── WinAppLocker.exe              # packer 主程序（Costura 单文件，依赖 DLL 已嵌入）
-├── WinAppLocker.exe.config       # 高 DPI 配置（WinForms 必需外部 config）
-└── stub/                         # 所有 stub 文件（packer 运行时扫描此目录）
-    ├── stub_gui.exe              # AppLocker GUI stub（临时文件模式）
-    ├── stub_gui.exe.meta.json
-    ├── stub_console.exe          # AppLocker Console stub（临时文件模式）
-    ├── stub_console.exe.meta.json
-    ├── stub_test.exe             # AppLocker Test stub（内置密码 test1234，测试用）
-    ├── stub_test.exe.meta.json
-    ├── winlock_builder.exe       # WinLock 加壳器（打包时用，x64 单文件）
-    ├── winlock_builder.exe.meta.json
-    ├── winlock_stub_x64.bin      # WinLock x64 运行时 stub（被 builder 嵌入目标 PE）
-    ├── winlock_stub_x86.bin      # WinLock x86 运行时 stub
-    └── winlock_stub_x86.exe      # x86 stub 完整 PE（builder 读 .reloc 用）
-```
-
-> 自 v1.0.0 起，WinLock 运行时 stub 文件统一加 `winlock_` 前缀避免与其它 stub 混淆。
-> builder.exe 仍向后兼容旧名 `stub_x{64,86}.bin` / `stub_x86.exe`（开发者直接 `make` 产物）。
-
-> **注意**：分发时必须把整个 `dist/` 目录一起分发，不能只拷 `WinAppLocker.exe`。
-> packer 启动时会扫描 `stub/` 目录，找不到 stub 会无法工作。
-
-### 3. 图形界面（GUI）
-
-直接运行 `WinAppLocker.exe`，在窗口中：
-
-1. 选择**输入 EXE**（原程序）和**输出 EXE** 路径。
-2. 输入并确认**密码**（至少 4 个字符）。
-3. **选择 Stub**：下拉框列出所有可用 stub（自动 / applocker-gui / applocker-console /
-   applocker-test / winlock），默认"自动"按子系统选临时文件模式。
-4. 设置迭代次数（默认 200000，仅临时文件模式生效）。
-5. 点击"执行加密操作"。
-
-> 若选 WinLock 但原 EXE 是 Console 或 .NET 程序，会弹出兼容性警告。
-
-### 4. 命令行（CLI）
+## CLI 参数
 
 ```powershell
-# 加密：把 input.exe 加密为 output.exe（默认按子系统自动选 tempfile stub）
-WinAppLocker.exe --pack -i input.exe -o output.exe -p 你的密码
-
-# 指定 stub 偏好（旧的子系统偏好，仅 tempfile 模式）
-WinAppLocker.exe --pack -i input.exe -o output.exe -p 你的密码 --stub Auto --iterations 300000
-
-# 指定 stub manifest 名称（优先级高于 --stub，支持 WinLock）
-WinAppLocker.exe --pack -i input.exe -o output.exe -p 你的密码 --stub-name winlock
-WinAppLocker.exe --pack -i input.exe -o output.exe -p 你的密码 --stub-name applocker-gui
-
-# 列出所有可用 stub
-WinAppLocker.exe --list-stubs
-
-# 查看已加密 EXE 的信息与完整性校验
-WinAppLocker.exe --info output.exe
-
-# 查看版本
-WinAppLocker.exe --version
+WinAppLocker.exe --pack -i <input> -o <output> -p <password> [options]
 ```
-
-#### CLI 参数说明
 
 | 参数 | 说明 |
 |------|------|
@@ -132,53 +49,27 @@ WinAppLocker.exe --version
 | `-o, --output <path>` | 输出 EXE 路径 |
 | `-p, --password <pass>` | 密码（至少 4 字符） |
 | `--stub <Auto\|Gui\|Console\|Test>` | 旧 stub 偏好（按子系统选 tempfile 模式） |
-| `--stub-name <name>` | 指定 stub manifest 名称（如 `winlock` / `applocker-gui`），优先级高于 `--stub` |
+| `--stub-name <name>` | 指定 stub manifest 名称（`winlock` / `applocker-gui` / `applocker-console` / `applocker-test`），优先级高于 `--stub` |
 | `--iterations <N>` | PBKDF2 迭代次数（默认 200000，仅 tempfile 模式） |
+| `--test` | WinLock 测试模式：builder 用 `-t`，stub 跳过密码弹框，密码硬编码为 `test123` |
+| `--pe-info <path>` | 显示 PE 信息（架构、子系统、.NET、ASLR/DEP/CFG 等） |
+| `--info <packed.exe>` | 检查已加密 EXE 的信息与完整性校验 |
 | `--list-stubs` | 列出 `stub/` 目录所有可用 stub |
-| `--info <packed.exe>` | 检查已加密 EXE 的信息 |
 | `--version` | 显示版本 |
-
----
 
 ## Stub 自动选择标准
 
-当用户不显式指定 stub（即 `--stub Auto` 或 GUI 下拉框选"自动"）时，packer 按以下
-顺序在 `stub/` 目录中挑选合适的 stub。**默认总是走临时文件模式**（兼容性最高），
-WinLock 必须用户显式指定（`--stub-name winlock` 或 GUI 下拉框选 winlock）。
+当用户不显式指定 stub（即 `--stub Auto` 或 GUI 下拉框选"自动"）时，packer 按以下顺序在 `stub/` 目录中挑选：
 
-### 选择流程
-
-`StubRegistry.Select(all, originalSubsystem, machine, preferName)` 实现，优先级：
-
-1. **用户指定优先**：若 `preferName` 非空（`--stub-name winlock` / `applocker-gui` 等），
-   且该 stub 满足 `IsAvailable`（主文件 + components 全部存在）和 `SupportsMachine`
-   （架构匹配）→ 直接用。
-2. **按子系统自动匹配**：根据原 EXE 的 `OptionalHeader.Subsystem` 选 tempfile stub：
+1. **用户指定优先**：若 `--stub-name` 非空，且该 stub 满足 `IsAvailable`（主文件 + components 全部存在）和 `SupportsMachine`（架构匹配）→ 直接用
+2. **按子系统自动匹配**：根据原 EXE 的 `OptionalHeader.Subsystem`：
    - `Windows Cui`（Console 程序）→ `applocker-console`
    - `Windows Gui`（GUI 程序）或其他 → `applocker-gui`
-3. **退而求其次**：若上面找不到，返回任意 `IsAvailable && SupportsMachine` 的 stub。
+3. **退而求其次**：返回任意 `IsAvailable && SupportsMachine` 的 stub
 
-### 选择约束
+**WinLock 不会被自动选中**，必须显式指定（`--stub-name winlock` 或 GUI 下拉框选 winlock）。
 
-- **`IsAvailable`**：stub 主文件存在 + `components` 中列出的所有依赖文件（如 WinLock 的
-  `winlock_stub_x64.bin` / `winlock_stub_x86.bin`）都存在。缺失任意一个就跳过该 stub。
-- **`SupportsMachine`**：检查 manifest 的 `supported_machines` 字段：
-  - tempfile stub（`applocker-*`）没填该字段 → 视为支持任意架构（`AnyCPU` 托管 PE）
-  - WinLock manifest 填 `["amd64", "i386"]` → 仅匹配 PE32+ (x64) 或 PE32 (x86) 输入
-  - 不匹配的架构跳过该 stub（例如 ARM64 输入会跳过 WinLock）
-
-### 何时选 WinLock
-
-WinLock **不会被自动选中**，必须显式指定：
-
-```powershell
-# CLI
-WinAppLocker.exe --pack -i input.exe -o output.exe -p 密码 --stub-name winlock
-
-# GUI：下拉框选 "winlock"
-```
-
-若用户选了 WinLock 但输入 PE 不满足条件，packer 会在打包前抛出明确错误：
+WinLock 输入 PE 限制：
 
 | 输入 PE 特征 | WinLock 是否可用 | 原因 |
 |------|------|------|
@@ -188,107 +79,63 @@ WinAppLocker.exe --pack -i input.exe -o output.exe -p 密码 --stub-name winlock
 | ARM64 / ARM | ❌ | `winlock_stub_*.bin` 仅支持 amd64 / i386 |
 | x64 / x86 原生 GUI EXE | ✅ | 正常加壳 |
 
-### 为什么默认走临时文件模式
+## stub 元数据（`.meta.json`）
 
-临时文件模式兼容性极高（等同于原 EXE 直接运行），支持任意架构、.NET / 原生 / Console
-程序。WinLock 是 in-place 加壳，会修改原 PE 结构（新增 `.lock` 节、加密 `.text` 节、
-剥离签名等），有一定兼容性风险（见"WinLock 限制"章节），所以默认不启用，由用户显式选择。
+每个 stub 旁边放一个同名 `.meta.json` 描述其属性，packer 启动时扫描 `stub/` 目录加载所有 manifest：
 
----
+```json
+{
+  "name": "winlock",
+  "kind": "inplace-builder",
+  "subsystem": "gui",
+  "description": "WinLock in-place packer (XTEA + SHA-256)",
+  "version": "2.0.0",
+  "components": {
+    "stub_x64": "winlock_stub_x64.bin",
+    "stub_x86": "winlock_stub_x86.bin"
+  },
+  "supported_machines": ["amd64", "i386"]
+}
+```
 
-## WinLock 模式
-
-### 工作原理
-
-WinLock 是一种 **in-place PE 加壳器**（C + 内联汇编，PIC，无 CRT，PEB walk）：
-
-1. **打包时**：builder.exe 读原 PE，找 `.text` 节，用 XTEA 加密前 N 字节；
-   新增 `.lock` 节写入 stub.bin；修改 `AddressOfEntryPoint`（或 TLS callbacks）指向 stub；
-   剥离 Authenticode 签名，清零 Bound Imports，保留 ASLR（stub 重应用 reloc）。
-2. **运行时**：Windows loader 加载加壳后的 PE → 进入 stub_entry → 弹密码框
-   （`DialogBoxIndirectParamW`）→ SHA-256(password+salt) 校验 → 解密 `.text` 节
-   → 重应用 relocations → 跳回原 EP（或调用原 TLS callbacks）→ 原程序正常运行。
-
-### 与临时文件模式对比
-
-| 维度 | 临时文件模式 | WinLock 模式 |
-|------|------------|-------------|
-| **原 EXE 是否被修改** | 不修改，作为 payload 附加 | 原地修改，新增 `.lock` 节 |
-| **运行时是否需要外部文件** | 需要：隐藏临时文件 | 不需要：完全单文件 |
-| **磁盘明文残留风险** | 有：异常退出可能残留 | 无：解密在内存中 |
-| **兼容性** | 极高（等同于原 EXE 直接运行） | 中（受 loader hook / 自校验限制） |
-| **加密算法** | AES-256-CBC + HMAC-SHA256 + PBKDF2 | XTEA + SHA-256 |
-| **架构支持** | 任意（stub AnyCPU） | 必须按架构选 stub_x64 / stub_x86 |
-| **支持 .NET EXE** | 是 | 否 |
-| **支持 Console 程序** | 是 | 否（仅 GUI） |
-
-### WinLock 限制
-
-WinLock 模式**不适用**于以下程序：
-- ❌ .NET CLR 托管 PE
-- ❌ Console 子系统程序（stub 用 `DialogBoxIndirectParamW` 弹 GUI 密码框）
-- ❌ DLL（仅 EXE）
-- ❌ Chrome：`chrome_elf.dll` 在 loader 阶段注册 UIA hook → loader lock 死锁
-- ❌ QQ：`FirstLoad.dll` 调用 `WinVerifyTrust` 验证签名 → 加壳后签名失效
-- ❌ 任何带自校验（hash / checksum / 签名）的程序
-
-> packer 在用户选 WinLock 但原 EXE 是 Console 或 .NET 时会弹警告。
-
----
-
-## 开发测试方法
-
-- **构建**：`.\build.ps1 -Release` 生成 `dist/WinAppLocker.exe` + `dist/stub/`。
-- **自动化测试**：`.\tests\auto_test.ps1` 使用内置密码的 `stub_test` 做端到端 round-trip 测试，
-  默认对 `..\temp\samples` 下的 CLI/GUI 样本加解密并验证运行；可加 `-Info` 同时校验
-  `--info` 输出，或 `-Samples "a.exe,b.exe"` 指定样本。
-- **WinLock 手动测试**：
-  ```powershell
-  WinAppLocker.exe --pack -i ..\temp\samples\hellogui.exe -o test.exe -p test1234 --stub-name winlock
-  ./test.exe   # 弹密码框，输入 test1234 后 hellogui 正常启动
-  ```
-- **手动验证**：`WinAppLocker.exe --info <加密文件>` 检查头部/尾部 CRC 与扩展元数据是否一致；
-  `WinAppLocker.exe --list-stubs` 查看 stub 清单。
-- **版本号**：统一在 `Directory.Build.props` 的 `Major/Minor/Patch` 中维护（当前 1.0.0），
-  编译期自动注入 Git 提交、构建时间等元数据。
-
----
+- `kind`：`tempfile`（临时文件模式）或 `inplace-builder`（WinLock in-place 模式）
+- `subsystem`：`gui` / `console` / `test`
+- `components`：仅 inplace-builder 用，列出依赖的 stub 文件
+- `supported_machines`：仅 inplace-builder 用，`amd64` / `i386`；tempfile stub 不填则视为 AnyCPU
 
 ## 项目结构
 
 ```
 dotnet/
 ├── build.ps1                       # 一键构建脚本（dotnet + WinLock + stub 汇集）
-├── test.ps1                        # 自动化测试脚本
-├── Directory.Build.props           # 统一版本号管理
-├── README.md                       # 本文档
+├── tests/auto_test.ps1             # 自动化测试脚本（tempfile + WinLock 两种模式）
+├── Directory.Build.props           # 统一版本号管理（Git hash + 构建时间自动注入）
 ├── WinAppLocker.slnx               # 解决方案
-├── shared/                         # 共享库（ByteSearch / Crc32 / PayloadFormat）
-├── stub/                           # dotnet GUI stub 项目（生成 stub_gui.exe）
-├── stub.console/                   # dotnet Console stub 项目（生成 stub_console.exe）
-├── stub.test/                      # dotnet Test stub 项目（生成 stub_test.exe）
-├── packer/                         # packer 主项目（生成 WinAppLocker.exe）
-│   ├── WinAppLocker.Packer.csproj  # csproj（含 stub/ 目录拷贝规则）
-│   ├── Program.cs                  # CLI 入口（--pack / --info / --list-stubs / --version）
-│   ├── MainForm.cs                 # GUI 主界面（动态加载 stub 列表）
-│   ├── PackCore.cs                 # 打包主流程（tempfile / WinLock 分支）
-│   ├── StubLoader.cs               # stub 字节加载（stub/ 目录 + 嵌入资源兜底）
-│   ├── StubManifest.cs             # stub 元数据模型（.meta.json 反序列化）
-│   ├── StubRegistry.cs             # stub 注册表（扫描 stub/ + 按偏好选）
-│   ├── WinLockPacker.cs            # WinLock 加壳分支（调用 winlock_builder.exe）
-│   ├── PeReader.cs                 # PE 解析（子系统 / 机器类型 / .NET 检测）
-│   ├── IconCopier.cs               # 图标复制（仅 tempfile 模式）
-│   ├── CryptoUtil.cs               # KDF + AES-CBC+HMAC
-│   ├── PayloadBuilder.cs           # payload 二进制组装
-│   └── stub/                       # 构建时汇集的所有 stub（拷到输出目录）
-│       ├── stub_gui.exe + .meta.json
-│       ├── stub_console.exe + .meta.json
-│       ├── stub_test.exe + .meta.json
-│       ├── winlock_builder.exe + .meta.json
-│       ├── winlock_stub_x64.bin
-│       ├── winlock_stub_x86.bin
-│       └── winlock_stub_x86.exe
-└── tests/                          # 临时测试脚本
+├── shared/                         # 共享库
+├── stub/                           # GUI stub 项目
+├── stub.console/                   # Console stub 项目
+├── stub.test/                      # Test stub 项目
+└── packer/                         # packer 主项目
+    ├── WinAppLocker.Packer.csproj
+    ├── Program.cs                  # CLI 入口
+    ├── MainForm.cs                 # GUI 主界面
+    ├── PackCore.cs                 # 打包主流程（tempfile / WinLock 分支）
+    ├── StubLoader.cs               # stub 字节加载（stub/ 目录 + 嵌入资源兜底）
+    ├── StubManifest.cs             # stub 元数据模型
+    ├── StubRegistry.cs             # stub 注册表（按偏好选）
+    ├── WinLockPacker.cs            # WinLock 加壳分支（调用 winlock_builder.exe）
+    ├── PeReader.cs                 # PE 解析
+    ├── IconCopier.cs               # 图标复制（仅 tempfile 模式）
+    ├── CryptoUtil.cs               # KDF + AES-CBC+HMAC
+    ├── PayloadBuilder.cs           # payload 二进制组装
+    └── stub/                       # 构建时汇集的所有 stub（拷到输出目录）
 ```
 
-> WinLock 源码在项目根目录的 `packer/` 子目录（C + 内联汇编），由 `build.ps1` 自动编译。
+## 版本号
+
+版本号统一在 `Directory.Build.props` 的 `Major/Minor/Patch` 中维护（当前 1.0.0），编译期自动注入：
+- AssemblyVersion = `Major.Minor.0.0`
+- FileVersion = `Major.Minor.<天数>.<秒数>`
+- InformationalVersion = `Major.Minor.Patch-<yyyyMMdd>-<git hash>`
+
+`--version` 命令显示 InformationalVersion。

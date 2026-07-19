@@ -12,7 +12,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
+# Push-Location 而非 Set-Location：脚本退出（正常/异常）时用 finally 恢复调用方 cwd
+Push-Location $root
+try {
 
 # applocker 仓库根目录（build.ps1 在 dotnet/ 下，根目录是上一层）
 $applockerRoot = Split-Path -Parent $root
@@ -230,7 +232,9 @@ if (Test-Path $packerOutStub) {
 }
 
 if ($Release) {
-    $distDir = "$root\dist"
+    # dist 放在 applocker 项目根目录（与 dotnet/、packer/ 平级），
+    # 便于两个子项目的产物统一汇集；同时兼容旧的 dotnet/dist 路径（测试脚本会自动回退查找）
+    $distDir = "$applockerRoot\dist"
     New-Item -ItemType Directory -Path $distDir -Force | Out-Null
     # 清空 dist 避免残留旧文件
     Get-ChildItem $distDir -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -244,12 +248,18 @@ if ($Release) {
     }
 
     Write-Host "==> dist/ 准备就绪（packer exe + .config + stub/ 目录）" -ForegroundColor Green
+    Write-Host "    路径: $distDir" -ForegroundColor DarkGray
     Get-ChildItem $distDir | Format-Table Name, Length
     if (Test-Path "$distDir\stub") {
         Write-Host "==> dist/stub/ 内容:" -ForegroundColor Cyan
-        Get-ChildItem "$distDir\stub" | Format-Table Name, Length
+        Get-ChildItem $distDir\stub | Format-Table Name, Length
     }
 } else {
     Write-Host "==> packer/bin/$config/WinAppLocker.exe 准备就绪" -ForegroundColor Green
     Get-ChildItem "$root\packer\bin\$config" -Filter "WinAppLocker*" | Format-Table Name, Length
+}
+
+} finally {
+    # 恢复调用方当前目录（Set-Location 会污染调用方 cwd，Push-Location + Pop-Location 配对）
+    Pop-Location
 }

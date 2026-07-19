@@ -1,5 +1,63 @@
 # 变更记录
 
+## 变更记录 2026-07-19 11:20
+
+auto_test.ps1 扩展支持 WinLock 模式 + 样本列表更新 + --test CLI 参数
+
+1. **auto_test.ps1 新增 -WinLock 模式**：用 `--stub-name winlock --test` 调 packer
+   做加壳测试。WinLock 是 in-place 加壳，加壳后 exe 直接运行原程序逻辑（无 stub
+   子进程，无临时文件），密码硬编码为 "test123"（builder -t 测试模式）。
+   - 预期通过：helloguix64.exe / helloguix86.exe（原生 GUI）
+   - 预期 SKIP：4 个 Console 程序（WinLock 仅支持 GUI）、hellowinforms.exe
+     （WinLock 不支持 .NET CLR）
+   - packer 拒绝时标 SKIP 而非 FAIL，避免误报
+
+2. **PackOptions 新增 WinLockTestMode 字段**：CLI `--test` 开关启用，传给
+   WinLockPacker → builder -t。stub 跳过密码弹框，用硬编码 "test123" 解密。
+   用于 CI/自动化测试。非 --test 模式下保持原弹框行为不变。
+
+3. **auto_test.ps1 默认样本列表更新**：
+   - 移除 hellogui.exe（已从 samples 删除）
+   - 新增 helloguix64.exe / helloguix86.exe（分架构 GUI 样本）
+   - 新增 hellowinforms.exe（.NET WinForms GUI，临时文件模式应通过，WinLock 应拒绝）
+
+4. **Is-GuiExe 改用 packer --pe-info 读子系统判断**（而非文件名启发式）：
+   - hellowinforms.exe 是 .NET WinForms GUI 但文件名不含 "gui"
+   - 文件名启发式会误判为 CLI，导致走 CLI 分支 stdout 为空触发异常
+   - 改为读 Subsystem=2 (WindowsGui) 判断，pe-info 失败时退回启发式
+
+5. **修复 Is-GuiExe 参数传递 bug**：`Is-GuiExe $sample` 传文件名（hellowinforms.exe）
+   导致 --pe-info 找不到文件，改为 `Is-GuiExe $src` 传完整路径。
+
+6. **CLI stdout 防御性处理**：stdout 为空时显示 "OK (exit=0, no stdout)" 而非
+   触发 null 异常（GUI 程序意外走到 CLI 分支时不输出到 stdout）。
+
+7. **hellowinforms.exe.config 一起拷贝到 work 目录**：.NET 程序需要 config 文件
+   才能正确启动（startup useLegacyV2RuntimeActivationPolicy 等）。
+
+## 变更记录 2026-07-19 11:05
+
+dotnet dist 目录移到项目根 + auto_test.ps1 进程清理修复
+
+1. **dist 目录移到 applocker 根目录**：`build.ps1 -Release` 输出从 `dotnet/dist/`
+   改为 `applocker/dist/`（与 `dotnet/`、`packer/` 平级）。`$distDir` 改用
+   `$applockerRoot\dist`，便于两个子项目产物统一汇集。日志目录随之变为
+   `applocker/dist/logs/`（AppLogger 自动跟随 exe 路径，无需改代码）。
+
+2. **auto_test.ps1 packer 查找路径回退**：新增 `$root\..\dist\WinAppLocker.exe`
+   回退路径，与 `$root\dist\`、`packer/bin/Release/`、`packer/bin/Debug/` 三级查找。
+
+3. **auto_test.ps1 修复 hellogui 子进程残留 bug**：
+   - **根因**：旧代码按 `el_*` 模式匹配临时子进程，但实际命名规则是
+     `_{原名}_ori.exe`（见 `StubEntry.cs:122`），hellogui 测试启动的
+     `_hellogui_test_locked_ori.exe` 永远匹配不到，测试后残留进程。
+   - **修复**：按真实命名规则 `_*_ori` 匹配，并加显式 `[kill]` 日志。
+   - **步骤3 临时文件清理**：`el_*.exe` 改为 `_*_ori.exe` 匹配。
+
+4. **auto_test.ps1 已从 `dotnet/test.ps1` 改名到 `dotnet/tests/auto_test.ps1`**：
+   用户已自行移动，路径变量用 `$root = Split-Path -Parent $PSScriptRoot` 推算。
+   脚本顶部用法注释同步更新为 `.\tests\auto_test.ps1`。
+
 ## 变更记录 2026-07-19 10:40
 
 packer 日志详细度调整 + WinLock stub 改名 + IconCopier 字符串名 bug 修复
