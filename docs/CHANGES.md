@@ -1,5 +1,42 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 0-2：MinGW 后备 + 共享代码抽取 + CMake/Builder 迁移
+
+按照 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 推进 MSVC 工具链迁移，阶段 0/1/2 全部完成。MinGW 版 Makefile 保留为后备，CMake 与之并存可随时回退。
+
+### 阶段 0：准备工作（零风险）
+- `packer/Makefile` → `packer/Makefile.mingw`（git rename 保留历史）
+- 跑全样本加壳基线，记录到 `packer/tests/baseline_mingw.txt`
+- 验证 `mingw32-make -f Makefile.mingw all all-x86 reflective-all` 仍可编译通过
+
+### 阶段 1：共享代码抽取（低风险，MinGW 回归验证）
+抽出 4 个共享头文件到 `packer/common/`，消除 4 处 XTEA 重复、2 处 SHA-256 路径、PEB walk 单点实现：
+- **`common/winlock_compat.h`**（新建）：编译器抽象层，集中所有 GCC/MSVC 差异宏（`WINLOCK_SECTION_TEXT` / `WINLOCK_SECTION_DATA` / `WINLOCK_SECTION_RDATA` / `WINLOCK_SECTION_ENTRY` / `WINLOCK_SECTION_TLSCBM` / `WINLOCK_SECTION_TLSCB` / `WINLOCK_SECTION_CRT_XLB` / `WINLOCK_UNREACHABLE` / `WINLOCK_NOINLINE` / `WINLOCK_OPTIMIZE_OFF` / `WINLOCK_SFENCE`）。MSVC 分支用 `__pragma(code_seg/data_seg/const_seg)` + `__declspec(noinline/align)`；GCC 分支保持原 `__attribute__` 写法，确保 stub 二进制字节级不变
+- **`common/peb_walk.h`**（新建）：从 `stub.c` / `loader.c` 抽取 PEB walk + DJB15 hash 解析（`find_module_by_hash` / `find_export_by_hash` / `WINLOCK_PEB()`），用 `static inline` 避免符号冲突
+- **`common/xtea.h`**（新建）：从 4 处重复实现抽取 XTEA 加密/解密（`xtea_encrypt_block/buf` / `xtea_decrypt_block/buf`），用 `#ifdef WINLOCK_PIC` 区分 stub 与 host 用途
+- **`common/pe_meta.h`**（新建）：节名/魔数常量集中管理（为阶段 5 节名伪装做准备）
+- **`common/sha256.h`**（移动）：从 `packer/stub/sha256.h` 移过来，路径不再有 `../stub/` 跨模块引用
+- 修改 `stub.c` / `loader.c` / `builder.c` / `builder_reflective.c` 删除本地实现，改 `#include "../common/*.h"`
+- 修改 `tests/stub_sha256_test.c` 的 include 路径
+
+### 阶段 2：CMake 骨架 + Builder 迁移（低风险）
+验证 MSVC + CMake 工具链可用，迁移最简单的 builder（纯 C 无 GCC 扩展）：
+- **`packer/CMakeLists.txt`**（新建顶层）：强制 MSVC（不用则 FATAL_ERROR），引入 `cmake/msvc_setup.cmake`，全局加 `/utf-8`（解决中文注释导致的 C4819 警告 + C2059 语法错误）+ `/Zc:preprocessor`（支持 `##__VA_ARGS__`）+ `_CRT_SECURE_NO_WARNINGS` + `/MT`（静态 CRT）
+- **`packer/cmake/msvc_setup.cmake`**（新建）：封装 vcvars64.bat 路径 + 查找 w64devkit/msys2 mingw32 的 binutils（objcopy/nm），binutils 与编译器无关继续使用
+- **`packer/builder/CMakeLists.txt`**（新建）：定义 `builder` 和 `builder_reflective` 两个 target，链 `advapi32`（CryptoAPI），编译选项 `/O2 /W3 /MT`
+- **`.gitignore`**（更新）：添加 `build-x64/` / `build-x86/` / `build-msvc*/` / CMake 生成文件（`*.vcxproj` / `*.sln` / `CMakeFiles/` 等）
+- **`packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md`**（新建）：实际使用的迁移 + PIC 化规格说明（7 阶段计划 + 风险表 + 回滚触发条件）
+
+### 编译验证
+- CMake 配置成功：MSVC 19.51.36248，所有 binutils 找到
+- `builder.exe`（181760 字节，比 MinGW 110826 大，因 MSVC /MT 静态 CRT）+ `builder_reflective.exe` 编译通过，仅 2 个无害的 C4319 零扩展警告
+- 加壳 `helloguix64.exe` 成功：输出 114688 字节（原 107008 + stub 7536 ≈ 7KB 增量），`builder --help` 完美运行
+- `builder_reflective` 测试通过：v1 明文 payload + 图标资源复制，输出 271360 字节
+
+### 阶段 3 进度（已启动）
+- stub.c 的 46 处 GCC 扩展中，批 1（15 处 section attribute）+ 批 2（optimize/unreachable/sfence）已通过 `winlock_compat.h` 宏抽象完成
+- 仅剩批 3（jump_to_oep 的 `__asm__ volatile` 内联汇编，2 处）需要独立 `.asm` 文件
+
 ## 变更记录 2026-07-19 Reflective 加壳添加密码弹框 + XTEA 加密（v2 模式）
 
 **目标**：Reflective 加壳方案之前是 MVP v1 半成品（明文 payload，无密码框），现在参考 WinLock Inplace（`packer/stub/stub.c`）补齐密码弹框 + 加密功能。
