@@ -1,0 +1,63 @@
+# ============================================================
+# CMakeLists-x86.txt - x86 专用顶层 CMakeLists
+#
+# 用法：
+#   cmake -S . -B build/x86 -G Ninja -DCMAKE_BUILD_TYPE=Release
+#         （需先调用 vcvars64.bat 设置 MSVC 环境，cl.exe 会用 32 位 host
+#          或显式指定 -A Win32）
+#
+# 编译 4 个 x86 target：
+#   builder_inplace       - inplace 加壳器（普通 EXE，32 位）
+#   stub_inplace_x86      - inplace stub（PIC 自包含，.lock 节提取 + .reloc 保留）
+#   builder_reflective    - reflective 加壳器（普通 EXE，32 位）
+#   stub_reflective_x86   - reflective stub（PIC 自包含 + __aulldvrm 辅助）
+#
+# 设计要点：
+#   - 只编译 x86，不掺 x64（避免 64 位 ml64.exe 误处理 32 位 asm）
+#   - x86 stub 必须 /FIXED:NO 保留 .reloc 节（builder 需要预 patch 绝对地址）
+#   - x86 reflective stub 需要 __aulldvrm（64 位除法 CRT 辅助）
+# ============================================================
+
+cmake_minimum_required(VERSION 3.20)
+project(winlock_packer_x86 C ASM_MASM)
+
+# 强制 MSVC
+if(NOT MSVC)
+    message(FATAL_ERROR "This project requires MSVC. Run vcvars64.bat first.")
+endif()
+
+# 顶层源码目录
+set(WINLOCK_ROOT ${CMAKE_CURRENT_LIST_DIR})
+
+# 引入公用脚本
+include(${WINLOCK_ROOT}/cmake/msvc_setup.cmake)
+
+# 全局头文件目录
+include_directories(${WINLOCK_ROOT}/common)
+
+# 全局 MSVC 编译选项
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:C>:/utf-8>
+    $<$<COMPILE_LANGUAGE:C>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C>:/MT>
+)
+add_compile_definitions(
+    _CRT_SECURE_NO_WARNINGS
+    _CRT_NONSTDC_NO_DEPRECATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
+# ---- 编译 target ----
+set(ARCH "x86")
+set(SUFFIX "_x86")
+
+# inplace 模式：builder_inplace + stub_inplace_x86
+include(${WINLOCK_ROOT}/inplace/CMakeLists.inc)
+# reflective 模式：builder_reflective + stub_reflective_x86
+include(${WINLOCK_ROOT}/reflective/CMakeLists.inc)
+
+message(STATUS "=== winlock_packer x86 CMake configuration complete ===")
+message(STATUS "MSVC version: ${MSVC_VERSION}")
+message(STATUS "OBJCOPY_X86:  ${OBJCOPY_X86}")
+message(STATUS "NM_X86:       ${NM_X86}")

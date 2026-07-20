@@ -436,10 +436,9 @@ static void print_usage(const char* prog) {
     printf("                        Checks BeingDebugged / NtGlobalFlag / KdDebuggerEnabled\n");
     printf("  -v, --debug           Verbose log: print PE parse details, section list,\n");
     printf("                        relocation patch info, etc. (default OFF)\n");
-    printf("  --stub-dir <path>     Directory to search winlock_stub_x64.bin /\n");
-    printf("                        winlock_stub_x86.bin / winlock_stub_x86.exe\n");
-    printf("                        (backward compat: stub_x64.bin / stub_x86.bin / stub_x86.exe)\n");
-    printf("                        (default: ./stub/)\n");
+    printf("  --stub-dir <path>     Directory to search stub_inplace_x64.bin /\n");
+    printf("                        stub_inplace_x86.bin / stub_inplace_x86.exe\n");
+    printf("                        (default: current directory)\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -799,71 +798,39 @@ int main(int argc, char* argv[]) {
     DBG("[*] Encrypting %u bytes (RawData) with XTEA\n", enc_size);
     xtea_encrypt_buf(pe + text_sec->PointerToRawData, enc_size, key);
 
-    /* 7. 读 stub.bin（按输入 PE 架构选择 winlock_stub_x64.bin 或 winlock_stub_x86.bin；
-     *    优先用 --stub-dir 指定目录，否则按原相对路径搜索。
-     *    新命名约定：分发目录用 winlock_ 前缀避免与其他 stub 混淆；
-     *    旧名 stub_x64.bin / stub_x86.bin / stub.bin 保留向后兼容（make 生成的源文件）。 */
-    const char* stub_candidates[8];
+    /* 7. 读 stub.bin（按输入 PE 架构选择 stub_inplace_x64.bin 或 stub_inplace_x86.bin；
+     *    --stub-dir 指定时优先用该目录，否则按当前目录搜索。
+     *    命名约定：stub_inplace_x64.bin / stub_inplace_x86.bin（统一新命名，无旧名 fallback）。 */
+    const char* stub_candidates[3];
     int n_candidates = 0;
     char stub_dir_path[512];
     if (stub_dir) {
-        /* --stub-dir 优先：winlock_stub_x64.bin / winlock_stub_x86.bin */
-        snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/winlock_stub_%s.bin",
+        /* --stub-dir 优先：{stub_dir}/stub_inplace_{x64|x86}.bin */
+        snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub_inplace_%s.bin",
                  stub_dir, g_is_x64 ? "x64" : "x86");
         stub_candidates[n_candidates++] = strdup(stub_dir_path);
-        /* 回退：旧命名 stub_x64.bin / stub_x86.bin */
-        snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub_%s.bin",
-                 stub_dir, g_is_x64 ? "x64" : "x86");
-        stub_candidates[n_candidates++] = strdup(stub_dir_path);
-        if (g_is_x64) {
-            /* x64 进一步回退：stub.bin */
-            snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub.bin", stub_dir);
-            stub_candidates[n_candidates++] = strdup(stub_dir_path);
-        }
     }
-    if (g_is_x64) {
-        stub_candidates[n_candidates++] = "stub/winlock_stub_x64.bin";
-        stub_candidates[n_candidates++] = "winlock_stub_x64.bin";
-        stub_candidates[n_candidates++] = "stub/stub_x64.bin";  /* 旧名回退 */
-        stub_candidates[n_candidates++] = "stub_x64.bin";
-        stub_candidates[n_candidates++] = "stub/stub.bin";  /* 最旧回退 */
-        stub_candidates[n_candidates++] = "stub.bin";
-    } else {
-        stub_candidates[n_candidates++] = "stub/winlock_stub_x86.bin";
-        stub_candidates[n_candidates++] = "winlock_stub_x86.bin";
-        stub_candidates[n_candidates++] = "stub/stub_x86.bin";  /* 旧名回退 */
-        stub_candidates[n_candidates++] = "stub_x86.bin";
-    }
+    /* 当前目录：./stub_inplace_{x64|x86}.bin */
+    stub_candidates[n_candidates++] = g_is_x64
+        ? "stub_inplace_x64.bin"
+        : "stub_inplace_x86.bin";
     size_t stub_size = 0;
     uint8_t* stub = NULL;
     for (int i = 0; i < n_candidates && !stub; i++) {
         stub = read_file(stub_candidates[i], &stub_size);
     }
     if (!stub) {
-        /* 尝试基于 argv[0] 的相对路径 */
-        char path[512];
-        snprintf(path, sizeof(path), "%s/stub/winlock_stub_%s.bin",
-                 argc > 0 ? argv[0] : ".", g_is_x64 ? "x64" : "x86");
-        stub = read_file(path, &stub_size);
-        if (!stub) {
-            snprintf(path, sizeof(path), "%s/stub/stub_%s.bin",
-                     argc > 0 ? argv[0] : ".", g_is_x64 ? "x64" : "x86");
-            stub = read_file(path, &stub_size);
-        }
-    }
-    if (!stub) {
-        printf("[-] Cannot read winlock_stub_%s.bin (run 'make%s' first)\n",
-               g_is_x64 ? "x64" : "x86",
-               g_is_x64 ? "" : " all-x86");
+        printf("[-] Cannot read stub_inplace_%s.bin (run packer/build.ps1 first)\n",
+               g_is_x64 ? "x64" : "x86");
         return 1;
     }
-    DBG("[*] Loaded winlock_stub_%s.bin (%zu bytes = 0x%zX)\n",
+    DBG("[*] Loaded stub_inplace_%s.bin (%zu bytes = 0x%zX)\n",
            g_is_x64 ? "x64" : "x86", stub_size, stub_size);
 
-    /* 7b. x86: 额外读 stub_x86.exe 获取 .reloc 节
+    /* 7b. x86: 额外读 stub_inplace_x86.exe 获取 .reloc 节
      *   x86 stub 用绝对地址引用静态数据（非 PIC），必须预 patch 到目标位置。
-     *   stub_x86.bin 是 objcopy 导出的 .lock raw bytes，没有 .reloc 节，
-     *   所以需要从 stub_x86.exe 读取 .reloc 节 + .lock 节 RVA + ImageBase。
+     *   stub_inplace_x86.bin 是 extract_lock_section.py 导出的 .lock raw bytes，
+     *   没有 .reloc 节，所以需要从 stub_inplace_x86.exe 读取 .reloc 节 + .lock 节 RVA + ImageBase。
      *   x64 stub 用 RIP-relative 是 PIC，不需要 .reloc，跳过此步。 */
     uint8_t* stub_exe = NULL;
     size_t stub_exe_size = 0;
@@ -873,36 +840,19 @@ int main(int argc, char* argv[]) {
     uint32_t stub_lock_rva = 0;
     uint32_t stub_lock_size = 0;
     if (!g_is_x64) {
-        const char* exe_candidates[6];
+        const char* exe_candidates[3];
         int n_exe = 0;
         char exe_dir_path[512];
         if (stub_dir) {
-            /* --stub-dir 优先：winlock_stub_x86.exe，回退旧名 stub_x86.exe */
-            snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/winlock_stub_x86.exe", stub_dir);
-            exe_candidates[n_exe++] = strdup(exe_dir_path);
-            snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/stub_x86.exe", stub_dir);
+            snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/stub_inplace_x86.exe", stub_dir);
             exe_candidates[n_exe++] = strdup(exe_dir_path);
         }
-        exe_candidates[n_exe++] = "stub/winlock_stub_x86.exe";
-        exe_candidates[n_exe++] = "winlock_stub_x86.exe";
-        exe_candidates[n_exe++] = "stub/stub_x86.exe";  /* 旧名回退 */
-        exe_candidates[n_exe++] = "stub_x86.exe";
+        exe_candidates[n_exe++] = "stub_inplace_x86.exe";
         for (int i = 0; i < n_exe && !stub_exe; i++) {
             stub_exe = read_file(exe_candidates[i], &stub_exe_size);
         }
         if (!stub_exe) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/stub/winlock_stub_x86.exe",
-                     argc > 0 ? argv[0] : ".");
-            stub_exe = read_file(path, &stub_exe_size);
-            if (!stub_exe) {
-                snprintf(path, sizeof(path), "%s/stub/stub_x86.exe",
-                         argc > 0 ? argv[0] : ".");
-                stub_exe = read_file(path, &stub_exe_size);
-            }
-        }
-        if (!stub_exe) {
-            printf("[-] Cannot read winlock_stub_x86.exe (needed for .reloc, run 'make all-x86')\n");
+            printf("[-] Cannot read stub_inplace_x86.exe (needed for .reloc, run packer/build.ps1)\n");
             return 1;
         }
         uint32_t reloc_off = 0;
@@ -910,17 +860,17 @@ int main(int argc, char* argv[]) {
                                     &stub_lock_rva, &stub_lock_size,
                                     &reloc_off, &stub_reloc_size,
                                     &stub_image_base) != 0) {
-            printf("[-] Failed to parse winlock_stub_x86.exe PE structure\n");
+            printf("[-] Failed to parse stub_inplace_x86.exe PE structure\n");
             free(stub_exe);
             return 1;
         }
         if (stub_reloc_size == 0 || reloc_off == 0) {
-            printf("[-] winlock_stub_x86.exe has no .reloc section (stub.ld 或 Makefile 配置错误)\n");
+            printf("[-] stub_inplace_x86.exe has no .reloc section (CMakeLists 配置错误)\n");
             free(stub_exe);
             return 1;
         }
         stub_reloc_data = stub_exe + reloc_off;
-        DBG("[*] stub_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
+        DBG("[*] stub_inplace_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
                (unsigned long long)stub_image_base,
                (unsigned long)stub_lock_rva, (unsigned long)stub_lock_size,
                stub_reloc_size);

@@ -1,5 +1,107 @@
 # 变更记录
 
+## 2026-07-20 23:30 修复 DontSleep 反射式加载崩溃 + 强制基址加载
+
+### 问题
+DontSleep 反射式加载后弹框 "Error! Loading language file string archive"，正常界面无法显示。
+用 UPX/VMProtect 加壳同样问题，DIE 显示 `.data compressed`。
+
+### 根因
+1. DontSleep 的 `.data` 段被压缩（vsize=247KB, rsize=75KB），重定位表为空（ASLR 关闭），
+   内层解压 stub 依赖原始 ImageBase 0x400000
+2. 0x400000 处已有文件映射（MAPPED），VirtualAlloc 失败后 fallback 到任意地址导致偏移错误
+3. manifest 激活（CreateActCtxA）在 PEB 刚修改后立即调用，触发 ntdll 内部 ACCESS_VIOLATION
+
+### 修复
+1. **map_image 新增 NtUnmapViewOfSection 逻辑**：VirtualAlloc(preferred) 失败时检查是否为 MAPPED 类型，
+   如果是则卸载后重试，确保 payload 加载到原始 ImageBase
+2. **manifest 激活延迟**：从 IAT 处理前移到 TLS callbacks 后，避免 PEB 修改后立即调用 CreateActCtxA
+
+### 测试
+- DontSleep 反射式加载成功，主界面正常显示 "Don't Sleep 9.96"
+- manifest 正常激活（comctl32 v6）
+
+## 2026-07-20 21:00 x86 MSVC 迁移完成：纯 C 位运算长除法替代 __aulldvrm
+
+完成 x86 架构从 MinGW 迁移到 MSVC 的最后关键一步：用纯 C 位运算长除法替代 `__aulldvrm` MASM 实现，彻底消除 64 位除法的 CRT 依赖。
+
+### 1. 问题背景
+
+- x86 `/NODEFAULTLIB` PIC stub 中，MSVC 对 64 位 `/` 和 `%` 会生成 `__aulldiv` / `__aulldvrm` 调用
+- 自实现 `__aulldvrm` MASM 汇编存在调用约定/参数数量不匹配问题（MSVC 实际调用时只 push 4 个参数，缺少 rem_ptr），导致 stub_reflective_x86 运行时 crash 在 `__aulldvrm+0x2b`
+
+### 2. 解决方案
+
+- **删除 `packer/reflective/aulldvrm.asm`**（移到 temp 备份）
+- **新增 `pic_u64_divmod()` 函数**（packer/reflective/loader.c）：
+  - 二进制长除法，循环 64 次
+  - 所有位移都是常数（`<< 1`, `>> 63`），MSVC 编译为纯 `shl/rcl/shr` 指令
+  - 64 位比较/减法是纯 `cmp/sbb/sub` 指令序列
+  - **不引入任何外部符号引用，100% PIC 安全**
+- **`u64_to_str()` 改用 `pic_u64_divmod()`** 替代 `v % base` 和 `v /= base`
+
+### 3. 验证结果
+
+完整 build（x64 + x86）+ 端到端测试 8 样本：
+- **reflective 8/8 PASS**（x64 + x86 全部通过，包括之前 crash 的 helloguix86）
+- **inplace 6/8 PASS**（hellomingw/helloucrt 的 x64 inplace 失败是已知 CRT/CFG 问题，stub.c 未改动，与本次迁移无关）
+
+### 4. dist/ 最终产物（8 个文件）
+
+```
+builder_inplace.exe        stub_inplace_x64.bin     stub_reflective_x64.exe
+builder_reflective.exe     stub_inplace_x64.exe     stub_reflective_x86.exe
+                           stub_inplace_x86.bin
+                           stub_inplace_x86.exe
+```
+
+---
+
+## 2026-07-20 12:25 构建脚本统一：dotnet/build.ps1 改调 packer/build.ps1（MSVC x64）
+
+把 .NET 项目的 WinLock 编译入口从 `mingw32-make` 切换为调用 `packer/build.ps1`（MSVC + CMake + Ninja），完成构建链统一化。
+
+### 1. 主要改动
+
+- **新增 `packer/build.ps1`**：MSVC + CMake + Ninja 构建脚本（x64 only）
+  - 用 `-S $root -B $buildDir` 显式指定源码与 build 目录（修复污染源码目录的 bug）
+  - 通过 `vcvars64.bat` 注入 MSVC 环境到 PowerShell session
+  - 按需编译 target：`stub_x64` / `builder` / `loader_x64` / `builder_reflective`
+  - 自动复制产物到源码目录（loader_x64.exe 由 CMake POST_BUILD 自动复制）
+  - 支持 `-Debug` / `-Release` / `-Clean` / `-SkipReflective` / `-SkipInplace` 参数
+- **修复 `dotnet/build.ps1`**：
+  - 删除 `mingw32-make all all-x86 reflective-all` 调用 + PATH 设置 + Push-Location 逻辑
+  - 改为 `& "$winlockDir\build.ps1" @winlockBuildArgs`（传递 -Release / -Clean）
+  - 给所有 `dotnet build` 调用加 `-p:Platform=AnyCPU`：.NET 10 SDK 默认 Platform=x64 会把产物输出到 `bin\x64\Release\`，与 build.ps1 假设的 `bin\$(Configuration)\` 路径不一致
+  - x86 stub/loader（MSVC 迁移未完成）继续由下方汇集逻辑以 warning 处理，不阻断构建
+
+### 2. 验证结果
+
+`dotnet/build.ps1 -Clean -Release` 端到端跑通：
+
+```
+stub_gui / stub_console / stub_test 编译（AnyCPU）  ✓
+WinLock packer/build.ps1（MSVC x64）              ✓
+  stub_x64.exe          9216 bytes
+  stub_x64.bin         24592 bytes
+  builder.exe         181760 bytes
+  loader_x64.exe       29184 bytes
+  builder_reflective.exe 170496 bytes
+stub 汇集（15 个文件含 meta.json）                ✓
+packer 编译 + Costura 嵌入依赖                    ✓
+dist/ 准备就绪：
+  WinAppLocker.exe     1172992 bytes
+  WinAppLocker.exe.config 794 bytes
+  stub/ 15 个 stub 文件                          ✓
+```
+
+### 3. 已知限制
+
+- x86 stub/loader 仍需 MinGW Makefile.mingw 单独编（MSVC x86 迁移未完成，主要因 x86 ml.exe 不能处理 x64 寄存器 + loader_x86 缺 `__aulldvrm` 辅助）
+- build.ps1 复制 winlock_stub_x86.bin / loader_x86.exe 时若缺失仅 warning，不阻断
+
+---
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 C3b 完成：完全 PIC 化（剥离 CRT）
 
 按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 C3b（spec 第 337-349 行）实施，把 `loader_x64.exe` 从 `/MT` 静态 CRT 模式改为 `/NODEFAULTLIB` 完全 PIC 化模式，剥离所有 CRT 依赖。

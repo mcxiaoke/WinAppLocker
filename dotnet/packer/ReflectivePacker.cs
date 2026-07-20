@@ -61,10 +61,10 @@ namespace WinAppLocker.Packer
             var result = new ReflectiveResult();
 
             // 根据原 PE 架构选 stub 文件名
-            // builder 默认 stub 路径是相对路径 ../reflective/loader_xXX.exe，
+            // builder 默认 stub 路径是当前目录下的 stub_reflective_xXX.exe，
             // 但 dotnet/packer/stub/ 目录布局不同，需要用 --stub 显式指定
-            string stubFile = machine == 0x8664 ? "loader_x64.exe"
-                           : machine == 0x14c ? "loader_x86.exe"
+            string stubFile = machine == 0x8664 ? "stub_reflective_x64.exe"
+                           : machine == 0x14c ? "stub_reflective_x86.exe"
                            : null;
             if (stubFile == null)
             {

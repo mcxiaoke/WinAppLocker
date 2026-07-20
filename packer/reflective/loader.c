@@ -207,13 +207,52 @@ static void log_printf(const char* fmt, ...) {
  * 行为与 CRT vsnprintf 字节级兼容（对 loader.c 中用到的所有格式化字符串） */
 static HANDLE g_logf = INVALID_HANDLE_VALUE;
 
-/* 简易数字转字符串（写入 out，返回写入长度，不写 0 终止） */
+/* 用纯 C 位运算实现 64 位 / 32 位 + 取余，避免调用 __aulldvrm / __aulldiv
+ *
+ * PIC Stub 无 CRT 注意事项：
+ *   32 位 MSVC 对 64 位 / 和 % 会生成 __aulldiv / __aulldvrm 调用，
+ *   这些 CRT 辅助函数在 /NODEFAULTLIB 下找不到。这里用二进制长除法
+ *   替代，所有位移都是常数（<< 1, >> 63），MSVC 编译为纯 shl/rcl/shr 指令，
+ *   64 位比较/减法也是纯 cmp/sbb/sub 指令序列，不引入任何外部符号引用。
+ *   100% PIC 安全，参考 PE Packer 无 CRT 除法的标准做法。
+ *
+ * 返回：quotient = v / base，*remainder = v % base */
+static unsigned long long pic_u64_divmod(unsigned long long v, unsigned int base,
+                                          unsigned int *remainder) {
+    unsigned long long quotient = 0;
+    unsigned long long rem = 0;
+    int i;
+    /* 二进制长除法：从最高位到最低位，逐位处理 64 次
+     * 每轮：rem = (rem << 1) | v 的最高位；v 左移；quotient 左移；
+     *       如果 rem >= base，则 rem -= base，quotient 最低位置 1 */
+    for (i = 0; i < 64; i++) {
+        rem = (rem << 1) | ((v >> 63) & 1);  /* 常数位移，不调用 __aullshr */
+        v = v << 1;                            /* 常数位移，不调用 __allshl */
+        quotient = quotient << 1;              /* 常数位移 */
+        if (rem >= base) {                     /* 64 位比较，纯 cmp/sbb 指令 */
+            rem -= base;                        /* 64 位减法，纯 sub/sbb 指令 */
+            quotient |= 1;                      /* 置商最低位 */
+        }
+    }
+    if (remainder) *remainder = (unsigned int)rem;
+    return quotient;
+}
+
+/* 简易数字转字符串（写入 out，返回写入长度，不写 0 终止）
+ * 用 pic_u64_divmod 替代 / 和 %，避免 64 位除法的 CRT 依赖 */
 static int u64_to_str(char* out, unsigned long long v, int base, int upper) {
     char tmp[32];
     int ti = 0;
     const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    if (v == 0) tmp[ti++] = '0';
-    while (v > 0) { tmp[ti++] = digits[v % base]; v /= base; }
+    if (v == 0) {
+        tmp[ti++] = '0';
+    } else {
+        while (v > 0) {
+            unsigned int r;
+            v = pic_u64_divmod(v, (unsigned int)base, &r);
+            tmp[ti++] = digits[r];
+        }
+    }
     int i;
     for (i = 0; ti > 0; i++) out[i] = tmp[--ti];
     return i;
@@ -1607,6 +1646,43 @@ static void patch_peb_ldr_main_entry(void* new_img) {
     entry->SizeOfImage = nt->OptionalHeader.SizeOfImage;
     /* TimeDateStamp / HashLinks 等字段在 +0x80 之后，对 LdrFindResource_U
      * 不是必须的，跳过（AlushPacker 也只更新上述 4 个字段就够用） */
+
+    /* ---- 诊断：测试 patch 后 FindResource 能否找到 DontSleep 的 "AAAA_UNICODE.TMP" 资源 ----
+     * DontSleep 的 "language file string archive" 是 PE 资源中的 PNG 类型 + 名为
+     * "AAAA_UNICODE.TMP" 的项（伪装成 PNG，实际是文本档）。
+     * 如果 patch 后 FindResource 失败，说明 PEB.Ldr patch 不完整或资源目录有问题。
+     * 注意：这里调用的是 kernel32!FindResourceW，内部走 LdrFindResource_U，
+     *      与 DontSleep 实际用的 API 一致，所以测试结果有代表性。 */
+    {
+        HRSRC hr = FindResourceW((HMODULE)new_img, L"AAAA_UNICODE.TMP", L"PNG");
+        if (hr) {
+            DWORD sz = SizeofResource((HMODULE)new_img, hr);
+            HGLOBAL hg = LoadResource((HMODULE)new_img, hr);
+            DBG("peb: diag FindResource(AAAA_UNICODE.TMP, PNG) OK: size=%lu, handle=%p\n",
+                (unsigned long)sz, (void*)hg);
+            if (hg) {
+                void* p = LockResource(hg);
+                DBG("peb: diag   ptr=%p, head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                    p,
+                    ((uint8_t*)p)[0], ((uint8_t*)p)[1], ((uint8_t*)p)[2], ((uint8_t*)p)[3],
+                    ((uint8_t*)p)[4], ((uint8_t*)p)[5], ((uint8_t*)p)[6], ((uint8_t*)p)[7]);
+            }
+        } else {
+            DWORD err = GetLastError();
+            DBG("peb: diag FindResource(AAAA_UNICODE.TMP, PNG) FAILED: err=%lu\n",
+                (unsigned long)err);
+            /* 也测下标准 RT_STRING (id=6) */
+            HRSRC hr2 = FindResourceW((HMODULE)new_img, MAKEINTRESOURCEW(6), MAKEINTRESOURCEW(6));
+            DWORD err2 = GetLastError();
+            DBG("peb: diag FindResource(RT_STRING=6, id=6) %s err=%lu\n",
+                hr2 ? "OK" : "FAILED", (unsigned long)err2);
+            /* 测下 RT_MANIFEST (id=24) */
+            HRSRC hr3 = FindResourceW((HMODULE)new_img, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24));
+            DWORD err3 = GetLastError();
+            DBG("peb: diag FindResource(RT_MANIFEST=24, id=1) %s err=%lu\n",
+                hr3 ? "OK" : "FAILED", (unsigned long)err3);
+        }
+    }
 }
 
 /* ---- 从内存 PE 提取 RT_MANIFEST 资源并创建 activation context ----
@@ -1806,9 +1882,49 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
                     (void*)mbi.AllocationBase);
                 q = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
             }
+
+            /* 如果 preferred_base 处有 MAPPED 文件映射，尝试卸载后重试
+             * 某些加壳程序（如 DontSleep）依赖加载到原始 ImageBase (0x400000)，
+             * 因为 .data 段被压缩（vsize>>rsize）且重定位表为空（ASLR 关闭），
+             * 内层解压 stub 会把 ImageBase 当硬编码常量用，偏移就会算错 */
+            if (VirtualQuery((void*)preferred_base, &mbi, sizeof(mbi)) &&
+                mbi.Type == 0x40000 /* MEM_MAPPED */) {
+                DBG("map: preferred_base 0x%p occupied by MAPPED view, "
+                    "trying NtUnmapViewOfSection\n", (void*)preferred_base);
+
+                /* 动态获取 NtUnmapViewOfSection（ntdll 导出，无需额外链接） */
+                typedef LONG NTSTATUS;
+                typedef NTSTATUS (NTAPI *pNtUnmapViewOfSection)(HANDLE, PVOID);
+
+                HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+                pNtUnmapViewOfSection fnUnmap = (pNtUnmapViewOfSection)
+                    GetProcAddress(hNtdll, "NtUnmapViewOfSection");
+
+                if (fnUnmap) {
+                    NTSTATUS st = fnUnmap(GetCurrentProcess(), (PVOID)preferred_base);
+                    DBG("map: NtUnmapViewOfSection(0x%p) = 0x%lx\n",
+                        (void*)preferred_base, (unsigned long)st);
+                    if (st == 0 /* STATUS_SUCCESS */) {
+                        /* 卸载成功，重试分配 */
+                        new_img = (uint8_t*)VirtualAlloc((void*)preferred_base, size_of_image,
+                                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (new_img) {
+                            DBG("map: retry VirtualAlloc(preferred) succeeded at %p\n",
+                                (void*)new_img);
+                        } else {
+                            DBG("map: retry VirtualAlloc(preferred) still failed (err=%lu)\n",
+                                GetLastError());
+                        }
+                    }
+                } else {
+                    DBG("map: GetProcAddress(NtUnmapViewOfSection) failed\n");
+                }
+            }
         }
-        new_img = (uint8_t*)VirtualAlloc(NULL, size_of_image,
-                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!new_img) {
+            new_img = (uint8_t*)VirtualAlloc(NULL, size_of_image,
+                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
     }
     if (!new_img) {
         DBG("map: VirtualAlloc failed entirely, err=%lu\n", GetLastError());
@@ -1885,16 +2001,17 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     }
 
     /* 4.6 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
-     * 必须在 IAT 处理之前激活，LoadLibraryA("comctl32.dll") 才能走 SxS 找到 v6
-     * 否则只能加载默认的 v5，TaskDialogIndirect 等 v6 函数解析失败为 NULL。
-     * actctx 是线程局栈式激活，必须在主线程调用；激活后到 DeactivateActCtx 之前有效 */
-    activate_manifest_from_image(new_img);
+     * 移到 IAT 和 TLS 之后执行，避免在 PEB 刚修改后立即调用 CreateActCtxA
+     * 导致某些加壳程序（DontSleep）在 ntdll 内部崩溃。
+     * 对于大多数程序，comctl32 函数名在 v5/v6 中一致，延迟激活不影响 IAT 解析。 */
 
     /* 5. 处理 IAT */
+    DBG("map: about to process_iat...\n");
     if (!process_iat(new_img)) {
         DBG("map: process_iat failed\n");
         return NULL;
     }
+    DBG("map: process_iat OK\n");
 
     /* 5.5 处理延迟导入表（DataDirectory[13]）
      *      CCleaner 等 app 有 12 个延迟导入 DLL，不处理会导致
@@ -1923,7 +2040,16 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     init_tls_data(new_img, preferred_base);
 
     /* 9. 调用 TLS callbacks（actctx 已在 4.6 激活，TLS 数据已初始化） */
+    DBG("map: about to run TLS callbacks...\n");
     run_tls_callbacks(new_img);
+    DBG("map: TLS callbacks done\n");
+
+    /* 10. 激活 manifest（延迟到 IAT/TLS 之后，避免 PEB 修改后立即调用崩溃）
+     *     对于加壳程序（如 DontSleep），CreateActCtxA 在 PEB 刚修改后
+     *     可能触发 ntdll 内部 ACCESS_VIOLATION。延迟到此处执行更安全。 */
+    DBG("map: about to activate manifest...\n");
+    activate_manifest_from_image(new_img);
+    DBG("map: manifest activation done\n");
 
     return new_img;
 }

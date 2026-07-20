@@ -6,8 +6,8 @@
  *   2. 解析 PE 头：ImageBase / SizeOfImage / OEP / Subsystem / Machine
  *   3. 构造 payload：reflective_payload_t 头 + 原 PE 文件完整数据（v1 明文）
  *   4. 按输入 PE 的架构选预编译 stub EXE：
- *        x64 -> reflective/loader_x64.exe
- *        x86 -> reflective/loader_x86.exe
+ *        x64 -> stub_reflective_x64.exe
+ *        x86 -> stub_reflective_x86.exe
  *      ARM64 -> 不支持（无 ARM64 工具链），报错退出
  *   5. 在 stub EXE 末尾追加 .payload 节：
  *      - 新增节头（.payload）
@@ -31,7 +31,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 
-#include "../reflective/payload.h"
+#include "payload.h"
 #include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
 
 static int g_debug = 1;
@@ -175,8 +175,8 @@ static void usage(const char* prog) {
     printf("                              skip dialog (for CI/automation)\n");
     printf("  --stub <path>               Path to reflective stub EXE\n");
     printf("                              (default: auto-select by input PE arch:\n");
-    printf("                               x64 -> ../reflective/loader_x64.exe\n");
-    printf("                               x86 -> ../reflective/loader_x86.exe)\n");
+    printf("                               x64 -> stub_reflective_x64.exe\n");
+    printf("                               x86 -> stub_reflective_x86.exe)\n");
     printf("  --no-icon                   Skip icon/version resource copy (use stub default)\n");
     printf("  --debug / -v                Verbose output\n");
     printf("\nFeatures:\n");
@@ -353,10 +353,10 @@ int main(int argc, char* argv[]) {
     const char* default_stub_path = NULL;
     if (info.machine == IMAGE_FILE_MACHINE_AMD64) {
         arch_str = "x64";
-        default_stub_path = "../reflective/loader_x64.exe";
+        default_stub_path = "stub_reflective_x64.exe";
     } else if (info.machine == IMAGE_FILE_MACHINE_I386) {
         arch_str = "x86";
-        default_stub_path = "../reflective/loader_x86.exe";
+        default_stub_path = "stub_reflective_x86.exe";
     } else if (info.machine == IMAGE_FILE_MACHINE_ARM64) {
         arch_str = "ARM64";
     }

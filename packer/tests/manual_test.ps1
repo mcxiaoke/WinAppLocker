@@ -28,16 +28,23 @@
 param(
     [string[]]$Samples = @("helloguix64.exe","helloguix86.exe","DontSleep.exe","Notepad4.exe"),
     [string]$Password = "hello123",
-    [switch]$NoRun
+    [switch]$NoRun,
+    [switch]$Reflective
 )
 
 $ErrorActionPreference = 'Continue'
 
-# ---- Paths (relative to winlock\ the working dir) ----
-$ROOT    = Split-Path -Parent $PSScriptRoot        # winlock\
-$BUILDER = Join-Path $ROOT "builder\builder.exe"
-$SampleDir = Join-Path $ROOT "..\samples"          # sibling samples dir (avoid $Samples clash - PS is case-insensitive)
-$TEMP    = Join-Path $ROOT "temp"                  # winlock\temp
+# ---- Paths ----
+# 脚本位于 applocker/packer/tests/manual_test.ps1
+# applocker 根 = packer/.. ；samples 在 applocker/temp/samples；产物在 packer/dist
+$AppRoot  = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # applocker\
+$DistDir  = Join-Path $AppRoot "packer\dist"                          # 产物目录
+$SampleDir = Join-Path $AppRoot "temp\samples"                       # 样本目录
+$TEMP     = Join-Path $AppRoot "temp"                                # 日志/临时
+
+# 按模式选 builder（默认 inplace，-Reflective 用反射式）
+$BuilderName = if ($Reflective) { "builder_reflective.exe" } else { "builder_inplace.exe" }
+$BUILDER = Join-Path $DistDir $BuilderName
 
 if (-not (Test-Path $SampleDir)) {
     Write-Host "ERROR: samples dir not found: $SampleDir" -ForegroundColor Red
@@ -98,9 +105,23 @@ foreach ($sample in $Samples) {
     }
 
     # 1. Pack (use -p to set the password, NOT -t test mode)
-    Log "  packing: builder -i `"$inPath`" -o `"$outPath`" -p `"$Password`""
-    $packOut = & $BUILDER -i $inPath -o $outPath -p $Password 2>&1
-    $packRc  = $LASTEXITCODE
+    #    inplace:  builder_inplace.exe    -i <in> -o <out> -p <pwd>
+    #    reflective: builder_reflective.exe <in> <out> -p <pwd>
+    #    WorkingDirectory 设为 dist/，让 builder 能在当前目录找到 stub
+    $origWD = (Get-Location).Path
+    try {
+        Set-Location $DistDir
+        if ($Reflective) {
+            Log "  packing: builder_reflective `"$inPath`" `"$outPath`" -p `"$Password`" (cwd=$DistDir)"
+            $packOut = & $BUILDER $inPath $outPath -p $Password 2>&1
+        } else {
+            Log "  packing: builder_inplace -i `"$inPath`" -o `"$outPath`" -p `"$Password`" (cwd=$DistDir)"
+            $packOut = & $BUILDER -i $inPath -o $outPath -p $Password 2>&1
+        }
+        $packRc = $LASTEXITCODE
+    } finally {
+        Set-Location $origWD
+    }
     # Print key lines only
     $packOut | Where-Object { $_ -match "Security|flags|EP RVA|Run |Password|TLS|\[\+\]|\[\-\]|\[\*\]" } |
               ForEach-Object { Log "    $_" }

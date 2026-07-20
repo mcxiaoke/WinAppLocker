@@ -58,63 +58,41 @@ Write-Host "    （版本号由 MSBuild Target 自动注入，此处仅显示）
 
 # ---- 编译 stub_gui（GUI 模式，WinExe + WinForms + DPI aware manifest）----
 Write-Host "==> 编译 stub_gui..." -ForegroundColor Cyan
-dotnet build stub -c $config
+dotnet build stub -c $config -p:Platform=AnyCPU
 if ($LASTEXITCODE -ne 0) { throw "stub_gui build failed" }
 
 # ---- 编译 stub_console（Console 模式，Exe + 控制台密码输入）----
 Write-Host "==> 编译 stub_console..." -ForegroundColor Cyan
-dotnet build stub.console -c $config
+dotnet build stub.console -c $config -p:Platform=AnyCPU
 if ($LASTEXITCODE -ne 0) { throw "stub_console build failed" }
 
 # ---- 编译 stub_test（测试用，内置密码 test1234，跳过密码输入 UI）----
 Write-Host "==> 编译 stub_test..." -ForegroundColor Cyan
-dotnet build stub.test -c $config
+dotnet build stub.test -c $config -p:Platform=AnyCPU
 if ($LASTEXITCODE -ne 0) { throw "stub_test build failed" }
 
-# ---- 编译 WinLock（in-place 加壳器，C + 内联汇编）----
-# 产物：
-#   packer/builder/builder.exe        → dotnet/packer/stub/winlock_builder.exe
-#   packer/stub/stub_x64.bin          → dotnet/packer/stub/stub_x64.bin
-#   packer/stub/stub_x86.bin          → dotnet/packer/stub/stub_x86.bin
-#   packer/stub/stub_x86.exe          → dotnet/packer/stub/stub_x86.exe（builder 读 .reloc 用）
+# ---- 编译 WinLock（in-place + reflective 加壳器，MSVC x64 + x86）----
+# 产物由 packer/build.ps1 统一汇集到 packer/dist/，本脚本只负责拷贝整个 dist/ 目录过来
+# 命名约定（packer/build.ps1 已规范化）：
+#   builder_inplace.exe           - inplace 加壳器
+#   stub_inplace_x64.bin          - inplace x64 stub 二进制
+#   stub_inplace_x64.exe          - inplace x64 stub exe
+#   stub_inplace_x86.bin          - inplace x86 stub 二进制
+#   stub_inplace_x86.exe          - inplace x86 stub exe（builder 读 .reloc 用）
+#   builder_reflective.exe        - reflective 加壳器
+#   stub_reflective_x64.exe       - reflective x64 stub
+#   stub_reflective_x86.exe       - reflective x86 stub
 if (-not $SkipWinLock) {
     if (-not (Test-Path $winlockDir)) {
         Write-Host "==> 跳过 WinLock（找不到源码目录: $winlockDir）" -ForegroundColor Yellow
     } else {
-        Write-Host "==> 编译 WinLock（mingw32-make all all-x86）..." -ForegroundColor Cyan
-        # Makefile 内部已配置 w64devkit + msys2 mingw32 PATH（用于 gcc/objcopy/nm），
-        # 但调用 make 本身需要先把这些目录加到 PowerShell 的 PATH 中
-        $w64devkitBin = "C:\Home\Develop\w64devkit\bin"
-        $msysMingw32Bin = "C:\Home\Develop\msys64\mingw32\bin"
-        $msysUsrBin = "C:\Home\Develop\msys64\usr\bin"
-        $origPath = $env:PATH
-        $extraPath = @()
-        if ((Test-Path $w64devkitBin) -and ($env:PATH -notlike "*$w64devkitBin*")) { $extraPath += $w64devkitBin }
-        if ((Test-Path $msysMingw32Bin) -and ($env:PATH -notlike "*$msysMingw32Bin*")) { $extraPath += $msysMingw32Bin }
-        if ((Test-Path $msysUsrBin) -and ($env:PATH -notlike "*$msysUsrBin*")) { $extraPath += $msysUsrBin }
-        if ($extraPath.Count -gt 0) {
-            $env:PATH = ($extraPath -join ";") + ";$env:PATH"
-        }
-
-        Push-Location $winlockDir
-        try {
-            $make = Get-Command mingw32-make -ErrorAction SilentlyContinue
-            if (-not $make) {
-                $make = Get-Command make -ErrorAction SilentlyContinue
-            }
-            if (-not $make) {
-                Write-Host "    [警告] 找不到 mingw32-make / make，跳过 WinLock 编译" -ForegroundColor Yellow
-                Write-Host "           请安装 w64devkit 或 msys2，并确保在 PATH 中" -ForegroundColor Yellow
-            } else {
-                & $make.Name all all-x86 reflective-all 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-                if ($LASTEXITCODE -ne 0) { Pop-Location; throw "WinLock build failed" }
-                Write-Host "==> WinLock 编译完成" -ForegroundColor Green
-            }
-        } finally {
-            Pop-Location
-            # 恢复原 PATH，避免污染后续 dotnet build
-            $env:PATH = $origPath
-        }
+        Write-Host "==> 编译 WinLock（调用 packer/build.ps1, MSVC x64 + x86）..." -ForegroundColor Cyan
+        $winlockBuildArgs = @()
+        if ($Release) { $winlockBuildArgs += "-Release" }
+        if ($Clean)    { $winlockBuildArgs += "-Clean" }
+        & "$winlockDir\build.ps1" @winlockBuildArgs
+        if ($LASTEXITCODE -ne 0) { throw "WinLock build failed (packer/build.ps1)" }
+        Write-Host "==> WinLock 编译完成" -ForegroundColor Green
     }
 } else {
     Write-Host "==> 跳过 WinLock 编译（-SkipWinLock）" -ForegroundColor DarkGray
@@ -140,48 +118,24 @@ foreach ($s in $dotnetStubs) {
     }
 }
 
-# 2. WinLock 产物（inplace-builder 模式）
-#    分发目录里统一加 winlock_ 前缀避免与其他 stub 混淆（builder.exe 已有 winlock_ 前缀，
-#    stub_xXX.bin / stub_x86.exe 是 make 生成的源文件名，拷贝时重命名加前缀）
+# 2. WinLock 产物（从 packer/dist/ 拷贝整个目录过来）
+#    packer/build.ps1 已统一汇集到 dist/，本脚本不再分散拷贝
 if (-not $SkipWinLock) {
-    $winlockArtifacts = @(
-        @{ Src = "$winlockDir\builder\builder.exe";  Dst = "winlock_builder.exe" },
-        @{ Src = "$winlockDir\stub\stub_x64.bin";    Dst = "winlock_stub_x64.bin" },
-        @{ Src = "$winlockDir\stub\stub_x86.bin";    Dst = "winlock_stub_x86.bin" },
-        @{ Src = "$winlockDir\stub\stub_x86.exe";    Dst = "winlock_stub_x86.exe" }
-    )
-    foreach ($s in $winlockArtifacts) {
-        if (Test-Path $s.Src) {
-            Copy-Item $s.Src (Join-Path $stubOutDir $s.Dst) -Force
-            Write-Host "    + $($s.Dst)" -ForegroundColor DarkGray
-        } else {
-            Write-Host "    [警告] 缺失: $($s.Src)" -ForegroundColor Yellow
+    $winlockDistDir = "$winlockDir\dist"
+    if (Test-Path $winlockDistDir) {
+        # 拷贝 dist/ 下所有文件（builder_inplace.exe / stub_inplace_*.bin / stub_inplace_*.exe
+        # / builder_reflective.exe / stub_reflective_*.exe）
+        Get-ChildItem $winlockDistDir -File | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $stubOutDir $_.Name) -Force
+            Write-Host "    + $($_.Name)" -ForegroundColor DarkGray
         }
-    }
-
-    # 2b. WinLock Reflective 产物（reflective-builder 模式，内存加载）
-    #     builder_reflective.exe → winlock_reflective_builder.exe（meta.json 主文件名匹配）
-    #     loader_x64.exe / loader_x86.exe（reflective stub，按 PE 架构自动选）
-    #     需要 'make reflective-all'（默认 'make all all-x86' 不编 reflective）
-    $reflectiveArtifacts = @(
-        @{ Src = "$winlockDir\builder\builder_reflective.exe"; Dst = "winlock_reflective_builder.exe" },
-        @{ Src = "$winlockDir\reflective\loader_x64.exe";      Dst = "loader_x64.exe" },
-        @{ Src = "$winlockDir\reflective\loader_x86.exe";      Dst = "loader_x86.exe" }
-    )
-    $hasReflective = $true
-    foreach ($s in $reflectiveArtifacts) {
-        if (Test-Path $s.Src) {
-            Copy-Item $s.Src (Join-Path $stubOutDir $s.Dst) -Force
-            Write-Host "    + $($s.Dst)" -ForegroundColor DarkGray
-        } else {
-            Write-Host "    [警告] 缺失: $($s.Src)（运行 'make reflective-all' 生成）" -ForegroundColor Yellow
-            $hasReflective = $false
-        }
+    } else {
+        Write-Host "    [警告] packer/dist/ 不存在: $winlockDistDir（packer/build.ps1 失败？）" -ForegroundColor Yellow
     }
 }
 
 # 3. 生成 5 个 .meta.json 文件（packer 通过它们识别 stub 类型）
-# 注意：stub_x64.bin / stub_x86.bin 不需要 meta.json，它们被 winlock_builder.exe.meta.json
+# 注意：stub_inplace_*.bin 不需要独立 meta.json，它们被 builder_inplace.exe.meta.json
 # 的 components 字段引用，packer 通过 builder 的 meta 间接验证它们的存在。
 $metaFiles = @(
     @{
@@ -215,24 +169,24 @@ $metaFiles = @(
         }
     },
     @{
-        Path = "$stubOutDir\winlock_builder.exe.meta.json"
+        Path = "$stubOutDir\builder_inplace.exe.meta.json"
         Json = @{
             name = "winlock"
             kind = "inplace-builder"
             subsystem = "gui"
             description = "WinLock in-place packer (GUI dialog, no plaintext tempfile, XTEA + SHA-256)"
             version = "2.0.0"
-            # components 文件名与分发文件名一致（build.ps1 拷贝时已加 winlock_ 前缀）
-            # builder.exe 运行时 --stub-dir 指向此目录，按 winlock_stub_xXX.bin 优先搜索
+            # components 文件名与分发文件名一致（packer/dist/ 已统一新命名）
+            # builder_inplace.exe 运行时 --stub-dir 指向此目录，按 stub_inplace_xXX.bin 搜索
             components = @{
-                stub_x64 = "winlock_stub_x64.bin"
-                stub_x86 = "winlock_stub_x86.bin"
+                stub_x64 = "stub_inplace_x64.bin"
+                stub_x86 = "stub_inplace_x86.bin"
             }
             supported_machines = @("amd64", "i386")
         }
     },
     @{
-        Path = "$stubOutDir\winlock_reflective_builder.exe.meta.json"
+        Path = "$stubOutDir\builder_reflective.exe.meta.json"
         Json = @{
             name = "winlock-reflective"
             kind = "reflective-builder"
@@ -240,10 +194,10 @@ $metaFiles = @(
             description = "WinLock reflective packer (memory load, supports x86/x64/.NET, plaintext v1)"
             version = "1.0.0"
             # components 文件名与分发文件名一致
-            # builder_reflective.exe 运行时 --stub 指向此目录的 loader_xXX.exe
+            # builder_reflective.exe 运行时 --stub 指向此目录的 stub_reflective_xXX.exe
             components = @{
-                stub_x64 = "loader_x64.exe"
-                stub_x86 = "loader_x86.exe"
+                stub_x64 = "stub_reflective_x64.exe"
+                stub_x86 = "stub_reflective_x86.exe"
             }
             supported_machines = @("amd64", "i386")
         }
@@ -256,7 +210,9 @@ foreach ($m in $metaFiles) {
 
 # ---- 编译 packer（会自动拷贝 stub/ 到输出目录 + Costura 嵌入依赖 DLL）----
 Write-Host "==> 编译 packer（Costura 嵌入依赖 + 拷贝 stub/ 到输出）..." -ForegroundColor Cyan
-dotnet build packer -c $config
+# 显式指定 -p:Platform=AnyCPU：.NET 10 SDK 默认 Platform=x64，会把产物输出到 bin\x64\Release\，
+# 而本脚本后面基于 bin\$(Configuration)\ 查找产物（与 .NET 6/7/8 行为一致）
+dotnet build packer -c $config -p:Platform=AnyCPU
 if ($LASTEXITCODE -ne 0) { throw "packer build failed" }
 
 # ---- 验证 packer 输出目录的 stub/ 子目录 ----
