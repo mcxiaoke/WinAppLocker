@@ -9,6 +9,15 @@
 ; 入口签名：void __cdecl jump_to_oep_x86(void* oep);
 ;   x86 __cdecl: [esp+4] = 第一个参数 = oep
 ;
+; 节区：
+;   必须放进 .lock$text 节（与 x64 同样的问题），
+;   否则 MASM 默认 .code 段会被 link.exe 放进 .text 节，
+;   extract_lock_section.py 不提取 .text，stub.bin 缺失此函数，
+;   stub 运行时跳到 .lock padding 区域崩溃（AV 0xC0000005）。
+;
+;   MASM x86 SEGMENT ALIAS 用法与 x64 一致：指定实际 COFF 节名
+;   （含 $ 等特殊字符时必须用 ALIAS），link.exe 按 $ 分组规则合并到 .lock。
+;
 ; 注意：
 ;   x86 MASM 的符号名需前导下划线（_jump_to_oep_x86），
 ;   与 __cdecl 调用约定的 name decoration 一致。
@@ -17,7 +26,8 @@
 .586
 .model flat
 
-.code
+; 用 SEGMENT 关键字 + ALIAS 把函数放进 .lock$text 节
+locktext SEGMENT READ EXECUTE ALIAS('.lock$text')
 
 ; void __cdecl jump_to_oep_x86(void* oep /*[esp+4]*/);
 _jump_to_oep_x86 PROC
@@ -25,5 +35,7 @@ _jump_to_oep_x86 PROC
     and  esp, -16       ; 16 字节对齐（清除 ESP 低 4 位）
     jmp  eax            ; 跳到 OEP（不压返回地址）
 _jump_to_oep_x86 ENDP
+
+locktext ENDS
 
 END

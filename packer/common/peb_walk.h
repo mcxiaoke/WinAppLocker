@@ -65,25 +65,38 @@ typedef struct {
 typedef struct { USHORT Length; USHORT MaxLength; PWSTR Buffer; } USTR;
 
 /* LDR_DATA_TABLE_ENTRY（简化版，仅含需要的字段）
- *   InLoadOrderLinks        +0x00
- *   InMemoryOrderLinks      +0x10
- *   InInitializationOrderLinks +0x20
- *   DllBase                 +0x30
- *   EntryPoint              +0x38
- *   SizeOfImage             +0x40 (ULONG)
- *   _pad1                   +0x44 (对齐)
- *   FullDllName             +0x48 (USTR)
- *   BaseDllName             +0x58 (USTR) */
+ *
+ * 注意：偏移注释是 x64 下的（PVOID=8B, MY_LIST_ENTRY=16B）。
+ * x86 上 PVOID/MY_LIST_ENTRY 都是 4B，编译器自动生成更小的偏移。
+ *
+ *   x64 布局：                         x86 布局（Windows 实际）：
+ *   InLoadOrderLinks        +0x00      InLoadOrderLinks        +0x00
+ *   InMemoryOrderLinks      +0x10      InMemoryOrderLinks      +0x08
+ *   InInitializationOrderLinks +0x20  InInitializationOrderLinks +0x10
+ *   DllBase                 +0x30      DllBase                 +0x18
+ *   EntryPoint              +0x38      EntryPoint              +0x1c
+ *   SizeOfImage             +0x40      SizeOfImage             +0x20
+ *   _pad1                   +0x44      (无 padding，USTR.Buffer 是 4B 自然对齐)
+ *   FullDllName             +0x48      FullDllName             +0x24
+ *   BaseDllName             +0x58      BaseDllName             +0x2c
+ *
+ * 关键 bug 历史：
+ *   原代码无条件 ULONG _pad1，导致 x86 上 BaseDllName 错位 4 字节。
+ *   stub_x86 运行时 hash_wstr_lower 读 BaseDllName.Buffer 实际读到 +0x34，
+ *   而 Windows 在 +0x30，读到错误指针值 -> AV 0xC0000005。
+ *   x64 不受影响（_pad1 在 x64 上是必需的，对齐 FullDllName 到 8B 边界）。 */
 typedef struct _LDR_DATA_TABLE_ENTRY_X {
     MY_LIST_ENTRY InLoadOrderLinks;          /* +0x00 */
-    MY_LIST_ENTRY InMemoryOrderLinks;        /* +0x10 */
-    MY_LIST_ENTRY InInitializationOrderLinks;/* +0x20 */
-    PVOID         DllBase;                   /* +0x30 */
-    PVOID         EntryPoint;                /* +0x38 */
-    ULONG         SizeOfImage;               /* +0x40 */
-    ULONG         _pad1;                     /* +0x44 对齐 */
-    USTR          FullDllName;               /* +0x48 */
-    USTR          BaseDllName;               /* +0x58 */
+    MY_LIST_ENTRY InMemoryOrderLinks;        /* +0x10 (x64) / +0x08 (x86) */
+    MY_LIST_ENTRY InInitializationOrderLinks;/* +0x20 (x64) / +0x10 (x86) */
+    PVOID         DllBase;                   /* +0x30 (x64) / +0x18 (x86) */
+    PVOID         EntryPoint;                /* +0x38 (x64) / +0x1c (x86) */
+    ULONG         SizeOfImage;               /* +0x40 (x64) / +0x20 (x86) */
+#ifdef _WIN64
+    ULONG         _pad1;                     /* +0x44 对齐 FullDllName 到 8B 边界（x64 only） */
+#endif
+    USTR          FullDllName;               /* +0x48 (x64) / +0x24 (x86) */
+    USTR          BaseDllName;               /* +0x58 (x64) / +0x2c (x86) */
 } LDR_DATA_TABLE_ENTRY_X;
 
 /* PEB 访问：x64 用 gs:[0x60]，x86 用 fs:[0x30]。

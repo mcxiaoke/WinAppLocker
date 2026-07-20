@@ -1,5 +1,70 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 3 完成：x86 stub 构建 + 多样本验证 + 关键 bug 修复
+
+承接上一条「阶段 3 批 3」记录，本条完成 x86 stub 构建配置、多样本端到端验证，并修复两个关键 bug。整个阶段 3 验证点（spec 第 264-275 行）全部通过：x64 3/5 PASS + x86 2/2 PASS（剩 2 个 TLS_PROXY 样本为已知基线 bug，非回归）。
+
+### 1. x86 stub CMake 配置修复（`packer/stub/CMakeLists.txt`）
+
+- **`/ENTRY:stub_entry` 替代 `/ENTRY:_stub_entry`**：link.exe 会自动按 `__cdecl` 装饰为 `_stub_entry`。原写法 `/ENTRY:_stub_entry` 会被再次装饰为 `__stub_entry`，导致 LNK2001 无法解析外部符号
+- **添加 `/FIXED:NO` 保留 `.reloc` 节**：仅 `/DYNAMICBASE:NO` 会让 link.exe strip 掉 `.reloc`，导致 builder 加壳 x86 PE 时报 "winlock_stub_x86.exe has no .reloc section"。`/FIXED:NO` 配合 `/DYNAMICBASE:NO` 既关闭 ASLR 又保留 `.reloc`（x86 stub 用绝对地址引用静态数据，builder 必须读 `.reloc` 做预 patch）
+- **POST_BUILD 复制 stub_x86.exe**：stub_x86.bin 在 `CMAKE_CURRENT_BINARY_DIR`，但 stub_x86.exe 在 `Release/` 子目录，builder 期望两者在同目录（`--stub-dir` 指向此目录）。新增 `copy_if_different` 命令复制 stub_x86.exe 到 stub_x86.bin 同目录
+
+### 2. x86 jump_to_oep 节区修复（`packer/stub/stub_asm_x86.asm`）
+
+- 与 x64 同样的问题：MASM 默认 `.code` 段会被 link.exe 放进 `.text` 节，`extract_lock_section.py` 不提取 `.text`，stub.bin 缺失此函数
+- 用 `SEGMENT ALIAS('.lock$text')` 替代 `.code`，link.exe 按 `$` 分组合并到 `.lock` 节
+
+### 3. builder `extract_stub_reloc_info` bug 修复（`packer/builder/builder.c`）
+
+- **原 bug**：循环遍历所有节找 `.lock`，但没 break，`lock_rva` 被覆盖为最后一个 `.lock` 节的 VA（如 `.lock$tlscbm` VA=0x5000）。这导致 `patch_stub_relocations` 用错误范围 `[0x5000, 0x5000+stub_size)` 过滤 `.reloc` 条目，0 个条目被 patch，x86 stub 运行时所有绝对地址错位 -> AV 0xC0000005
+- **修复**：取所有 `.lock` 节的最小 RVA 作为 `lock_rva`，最大 `(RVA+VSize)` 减最小 RVA 作为 `lock_size`，覆盖整个 `.lock` 区域。修复后 builder 报告 `Patched 84 stub relocations`（之前是 0）
+
+### 4. peb_walk.h x86 结构布局 bug 修复（`packer/common/peb_walk.h`）
+
+- **原 bug**：`LDR_DATA_TABLE_ENTRY_X._pad1` 是 x64 only 的对齐 padding（用于让 FullDllName 对齐到 8 字节边界），但代码无条件定义此字段。x86 上 PVOID 是 4 字节，USTR.Buffer 4 字节本身对齐，不需要 _pad1
+- **后果**：x86 上 BaseDllName 错位 4 字节（编译器在 +0x30，Windows 实际在 +0x2c）。`find_module_by_hash` 调用 `hash_wstr_lower(e->BaseDllName.Buffer, ...)` 时，Buffer 读到错误的字段值（无效指针 0x22cc），导致 `mov bl, byte ptr [eax+edi*2]` 触发 AV 0xC0000005
+- **修复**：用 `#ifdef _WIN64` 包裹 `_pad1`。x64 仍保留（必需），x86 不定义（自然对齐）
+- **影响范围**：此 bug 只影响 x86 stub/loader，x64 不受影响（_pad1 仍存在，二进制不变）
+
+### 5. 多样本端到端验证
+
+测试脚本：`temp/test_phase3_samples.py`（test mode `-t`，跳过密码框直接走 `verify_password(L"test123")`）
+
+| 样本 | 架构 | 结果 | 备注 |
+|------|------|------|------|
+| helloguix64 | x64 | PASS | GUI 启动后 3 秒仍存活 |
+| hellomfcx64 | x64 | PASS | MFC + /GS SecurityCookie 初始化正常 |
+| hellocli | x64 | PASS | exit=0，stdout="Hello World!" |
+| hellomingw | x64 | FAIL | exit=0xC00000FD，TLS_PROXY 模式崩溃，MinGW 基线也崩溃（非回归） |
+| helloucrt | x64 | FAIL | exit=0xC0000005，同上 TLS_PROXY 问题 |
+| helloguix86 | x86 | PASS | GUI 启动后 3 秒仍存活（修复 _pad1 bug 后通过） |
+| hellomfcx86 | x86 | PASS | MFC x86 启动正常 |
+
+### 6. 已知 TLS_PROXY bug（非 MSVC 迁移引入）
+
+- `hellomingw` / `helloucrt` 有 2 个 TLS callbacks，builder 启用 TLS_PROXY 模式（在 `.lock` 节内创建新 TLS directory + callbacks 数组 `[stub_tls_callback, NULL]`）
+- 用 MinGW 版 stub_x64.bin（25008 字节）替换 MSVC 版加壳 `hellomingw`，运行同样崩溃（exit=0xC0000005），确认是基线 bug 而非 MSVC 迁移引入
+- cdb 调试显示 crash 在 `rip=image_base`（MZ header `4d5a` = `pop r10` 当代码执行），推测 `stub_tls_callback` 调用原 callbacks 时地址错误（原 callbacks 数组 VA 指向 image base）
+- 不阻塞 MSVC 迁移，留作后续单独修复
+
+### 涉及文件
+
+- `packer/stub/CMakeLists.txt`：x86 链接选项 + POST_BUILD 复制 stub_x86.exe
+- `packer/stub/stub_asm_x86.asm`：`SEGMENT ALIAS('.lock$text')` 修复
+- `packer/builder/builder.c`：`extract_stub_reloc_info` 取最小 RVA 而非最后一个
+- `packer/common/peb_walk.h`：`_pad1` 用 `#ifdef _WIN64` 包裹
+
+### 临时验证文件（在 `temp/`，被 .gitignore 排除）
+
+- `temp/test_phase3_samples.py`：阶段 3 多样本验证脚本
+- `temp/build_x86_stub.ps1`：x86 stub 构建脚本（用 vcvarsamd64_x86.bat 交叉编译）
+- `temp/dump_stub_sections.py`：检查 stub_xXX.exe 节布局
+- `temp/dump_stub_reloc.py`：dump stub_x86.exe 的 .reloc 表条目
+- `temp/find_stub_magic.py`：搜索 stub.bin 中 STUB_*_MAGIC 位置
+- `temp/disasm_stub_x86.py`：用 capstone 反汇编 stub_x86.bin
+- `temp/debug_x86.ps1`：用 cdb 调试 x86 崩溃
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 3 批 3 完成：jump_to_oep_x64 修复 + SHA-256 用 Brad Conte 实现
 
 承接上一条「阶段 3 进度」记录，本条完成批 3（MASM 实现 jump_to_oep_x64）并修复 SHA-256 bug，整个 stub 现在可在 MSVC 下端到端工作（加壳→密码校验→解密 .text→跳 OEP）。

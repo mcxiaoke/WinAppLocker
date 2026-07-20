@@ -219,22 +219,37 @@ static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
                 + sizeof(IMAGE_FILE_HEADER) + s_nt32->FileHeader.SizeOfOptionalHeader);
     }
 
+    /* 遍历所有节，找 .lock 节的最小 RVA 和总跨度，以及 .reloc 节位置。
+     * 注意：MSVC link.exe 不合并不同特性的 .lock$X 子节（LNK4078 警告），
+     * 导致 PE 中有多个独立的 .lock 节（.lock$text / .lock$data / .lock$rdata）。
+     * 必须取所有 .lock 节的并集 [min_rva, max_rva+vsize)，才能覆盖整个 .lock 区域。
+     *
+     * 旧 bug：循环没 break，lock_rva 被覆盖为最后一个 .lock 节的 VA（如 .lock$tlscbm），
+     * 导致 patch_stub_relocations 用错误范围过滤，0 个条目被 patch，
+     * x86 stub 运行时绝对地址全部错位（delta 巨大）-> AV 0xC0000005。 */
     uint32_t lock_rva = 0, lock_size = 0;
+    uint32_t lock_min_rva = 0xFFFFFFFF, lock_max_end = 0;
     uint32_t reloc_off = 0, reloc_size = 0;
+    int has_lock = 0;
     for (WORD i = 0; i < n_sec; i++) {
         char name[9] = {0};
         memcpy(name, s_sec[i].Name, 8);
         if (strcmp(name, ".lock") == 0) {
-            lock_rva = s_sec[i].VirtualAddress;
-            lock_size = s_sec[i].Misc.VirtualSize;
-            if (lock_size == 0) lock_size = s_sec[i].SizeOfRawData;
+            uint32_t va = s_sec[i].VirtualAddress;
+            uint32_t vs = s_sec[i].Misc.VirtualSize ? s_sec[i].Misc.VirtualSize
+                                                     : s_sec[i].SizeOfRawData;
+            if (va < lock_min_rva) lock_min_rva = va;
+            if (va + vs > lock_max_end) lock_max_end = va + vs;
+            has_lock = 1;
         } else if (strcmp(name, ".reloc") == 0) {
             reloc_off = s_sec[i].PointerToRawData;
             reloc_size = s_sec[i].SizeOfRawData;
         }
     }
 
-    if (lock_rva == 0) return -1;
+    if (!has_lock) return -1;
+    lock_rva = lock_min_rva;
+    lock_size = lock_max_end - lock_min_rva;
     *out_lock_rva = lock_rva;
     *out_lock_size = lock_size;
     *out_reloc_off = reloc_off;

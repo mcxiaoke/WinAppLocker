@@ -125,23 +125,39 @@ if(WINLOCK_BUILD_X86 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         $<$<COMPILE_LANGUAGE:C>:/Gy>
     )
 
-    # x86 入口名带下划线前缀（__cdecl name decoration）
+    # x86 入口名：用 undecorated name（/ENTRY:stub_entry），
+    # link.exe 会自动按 __cdecl 装饰为 _stub_entry。
+    # 之前写成 /ENTRY:_stub_entry 会再次装饰为 __stub_entry 导致 LNK2001。
+    #
+    # /FIXED:NO 必须配合 /DYNAMICBASE:NO：
+    #   - /DYNAMICBASE:NO  关闭 ASLR（stub 用绝对地址，需要固定基址）
+    #   - /FIXED:NO        保留 .reloc 节（builder 读它做预 patch）
+    #     如果只 /DYNAMICBASE:NO 不加 /FIXED:NO，link.exe 会 strip 掉 .reloc，
+    #     builder 加壳 x86 PE 时会报 "winlock_stub_x86.exe has no .reloc section"。
     target_link_options(stub_x86 PRIVATE
         /NODEFAULTLIB
-        /ENTRY:_stub_entry
+        /ENTRY:stub_entry
         /SUBSYSTEM:WINDOWS
         /BASE:0x10000
         /DYNAMICBASE:NO
+        /FIXED:NO
         /OPT:REF
         /OPT:ICF
     )
 
     add_custom_command(TARGET stub_x86 POST_BUILD
+        # 提取 .lock 节为 stub_x86.bin
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_SOURCE_DIR}/cmake/extract_lock_section.py
                 $<TARGET_FILE:stub_x86>
                 ${CMAKE_CURRENT_BINARY_DIR}/stub_x86.bin
-        COMMENT "Extracting .lock sections -> stub_x86.bin"
+        # 复制 stub_x86.exe 到 stub_x86.bin 同目录
+        # builder 加壳 x86 PE 时需要读 stub_x86.exe 的 .reloc 节做预 patch，
+        # 期望 stub_x86.bin 和 stub_x86.exe 在同一目录（--stub-dir 指向此目录）
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:stub_x86>
+                ${CMAKE_CURRENT_BINARY_DIR}/stub_x86.exe
+        COMMENT "Extracting .lock sections -> stub_x86.bin + copy stub_x86.exe"
         VERBATIM
     )
 endif()
