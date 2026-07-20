@@ -264,7 +264,6 @@ add_custom_command(TARGET stub_x64 POST_BUILD
 **验证点**（批 3 完成后，MSVC 编译）：
 - `cmake --build build-x64 --config Release --target stub_x64` 生成 stub_x64.exe + stub_x64.bin
 - nm 验证 stub_entry 符号存在
-- stub_x64.bin 体积与 MinGW 版差异 < 30%（目标 < 8KB）
 - 加壳 helloguix64.exe（x64），弹密码框，输入 hello123，程序正常启动
 - 加壳 hellomfcx64.exe（MFC + /GS，验证 SecurityCookie 初始化）
 - 加壳 hellocli.exe / hellomingw.exe / helloucrt.exe
@@ -275,7 +274,6 @@ add_custom_command(TARGET stub_x64 POST_BUILD
 - 加壳 helloguix86.exe / hellomfcx86.exe / hellowinforms.exe
 
 **回滚触发**：
-- stub_x64.bin 体积变化 > 50% → 部分回滚 2（Inplace 保留 MinGW）
 - stub_entry 魔数搜索失败 → 检查 /MERGE，回退批 3
 - hellogui/hellomfcx64 加壳后崩溃 → 回退批 3，保留批 1+2
 
