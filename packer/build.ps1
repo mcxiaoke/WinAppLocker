@@ -1,4 +1,4 @@
-# WinLock packer 构建脚本（MSVC x64 + x86 双架构，产物汇集到 dist/）
+# WinLock packer 构建脚本（inplace stub 用 MinGW，其余用 MSVC x64 + x86）
 #
 # 用法：
 #   .\build.ps1               # 默认 Release，构建 x64 + x86
@@ -7,18 +7,19 @@
 #   .\build.ps1 -Clean        # 清理 build/ 和 dist/ 后重新构建
 #   .\build.ps1 -SkipX64      # 跳过 x64 构建，只构建 x86
 #   .\build.ps1 -SkipX86      # 跳过 x86 构建，只构建 x64
+#   .\build.ps1 -SkipMinGW    # 跳过 MinGW 构建 inplace stub（用 MSVC 版本）
 #
 # 流程：
-#   1. vcvarsall.bat x86 → cmake configure + build x86 产物到 build/x86/
-#   2. vcvarsall.bat x64 → cmake configure + build x64 产物到 build/x64/
+#   1. MSVC vcvarsall → cmake build（builder + reflective stub + inplace stub 备份）
+#   2. MinGW 构建 inplace stub（x64），覆盖 MSVC 产物
 #   3. 汇集产物到 dist/（平级，不带子目录）
 #
 # 产物（dist/）：
 #   builder_inplace.exe          - inplace 加壳器（x64，运行时按输入 PE 选 stub）
-#   stub_inplace_x64.bin          - inplace x64 stub（.lock 节提取，PIC 自包含）
-#   stub_inplace_x64.exe          - inplace x64 stub exe（参考用，builder 不需要）
-#   stub_inplace_x86.bin          - inplace x86 stub（.lock 节提取）
-#   stub_inplace_x86.exe          - inplace x86 stub exe（builder 加壳时读 .reloc 用）
+#   stub_inplace_x64.bin          - inplace x64 stub（MinGW 构建，TLS callback 完整）
+#   stub_inplace_x64.exe          - inplace x64 stub exe（MinGW 构建，builder 读 .reloc 用）
+#   stub_inplace_x86.bin          - inplace x86 stub（MSVC 构建）
+#   stub_inplace_x86.exe          - inplace x86 stub exe（MSVC 构建）
 #   builder_reflective.exe        - reflective 加壳器（x64）
 #   stub_reflective_x64.exe       - reflective x64 stub
 #   stub_reflective_x86.exe       - reflective x86 stub
@@ -36,7 +37,8 @@ param(
     [switch]$Release,
     [switch]$Clean,
     [switch]$SkipX64,
-    [switch]$SkipX86
+    [switch]$SkipX86,
+    [switch]$SkipMinGW
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,7 +69,8 @@ function Invoke-Vcvarsall([string]$vcvarsArch) {
     if ($LASTEXITCODE -ne 0) { throw "vcvarsall.bat $vcvarsArch 调用失败" }
     foreach ($line in $envOutput) {
         if ($line -match '^([^=]+)=(.*)$') {
-            Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+            # 用 .NET API 避免 PowerShell Env: provider 把 [ ] 等字符当通配符
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
         }
     }
     $clPath = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source
@@ -128,6 +131,102 @@ function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
     Write-Host "==> $arch 构建完成" -ForegroundColor Green
 }
 
+# 辅助函数：MinGW 构建 inplace stub (x64 + x86)
+# 使用 MSYS64 工具链（mingw64/mingw32），输出到 build/mingw/，
+# 产物覆盖 MSVC 的 stub_inplace_xXX.bin/.exe
+function Build-InplaceMinGW {
+    Write-Host ""
+
+    $msys = "C:\Home\Develop\msys64"
+    $commonDir = Join-Path $root "common"
+    $inplaceDir = Join-Path $root "inplace"
+    $stubLd = Join-Path $inplaceDir "stub.ld"
+    $stubC = Join-Path $inplaceDir "stub.c"
+    $buildDir = Join-Path $root "build\mingw"
+
+    if (-not (Test-Path $buildDir)) {
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+    }
+
+    # 通用编译参数
+    $commonCflags = @(
+        "-Wall", "-Wextra", "-Wno-cast-function-type",
+        "-O2", "-ffreestanding",
+        "-fno-stack-protector", "-fno-pic", "-fno-pie",
+        "-fno-asynchronous-unwind-tables", "-fno-exceptions", "-fno-ident",
+        "-DWINLOCK_STUB",
+        "-I", $commonDir
+    )
+
+    # 通用链接参数
+    $commonLdflags = @(
+        "-nostdlib", "-nostartfiles",
+        "-Wl,-subsystem,windows", "-Wl,-e,stub_entry",
+        "-Wl,-T,$stubLd",
+        "-Wl,--gc-sections", "-Wl,--build-id=none"
+    )
+
+    # 架构定义: name, mingw_bin, extra_cflags, msvc_build_dir
+    $archs = @(
+        @{ Name="x64"; MingwBin="$msys\mingw64\bin"; ImageBase="0x10000";
+           ExtraCflags=@("-mno-red-zone", "-mno-sse", "-mno-sse2"); MsvcDir="build\x64" },
+        @{ Name="x86"; MingwBin="$msys\mingw32\bin"; ImageBase="0x10000";
+           ExtraCflags=@(); MsvcDir="build\x86" }
+    )
+
+    foreach ($arch in $archs) {
+        $archName = $arch.Name
+        $gcc = Join-Path $arch.MingwBin "gcc.exe"
+        $objcopy = Join-Path $arch.MingwBin "objcopy.exe"
+
+        if (-not (Test-Path $gcc)) {
+            Write-Host "    [警告] MinGW $archName gcc 不存在: $gcc，跳过" -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Host "======== MinGW 构建 inplace stub ($archName) ========" -ForegroundColor Cyan
+
+        # 确保 mingw bin 在 PATH 最前面
+        $env:Path = "$($arch.MingwBin);$env:Path"
+
+        $objFile = Join-Path $buildDir "stub_$archName.o"
+        $exeFile = Join-Path $buildDir "stub_inplace_$archName.exe"
+        $binFile = Join-Path $buildDir "stub_inplace_$archName.bin"
+
+        # 编译
+        $cflags = $commonCflags + $arch.ExtraCflags
+        Write-Host "    编译 $stubC ..."
+        & $gcc @cflags -c $stubC -o $objFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) { throw "MinGW $archName 编译失败" }
+
+        # 链接
+        $ldflags = $commonLdflags + @("-Wl,--image-base=$($arch.ImageBase)")
+        Write-Host "    链接 $exeFile ..."
+        & $gcc @cflags @ldflags $objFile -o $exeFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) { throw "MinGW $archName 链接失败" }
+
+        # 提取 .lock 节为 bin
+        Write-Host "    提取 .lock 节 -> $binFile ..."
+        & $objcopy -O binary -j .lock $exeFile $binFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) { throw "MinGW $archName objcopy 失败" }
+
+        $binSize = (Get-Item $binFile).Length
+        $exeSize = (Get-Item $exeFile).Length
+        Write-Host "    stub_inplace_$($archName).bin: $binSize bytes" -ForegroundColor DarkGray
+        Write-Host "    stub_inplace_$($archName).exe: $exeSize bytes" -ForegroundColor DarkGray
+
+        # 覆盖 MSVC 产物
+        $msvcDir = Join-Path $root $arch.MsvcDir
+        if (Test-Path $msvcDir) {
+            Copy-Item $binFile (Join-Path $msvcDir "stub_inplace_$($archName).bin") -Force
+            Copy-Item $exeFile (Join-Path $msvcDir "stub_inplace_$($archName).exe") -Force
+            Write-Host "    已覆盖 MSVC $($arch.MsvcDir)/ 中的 inplace stub 产物" -ForegroundColor DarkGray
+        }
+
+        Write-Host "==> MinGW $archName inplace stub 构建完成" -ForegroundColor Green
+    }
+}
+
 # ---- 构建 x64 ----
 if (-not $SkipX64) {
     Build-Arch "x64" "CMakeLists-x64.txt" (Join-Path $root "build\x64")
@@ -136,6 +235,13 @@ if (-not $SkipX64) {
 # ---- 构建 x86 ----
 if (-not $SkipX86) {
     Build-Arch "x86" "CMakeLists-x86.txt" (Join-Path $root "build\x86")
+}
+
+# ---- MinGW 构建 inplace stub (x64) ----
+# MSVC 的 /OPT:REF 会移除 TLS callback 代码（.lock$tlscb 节），
+# MinGW 用 __attribute__((used)) + KEEP() 天然保留，且产物体积更小（7.5KB vs 24.5KB）
+if (-not $SkipMinGW) {
+    Build-InplaceMinGW
 }
 
 # ---- 汇集产物到 dist/ ----

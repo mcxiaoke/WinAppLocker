@@ -757,6 +757,7 @@ static int prompt_password(void) {
  * ============================================================ */
 WINLOCK_SECTION_ENTRY WINLOCK_OPTIMIZE_OFF
 void stub_entry(void) {
+
     /* 1. PEB walk 找 kernel32（windows 启动时已加载）
      *    P1-1: 用 hash 替代明文模块名，避免 strings 暴露 "kernel32.dll" */
     PVOID k32 = find_module_by_hash(HASH_MOD_KERNEL32_DLL);

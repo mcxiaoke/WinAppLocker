@@ -136,6 +136,19 @@ def launch_and_check(exe_path, exe_type, match_keyword, wait_sec=4):
 # ---- 主测试逻辑 ----
 
 def main():
+    # ---- 0. Clean build 确保使用最新的 stub 和 builder ----
+    print("=" * 70)
+    print("[BUILD] 清理并重建 packer（MSVC x64 + x86）...")
+    print("=" * 70)
+    build_ps1 = os.path.join(REPO_ROOT, "packer", "build.ps1")
+    rc, out = run(["pwsh", "-File", build_ps1, "-Clean"], timeout=120)
+    if rc != 0:
+        print(f"[FATAL] build.ps1 failed (rc={rc})")
+        print(out)
+        return 1
+    print("[BUILD] 构建完成")
+    print()
+
     if not os.path.exists(BUILDER_INPLACE):
         print(f"[FATAL] builder_inplace.exe not found: {BUILDER_INPLACE}")
         print("       Run packer/build.ps1 first.")

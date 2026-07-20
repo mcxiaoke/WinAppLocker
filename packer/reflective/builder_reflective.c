@@ -658,126 +658,44 @@ int main(int argc, char* argv[]) {
     }
     /* TODO: x86 TLS 扩展（x86 的 TLS 目录结构不同，后续支持） */
 
-    /* 找最后一个节的 VA 结束位置和文件结束位置
-     * 新节的 VA 必须在所有现有节之后，按 SectionAlignment 对齐
-     * 新节的 RawOffset 必须在所有现有节之后，按 FileAlignment 对齐 */
-    DWORD last_va_end = 0;
-    DWORD last_raw_end = 0;
-    for (WORD i = 0; i < s_n_sec; i++) {
-        DWORD va_end = s_sec[i].VirtualAddress +
-                       (s_sec[i].Misc.VirtualSize ? s_sec[i].Misc.VirtualSize : s_sec[i].SizeOfRawData);
-        DWORD raw_end = s_sec[i].PointerToRawData + s_sec[i].SizeOfRawData;
-        if (va_end > last_va_end) last_va_end = va_end;
-        if (raw_end > last_raw_end) last_raw_end = raw_end;
-    }
-    /* stub EXE 文件实际末尾可能超过最后一个节的 raw_end（如 certificate 表）
-     * 用 max(last_raw_end, stub_size) 作为文件末尾 */
-    if (stub_size > last_raw_end) last_raw_end = (DWORD)stub_size;
-
-    /* 6. 计算新 .payload 节的位置 */
-    DWORD new_va           = (last_va_end + s_sec_align - 1) & ~(s_sec_align - 1);
-    DWORD new_vsize        = (DWORD)total_payload_size;
-    DWORD new_vsize_aligned= (new_vsize + s_sec_align - 1) & ~(s_sec_align - 1);
-    DWORD new_raw_off      = (last_raw_end + s_file_align - 1) & ~(s_file_align - 1);
-    DWORD new_raw_size     = (DWORD)((total_payload_size + s_file_align - 1) & ~(s_file_align - 1));
-
-    printf("[+] New .payload section: VA=0x%lx VSize=0x%lx RawOff=0x%lx RawSize=0x%lx\n",
-           (unsigned long)new_va, (unsigned long)new_vsize,
-           (unsigned long)new_raw_off, (unsigned long)new_raw_size);
-
-    /* 检查节表是否有空间（节表在第一个节之前，每个节头 40 字节）*/
-    DWORD sec_table_start = (DWORD)((uint8_t*)s_sec - stub);
-    DWORD sec_table_end = sec_table_start + s_n_sec * sizeof(IMAGE_SECTION_HEADER);
-    DWORD first_sec_raw = 0xFFFFFFFF;
-    for (WORD i = 0; i < s_n_sec; i++) {
-        if (s_sec[i].PointerToRawData > 0 && s_sec[i].PointerToRawData < first_sec_raw) {
-            first_sec_raw = s_sec[i].PointerToRawData;
+    /* 7. 先写 stub 到输出文件（不含 .payload）
+     *    必须在加 .payload 之前复制图标/版本资源，
+     *    因为 EndUpdateResourceW 会重写 PE 文件，可能改变节布局，
+     *    导致 .payload 数据被破坏或偏移错误 */
+    {
+        size_t out_base_size = stub_size;
+        uint8_t* out_base = (uint8_t*)calloc(out_base_size, 1);
+        if (!out_base) {
+            printf("[-] Out of memory for base output (%zu bytes)\n", out_base_size);
+            free(stub); free(payload); free(in_pe);
+            return 1;
         }
-    }
-    /* SizeOfHeaders 通常覆盖节表，但加一个新节头后可能溢出
-     * 这里简化检查：节表末尾 + 新节头(40B) 不能超过第一个节的 raw offset */
-    if (sec_table_end + sizeof(IMAGE_SECTION_HEADER) > first_sec_raw) {
-        printf("[-] No room in section table for .payload (need %zu, have %lu)\n",
-               sizeof(IMAGE_SECTION_HEADER), (unsigned long)(first_sec_raw - sec_table_end));
-        /* MVP 简化：直接报错，不做节表扩展 */
-        free(stub); free(payload); free(in_pe);
-        return 1;
-    }
+        memcpy(out_base, stub, stub_size);
 
-    /* 7. 准备输出缓冲区
-     *   [stub 原始数据] + [padding 到 new_raw_off] + [.payload 节] + [padding] */
-    size_t out_size = new_raw_off + new_raw_size;
-    uint8_t* out = (uint8_t*)calloc(out_size, 1);
-    if (!out) {
-        printf("[-] Out of memory for output (%zu bytes)\n", out_size);
-        free(stub); free(payload); free(in_pe);
-        return 1;
-    }
+        /* 设置 subsystem 和 CheckSum（继承原 PE 的 subsystem，让 GUI 程序保持 GUI） */
+        IMAGE_DOS_HEADER* base_dos = (IMAGE_DOS_HEADER*)out_base;
+        if (stub_is_x64) {
+            IMAGE_NT_HEADERS64* base_nt = (IMAGE_NT_HEADERS64*)(out_base + base_dos->e_lfanew);
+            base_nt->OptionalHeader.Subsystem = info.subsystem;
+            base_nt->OptionalHeader.CheckSum = 0;
+        } else {
+            IMAGE_NT_HEADERS32* base_nt = (IMAGE_NT_HEADERS32*)(out_base + base_dos->e_lfanew);
+            base_nt->OptionalHeader.Subsystem = info.subsystem;
+            base_nt->OptionalHeader.CheckSum = 0;
+        }
 
-    /* 拷贝 stub 数据 */
-    memcpy(out, stub, stub_size);
-
-    /* 重新解析指针到 out 缓冲区（避免悬空指针）
-     * 按 stub 架构用对应 NT_HEADERS 类型 */
-    IMAGE_DOS_HEADER* o_dos = (IMAGE_DOS_HEADER*)out;
-    IMAGE_NT_HEADERS32* o_nt32 = (IMAGE_NT_HEADERS32*)(out + o_dos->e_lfanew);
-    IMAGE_NT_HEADERS64* o_nt64 = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
-    IMAGE_SECTION_HEADER* o_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(o_nt64)
-                                              : IMAGE_FIRST_SECTION(o_nt32);
-
-    /* 8. 添加 .payload 节头 */
-    IMAGE_SECTION_HEADER* new_sec = &o_sec[s_n_sec];
-    memset(new_sec, 0, sizeof(*new_sec));
-    memcpy(new_sec->Name, ".payload", 8);
-    new_sec->VirtualAddress    = new_va;
-    new_sec->Misc.VirtualSize  = new_vsize;
-    new_sec->SizeOfRawData     = new_raw_size;
-    new_sec->PointerToRawData  = new_raw_off;
-    /* .payload 是数据节：READ 即可（loader 只读不写）
-     * 设 WRITE 会让某些 AV 觉得可疑，所以只 READ */
-    new_sec->Characteristics   = IMAGE_SCN_CNT_INITIALIZED_DATA
-                               | IMAGE_SCN_MEM_READ;
-
-    /* 9. 写入 payload 数据 */
-    memcpy(out + new_raw_off, payload, total_payload_size);
-
-    /* 10. 更新 PE 头（按 stub 架构访问 OptionalHeader）*/
-    DWORD new_size_of_image = new_va + new_vsize_aligned;
-    if (stub_is_x64) {
-        o_nt64->FileHeader.NumberOfSections++;
-        o_nt64->OptionalHeader.SizeOfImage = new_size_of_image;
-        /* 继承原 PE 的 subsystem（让 GUI 程序保持 GUI）
-         * stub 编译为 console subsystem 便于开发，输出 EXE 改为原 PE 的 subsystem */
-        o_nt64->OptionalHeader.Subsystem = info.subsystem;
-        /* 清零 CheckSum（让 OS 不校验，CRT 不依赖 CheckSum）*/
-        o_nt64->OptionalHeader.CheckSum = 0;
-    } else {
-        o_nt32->FileHeader.NumberOfSections++;
-        o_nt32->OptionalHeader.SizeOfImage = new_size_of_image;
-        o_nt32->OptionalHeader.Subsystem = info.subsystem;
-        o_nt32->OptionalHeader.CheckSum = 0;
+        if (write_file(out_path, out_base, out_base_size) != 0) {
+            printf("[-] Failed to write base output: %s\n", out_path);
+            free(out_base); free(stub); free(payload); free(in_pe);
+            return 1;
+        }
+        free(out_base);
     }
 
-    /* 11. 写输出 */
-    if (write_file(out_path, out, out_size) != 0) {
-        printf("[-] Failed to write output: %s\n", out_path);
-        free(out); free(stub); free(payload); free(in_pe);
-        return 1;
-    }
-
-    WORD o_n_sec = stub_is_x64 ? o_nt64->FileHeader.NumberOfSections
-                               : o_nt32->FileHeader.NumberOfSections;
-    printf("[+] Wrote output: %s (%zu bytes)\n", out_path, out_size);
-    printf("[+]   Subsystem: %u(%s) (inherited from input PE)\n",
-           info.subsystem, subsys_str);
-    printf("[+]   NumberOfSections: %u -> %u\n", s_n_sec, o_n_sec);
-    printf("[+]   SizeOfImage: 0x%lx -> 0x%lx\n",
-           (unsigned long)s_size_of_image, (unsigned long)new_size_of_image);
-    printf("[+]   Entry: stub mainCRTStartup (unchanged)\n");
-
-    /* 12. 复制原 PE 的图标和版本资源到输出 EXE
-     *     让 Explorer 显示原图标，文件属性显示原版本信息
-     *     失败不致命（图标错不影响程序运行） */
+    /* 8. 复制原 PE 的图标和版本资源到输出 EXE
+     *    必须在加 .payload 之前执行，因为 EndUpdateResourceW 会重写 PE 文件，
+     *    可能改变节布局（.rsrc 变大 → 后续节的 VA/RawOffset 被移动）。
+     *    先复制资源再加 .payload 可确保 .payload 的 VA 基于最终的 .rsrc 大小计算。 */
     if (copy_icon) {
         wchar_t in_path_w[MAX_PATH], out_path_w[MAX_PATH];
         if (char_to_wchar(in_path, in_path_w, MAX_PATH) == 0 &&
@@ -794,6 +712,116 @@ int main(int argc, char* argv[]) {
     } else {
         printf("[+] Skipping icon/version copy (--no-icon)\n");
     }
+
+    /* 9. 重新读取被 EndUpdateResourceW 修改后的输出文件 */
+    size_t out_size = 0;
+    uint8_t* out = read_file(out_path, &out_size);
+    if (!out) {
+        printf("[-] Failed to re-read output file after resource copy: %s\n", out_path);
+        free(stub); free(payload); free(in_pe);
+        return 1;
+    }
+
+    /* 10. 重新解析 PE 头（EndUpdateResourceW 可能已改变节数量/布局） */
+    IMAGE_DOS_HEADER* o_dos = (IMAGE_DOS_HEADER*)out;
+    IMAGE_NT_HEADERS32* o_nt32 = (IMAGE_NT_HEADERS32*)(out + o_dos->e_lfanew);
+    IMAGE_NT_HEADERS64* o_nt64 = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
+    IMAGE_SECTION_HEADER* o_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(o_nt64)
+                                              : IMAGE_FIRST_SECTION(o_nt32);
+    WORD o_n_sec = stub_is_x64 ? o_nt64->FileHeader.NumberOfSections
+                               : o_nt32->FileHeader.NumberOfSections;
+
+    /* 11. 重新计算最后一个节的结束位置（EndUpdateResourceW 可能改了 .rsrc 大小） */
+    DWORD last_va_end = 0;
+    DWORD last_raw_end = 0;
+    for (WORD i = 0; i < o_n_sec; i++) {
+        DWORD va_end = o_sec[i].VirtualAddress +
+                       (o_sec[i].Misc.VirtualSize ? o_sec[i].Misc.VirtualSize : o_sec[i].SizeOfRawData);
+        DWORD raw_end = o_sec[i].PointerToRawData + o_sec[i].SizeOfRawData;
+        if (va_end > last_va_end) last_va_end = va_end;
+        if (raw_end > last_raw_end) last_raw_end = raw_end;
+    }
+    if (out_size > last_raw_end) last_raw_end = (DWORD)out_size;
+
+    /* 12. 计算新 .payload 节的位置（基于最终的节布局） */
+    DWORD new_va           = (last_va_end + s_sec_align - 1) & ~(s_sec_align - 1);
+    DWORD new_vsize        = (DWORD)total_payload_size;
+    DWORD new_vsize_aligned= (new_vsize + s_sec_align - 1) & ~(s_sec_align - 1);
+    DWORD new_raw_off      = (last_raw_end + s_file_align - 1) & ~(s_file_align - 1);
+    DWORD new_raw_size     = (DWORD)((total_payload_size + s_file_align - 1) & ~(s_file_align - 1));
+
+    printf("[+] New .payload section: VA=0x%lx VSize=0x%lx RawOff=0x%lx RawSize=0x%lx\n",
+           (unsigned long)new_va, (unsigned long)new_vsize,
+           (unsigned long)new_raw_off, (unsigned long)new_raw_size);
+
+    /* 13. 检查节表空间 */
+    DWORD sec_table_start = (DWORD)((uint8_t*)o_sec - out);
+    DWORD sec_table_end = sec_table_start + o_n_sec * sizeof(IMAGE_SECTION_HEADER);
+    DWORD first_sec_raw = o_sec[0].PointerToRawData;
+    if (sec_table_end + sizeof(IMAGE_SECTION_HEADER) > first_sec_raw) {
+        printf("[-] No room in section table for .payload (need %zu, have %lu)\n",
+               sizeof(IMAGE_SECTION_HEADER), (unsigned long)(first_sec_raw - sec_table_end));
+        free(out); free(stub); free(payload); free(in_pe);
+        return 1;
+    }
+
+    /* 14. 扩展输出缓冲区，添加 .payload 数据 */
+    size_t new_out_size = new_raw_off + new_raw_size;
+    uint8_t* new_out = (uint8_t*)realloc(out, new_out_size);
+    if (!new_out) {
+        printf("[-] Out of memory for final output (%zu bytes)\n", new_out_size);
+        free(out); free(stub); free(payload); free(in_pe);
+        return 1;
+    }
+    out = new_out;
+    memset(out + out_size, 0, new_out_size - out_size);
+
+    /* 重新解析指针（realloc 可能改变地址） */
+    o_dos = (IMAGE_DOS_HEADER*)out;
+    o_nt32 = (IMAGE_NT_HEADERS32*)(out + o_dos->e_lfanew);
+    o_nt64 = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
+    o_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(o_nt64) : IMAGE_FIRST_SECTION(o_nt32);
+
+    /* 15. 添加 .payload 节头 */
+    IMAGE_SECTION_HEADER* new_sec = &o_sec[o_n_sec];
+    memset(new_sec, 0, sizeof(*new_sec));
+    memcpy(new_sec->Name, ".payload", 8);
+    new_sec->VirtualAddress    = new_va;
+    new_sec->Misc.VirtualSize  = new_vsize;
+    new_sec->SizeOfRawData     = new_raw_size;
+    new_sec->PointerToRawData  = new_raw_off;
+    new_sec->Characteristics   = IMAGE_SCN_CNT_INITIALIZED_DATA
+                               | IMAGE_SCN_MEM_READ;
+
+    /* 16. 写入 payload 数据 */
+    memcpy(out + new_raw_off, payload, total_payload_size);
+
+    /* 17. 更新 PE 头 */
+    DWORD new_size_of_image = new_va + new_vsize_aligned;
+    if (stub_is_x64) {
+        o_nt64->FileHeader.NumberOfSections++;
+        o_nt64->OptionalHeader.SizeOfImage = new_size_of_image;
+    } else {
+        o_nt32->FileHeader.NumberOfSections++;
+        o_nt32->OptionalHeader.SizeOfImage = new_size_of_image;
+    }
+
+    o_n_sec++;
+
+    /* 18. 写最终输出 */
+    if (write_file(out_path, out, new_out_size) != 0) {
+        printf("[-] Failed to write final output: %s\n", out_path);
+        free(out); free(stub); free(payload); free(in_pe);
+        return 1;
+    }
+
+    printf("[+] Wrote output: %s (%zu bytes)\n", out_path, new_out_size);
+    printf("[+]   Subsystem: %u(%s) (inherited from input PE)\n",
+           info.subsystem, subsys_str);
+    printf("[+]   NumberOfSections: %u -> %u\n", s_n_sec, o_n_sec);
+    printf("[+]   SizeOfImage: 0x%lx -> 0x%lx\n",
+           (unsigned long)s_size_of_image, (unsigned long)new_size_of_image);
+    printf("[+]   Entry: stub mainCRTStartup (unchanged)\n");
 
     printf("[+] Done. Output will run stub -> reflective load -> jump to original OEP\n");
 
