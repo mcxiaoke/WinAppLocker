@@ -19,61 +19,20 @@
  */
 
 #include <stdint.h>
+#include "../common/winlock_compat.h"
 /* Provide __faststorefence for windows.h under -mno-sse2 (sfence is SSE2) */
-static __inline__ void __winlock_sfence(void) { __asm__ __volatile__("sfence" ::: "memory"); }
+static __inline__ void __winlock_sfence(void) { WINLOCK_SFENCE(); }
 #define __builtin_ia32_sfence() __winlock_sfence()
 #include <windows.h>
 #include "../common/config.h"
 
 /* ============================================================
- * 类型定义
- * ============================================================ */
-
-typedef struct { USHORT Length; USHORT MaxLength; PWSTR Buffer; } USTR;
-
-/* ============================================================
- * SHA-256 + UTF-16LE->UTF-8 + 常量时间比较（共享实现）
- *   - WINLOCK_PIC 让函数进入 .lock.text 节
- *   - 同一份代码被 tests/stub_sha256_test.c 复用（host 模式）
+ * 类型定义：PEB / LDR 类型由 common/peb_walk.h 提供
+ * SHA-256 共享实现由 common/sha256.h 提供
  * ============================================================ */
 #define WINLOCK_PIC 1
-#include "sha256.h"
-
-typedef struct {
-    LIST_ENTRY  InLoadOrderLinks;
-    LIST_ENTRY  InMemoryOrderLinks;
-    LIST_ENTRY  InInitializationOrderLinks;
-    PVOID      DllBase;
-    PVOID      EntryPoint;
-    ULONG      SizeOfImage;
-    USTR       FullDllName;
-    USTR       BaseDllName;
-} LDRENT;
-
-typedef struct {
-    ULONG      Length;
-    UCHAR      Initialized;
-    PVOID      SsHandle;
-    LIST_ENTRY InLoadOrderModuleList;
-    LIST_ENTRY InMemoryOrderModuleList;
-    LIST_ENTRY InInitializationOrderModuleList;
-} LDRCNT;
-
-typedef struct {
-    UCHAR  a, b, c, d;
-    PVOID  Mutant;
-    PVOID  ImageBaseAddress;
-    LDRCNT *Ldr;
-} PEBX;
-
-/* PEB 访问：x64 用 gs:[0x60]，x86 用 fs:[0x30]。
- * PVOID 自动按架构变大小（8B/4B），PEBX/LDRENT/USTR 用 PVOID/LIST_ENTRY，
- * 默认对齐与 Windows 内核结构一致，x86/x64 都能正确解析。 */
-#ifdef _WIN64
-#define WINLOCK_PEB()  ((PEBX*)__readgsqword(0x60))
-#else
-#define WINLOCK_PEB()  ((PEBX*)(uintptr_t)__readfsdword(0x30))
-#endif
+#include "../common/sha256.h"
+#include "../common/peb_walk.h"
 
 /* 函数指针类型 */
 typedef HMODULE  (WINAPI *FnLoadLibraryA)(LPCSTR);
@@ -91,7 +50,7 @@ typedef int      (WINAPI *FnMessageBoxW)(HWND, LPCWSTR, LPCWSTR, UINT);
  * ============================================================ */
 
 /* builder 在 stub.bin 中搜索 STUB_DATA_MAGIC 来定位此结构并填充字段 */
-__attribute__((section(".lock.data"), used, aligned(16)))
+WINLOCK_SECTION_DATA
 volatile stub_data_t stub_data = {
     .magic         = STUB_DATA_MAGIC,
     .version       = STUB_DATA_VERSION,
@@ -118,7 +77,7 @@ volatile stub_data_t stub_data = {
 };
 
 /* 运行时解析的函数指针表 */
-__attribute__((section(".lock.data"), used, aligned(16)))
+WINLOCK_SECTION_DATA
 static volatile struct {
     FnLoadLibraryA             LoadLibraryA;
     FnGetProcAddress           GetProcAddress;
@@ -137,20 +96,20 @@ static volatile struct {
  * 仅保留 UI 文本（标题/按钮/提示）和 LoadLibraryA 参数 "user32.dll"。
  * "user32.dll" 仍为明文是因为 stub 没引入 LdrLoadDll（P2 候选）。
  * 测试密码 L"test123" 仍明文（仅测试模式用，生产模式不会激活）。*/
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_TITLE[]    = L"WinLock - Password Required";
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_OK[]       = L"OK";
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_CANCEL[]   = L"Cancel";
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_WRONG[]    = L"Wrong password";
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_TEST_PWD[] = L"test123";  /* 测试模式硬编码密码 */
-__attribute__((section(".lock.rdata"), used, aligned(2)))
+WINLOCK_SECTION_RDATA
 static const wchar_t STR_MSGBOX[]   = L"WinLock";
 
-__attribute__((section(".lock.rdata"), used, aligned(1)))
+WINLOCK_SECTION_RDATA
 static const char STR_USER32_A[]                 = "user32.dll";
 
 /* ============================================================
@@ -158,7 +117,7 @@ static const char STR_USER32_A[]                 = "user32.dll";
  * ============================================================ */
 
 /* 窄字符串长度 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static size_t my_strlen(const char* s) {
     size_t n = 0;
     while (s[n]) n++;
@@ -166,7 +125,7 @@ static size_t my_strlen(const char* s) {
 }
 
 /* 宽字符串长度 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static size_t my_wstrlen(const wchar_t* s) {
     size_t n = 0;
     while (s[n]) n++;
@@ -174,7 +133,7 @@ static size_t my_wstrlen(const wchar_t* s) {
 }
 
 /* 宽字符串相等比较 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int wstr_eq(const wchar_t* a, const wchar_t* b) {
     while (*a && *b) {
         if (*a != *b) return 0;
@@ -184,7 +143,7 @@ static int wstr_eq(const wchar_t* a, const wchar_t* b) {
 }
 
 /* 大小写不敏感的宽字符比较（用于模块名） */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int wstr_ieq_n(const wchar_t* a, const wchar_t* b, size_t n) {
     for (size_t i = 0; i < n; i++) {
         wchar_t ca = a[i], cb = b[i];
@@ -197,7 +156,7 @@ static int wstr_ieq_n(const wchar_t* a, const wchar_t* b, size_t n) {
 }
 
 /* ANSI 字符串相等（API 名区分大小写） */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int astr_eq(const char* a, const char* b) {
     while (*a && *b) {
         if (*a != *b) return 0;
@@ -207,15 +166,15 @@ static int astr_eq(const char* a, const char* b) {
 }
 
 /* PEB walk：按名字查找已加载模块基址 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static PVOID find_module(const wchar_t* name) {
     PEBX*   peb = WINLOCK_PEB();
-    LDRCNT* ldr = peb->Ldr;
-    LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
-    LIST_ENTRY* curr = head->Flink;
+    PEB_LDR_DATA_X* ldr = (PEB_LDR_DATA_X*)peb->Ldr;
+    MY_LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
+    MY_LIST_ENTRY* curr = head->Flink;
     size_t name_len = my_wstrlen(name);
     while (curr != head) {
-        LDRENT* e = (LDRENT*)curr;
+        LDR_DATA_TABLE_ENTRY_X* e = (LDR_DATA_TABLE_ENTRY_X*)curr;
         if (e->BaseDllName.Buffer) {
             size_t len = e->BaseDllName.Length / sizeof(wchar_t);
             if (len == name_len && wstr_ieq_n(e->BaseDllName.Buffer, name, name_len)) {
@@ -228,7 +187,7 @@ static PVOID find_module(const wchar_t* name) {
 }
 
 /* 解析 PE 导出表，按名查找函数地址 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static PVOID find_export(PVOID mod, const char* name) {
     if (!mod) return NULL;
     uint8_t* base = (uint8_t*)mod;
@@ -262,132 +221,22 @@ static PVOID find_export(PVOID mod, const char* name) {
 }
 
 /* ============================================================
- * API 哈希化（P1-1，借鉴 peldr loader.c:99-114 + hash.py）
- *
- *   - DJB15: h = 1993; h = ((h<<4) - h) + c   即 h = h*15 + c
- *   - 大小写不敏感：ASCII_FOLD_MASK = ('A' <= c <= 'Z') ? 0x20 : 0
- *   - 模块名（wchar）取低 8 位当 ASCII 处理（系统 DLL 名都是 ASCII）
- *   - Hash 常量由 tools/gen_api_hash.py 离线生成，写入 config.h
- *   - 优点：.lock.rdata 中无明文 API 名/模块名，strings 抓取为乱码
+ * API 哈希化（P1-1）— 实现已抽取到 common/peb_walk.h
  * ============================================================ */
+#define PEB_WALK_IMPLEMENT
+#include "../common/peb_walk.h"
 
-/* DJB15 大小写不敏感 ASCII hash */
-__attribute__((section(".lock.text"), used, noinline))
-static uint32_t hash_ascii(const char* s) {
-    uint32_t h = WINLOCK_HASH_SEED;
-    uint8_t c;
-    while ((c = (uint8_t)*s++)) {
-        /* ASCII_FOLD_MASK: 'A' <= c <= 'Z' 时 mask=0x20（unsigned 比较 trick）*/
-        if ((uint8_t)(c - 'A') <= (uint8_t)('Z' - 'A')) c |= 0x20;
-        h = ((h << 4) - h) + c;
-    }
-    return h;
-}
-
-/* DJB15 大小写不敏感宽字符 hash（用于 PEB 模块名匹配）
- *   - 只取每个 wchar 的低 8 位（系统 DLL 名都是 ASCII）
- *   - len 是 wchar 数量（不是字节数） */
-__attribute__((section(".lock.text"), used, noinline))
-static uint32_t hash_wstr_lower(const wchar_t* s, size_t len) {
-    uint32_t h = WINLOCK_HASH_SEED;
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = (uint8_t)s[i];
-        if ((uint8_t)(c - 'A') <= (uint8_t)('Z' - 'A')) c |= 0x20;
-        h = ((h << 4) - h) + c;
-    }
-    return h;
-}
-
-/* PEB walk：按 hash 查找已加载模块基址 */
-__attribute__((section(".lock.text"), used, noinline))
-static PVOID find_module_by_hash(uint32_t want_hash) {
-    PEBX*   peb = WINLOCK_PEB();
-    LDRCNT* ldr = peb->Ldr;
-    LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
-    LIST_ENTRY* curr = head->Flink;
-    while (curr != head) {
-        LDRENT* e = (LDRENT*)curr;
-        if (e->BaseDllName.Buffer) {
-            size_t len = e->BaseDllName.Length / sizeof(wchar_t);
-            if (hash_wstr_lower(e->BaseDllName.Buffer, len) == want_hash) {
-                return e->DllBase;
-            }
-        }
-        curr = curr->Flink;
-    }
-    return NULL;
-}
-
-/* 解析 PE 导出表，按 hash 查找函数地址（替代 find_export） */
-__attribute__((section(".lock.text"), used, noinline))
-static PVOID find_export_by_hash(PVOID mod, uint32_t want_hash) {
-    if (!mod) return NULL;
-    uint8_t* base = (uint8_t*)mod;
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
-
-    IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (dir->VirtualAddress == 0 || dir->Size == 0) return NULL;
-
-    IMAGE_EXPORT_DIRECTORY* exp =
-        (IMAGE_EXPORT_DIRECTORY*)(base + dir->VirtualAddress);
-    DWORD* names = (DWORD*)(base + exp->AddressOfNames);
-    WORD*  ords  = (WORD*)(base +  exp->AddressOfNameOrdinals);
-    DWORD* funcs = (DWORD*)(base + exp->AddressOfFunctions);
-
-    DWORD exp_start = dir->VirtualAddress;
-    DWORD exp_end   = dir->VirtualAddress + dir->Size;
-
-    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
-        const char* n = (const char*)(base + names[i]);
-        if (hash_ascii(n) == want_hash) {
-            DWORD rva = funcs[ords[i]];
-            if (rva >= exp_start && rva < exp_end) return NULL;  /* forwarder */
-            return base + rva;
-        }
-    }
-    return NULL;
-}
-
-/* XTEA 解密单个 8 字节块 */
-__attribute__((section(".lock.text"), used, noinline))
-static void xtea_decrypt_block(uint32_t* v, const uint32_t* key) {
-    uint32_t v0 = v[0], v1 = v[1];
-    uint32_t sum = XTEA_DELTA * XTEA_ROUNDS;  /* 0xC6EF3720 */
-    for (int i = 0; i < XTEA_ROUNDS; i++) {
-        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
-        sum -= XTEA_DELTA;
-        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
-    }
-    v[0] = v0; v[1] = v1;
-}
-
-/* XTEA 解密缓冲区（按 8 字节块，尾部按字节异或密钥流） */
-__attribute__((section(".lock.text"), used, noinline))
-static void xtea_decrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
-    size_t n_blocks = size / 8;
-    size_t i;
-    for (i = 0; i < n_blocks; i++) {
-        xtea_decrypt_block((uint32_t*)(data + i * 8), key);
-    }
-    /* 尾部不足 8 字节，简单异或密钥字节 */
-    size_t tail_off = n_blocks * 8;
-    uint8_t* k = (uint8_t*)key;
-    for (i = 0; i < size - tail_off; i++) {
-        data[tail_off + i] ^= k[i];
-    }
-}
+/* XTEA 解密实现已抽取到 common/xtea.h */
+#include "../common/xtea.h"
 
 /* ---- 对话框模板构造工具 ---- */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static uint8_t* put_word(uint8_t* p, uint16_t w) {
     *(uint16_t*)p = w;
     return p + 2;
 }
 
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static uint8_t* put_wstr(uint8_t* p, const wchar_t* s) {
     while (*s) {
         *(uint16_t*)p = (uint16_t)*s++;
@@ -397,14 +246,14 @@ static uint8_t* put_wstr(uint8_t* p, const wchar_t* s) {
     return p + 2;
 }
 
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static uint8_t* align_dword(uint8_t* p, uint8_t* start) {
     uintptr_t off = (uintptr_t)(p - start);
     return start + ((off + 3) & ~(uintptr_t)3);
 }
 
 /* 在栈缓冲区上构建密码对话框 DLGTEMPLATE */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static size_t build_dialog(uint8_t* buf) {
     uint8_t* start = buf;
     uint8_t* p = buf;
@@ -471,7 +320,7 @@ static size_t build_dialog(uint8_t* buf) {
  * 通过 .lock.data 全局 fn 访问 user32 函数
  * 通过 .lock.data 全局 stub_data 读取密码（v2: SHA-256 hash）
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int verify_password(const wchar_t* input) {
     if (stub_data.flags & 0x1) {
         /* v2: hash 模式
@@ -494,7 +343,7 @@ static int verify_password(const wchar_t* input) {
     }
 }
 
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static INT_PTR WINAPI dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     (void)lParam;
     if (msg == WM_INITDIALOG) {
@@ -552,7 +401,7 @@ static INT_PTR WINAPI dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam
  *         若再次应用 delta 会"双重重定位"→ 数据损坏。
  *
  *   返回：1 成功（或无需重定位），0 失败 */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int apply_relocations(uint8_t* img_base) {
     /* 如果 builder 没填 reloc 信息，或没启用 ASLR，跳过 */
     if (!(stub_data.flags & STUB_FLAG_ASLR)) return 1;
@@ -646,7 +495,7 @@ static int apply_relocations(uint8_t* img_base) {
  *      如果 callbacks 用了 /GS，cookie 仍是默认值会误报 __report_gsfailure
  *   2. 某些程序 OEP 不是 CRT 启动代码，cookie 永远不会被初始化
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static void init_security_cookie(void) {
     if (stub_data.security_cookie_rva == 0) return;
     PEBX* peb = WINLOCK_PEB();
@@ -684,7 +533,7 @@ static void init_security_cookie(void) {
  *
  *   组合三项大幅提高反调试强度。检测到调试器返回 1。
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int is_being_debugged(void) {
     PEBX* peb = WINLOCK_PEB();
     uint8_t* p = (uint8_t*)peb;
@@ -714,7 +563,7 @@ static int is_being_debugged(void) {
  *   - fn 是 volatile，编译器不会优化掉写入
  *   - 必须在跳 OEP 之前调用，那时 stub 不再需要这些指针
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static void clear_fn_pointers(void) {
     fn.LoadLibraryA             = NULL;
     fn.GetProcAddress           = NULL;
@@ -739,7 +588,7 @@ static void clear_fn_pointers(void) {
  *       jmp *reg
  *   - __builtin_unreachable 告诉 GCC 函数不返回，避免 fallthrough 警告
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static void jump_to_oep(void* oep) {
 #ifdef _WIN64
     __asm__ volatile (
@@ -755,14 +604,14 @@ static void jump_to_oep(void* oep) {
         : : "r"(oep) : "memory"
     );
 #endif
-    __builtin_unreachable();
+    WINLOCK_UNREACHABLE();
 }
 
 /* ============================================================
  * 解密 .text 节 + 应用 relocations（stub_entry 与 stub_tls_callback 共用）
  *   返回：1 成功，0 失败
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int decrypt_text_and_reloc(void) {
     PEBX*   peb       = WINLOCK_PEB();
     uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
@@ -797,7 +646,7 @@ static int decrypt_text_and_reloc(void) {
  * 弹密码框（stub_entry / stub_tls_callback 共用）
  *   返回：1 成功；0 失败（Cancel 或超限时内部已 ExitProcess，不会真正返回 0）
  * ============================================================ */
-__attribute__((section(".lock.text"), used, noinline))
+WINLOCK_SECTION_TEXT
 static int prompt_password(void) {
     HMODULE u32 = fn.LoadLibraryA(STR_USER32_A);
     if (!u32) return 0;
@@ -845,7 +694,7 @@ static int prompt_password(void) {
  *   - TLS 代理模式（flags & STUB_FLAG_TLS_PROXY）：
  *     stub_entry 跳过解密（已在 stub_tls_callback 完成），只跳 OEP
  * ============================================================ */
-__attribute__((section(".lock.entry"), used, noinline, optimize("O0")))
+WINLOCK_SECTION_ENTRY WINLOCK_OPTIMIZE_OFF
 void stub_entry(void) {
     /* 1. PEB walk 找 kernel32（windows 启动时已加载）
      *    P1-1: 用 hash 替代明文模块名，避免 strings 暴露 "kernel32.dll" */
@@ -939,7 +788,7 @@ typedef void (WINAPI *TLS_CALLBACK)(PVOID, DWORD, PVOID);
 #define WINLOCK_DLL_PROCESS_DETACH 0
 
 /* stub_tls_callback 状态：确保解密只做一次（DLL_PROCESS_ATTACH） */
-__attribute__((section(".lock.data"), used, aligned(8)))
+WINLOCK_SECTION_DATA
 static volatile int g_tls_decrypted = 0;
 
 /* stub_tls_callback 的定位魔数：builder 在 stub.bin 中搜索此 8 字节，
@@ -951,12 +800,12 @@ static volatile int g_tls_decrypted = 0;
  * 用 16 字节数组（magic + zero pad）：因为 stub.ld 的 SUBALIGN(16) 强制
  * 每个子节 16 字节对齐，marker 后必然有填充。让 marker 自身占满 16 字节，
  * function 就紧跟在 marker+16 处（无额外填充），builder 计算 offset = M + 16。 */
-__attribute__((section(".lock.tlscbm"), used, aligned(16)))
+WINLOCK_SECTION_TLSCBM
 static const uint64_t g_stub_tls_cb_marker[2] = { STUB_TLS_CB_MAGIC, 0 };
 
 /* TLS callback 必须有特定签名，且放在 .lock.tlscb 节（代码节）
  * Windows loader 通过 IMAGE_TLS_DIRECTORY.AddressOfCallBacks 调用 */
-__attribute__((section(".lock.tlscb"), used, noinline))
+WINLOCK_SECTION_TLSCB
 void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
     (void)hModule;
     (void)reserved;

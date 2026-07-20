@@ -25,7 +25,7 @@
 #include <stddef.h>
 
 /* 不定义 WINLOCK_PIC，函数进入普通 .text 节 */
-#include "../stub/sha256.h"
+#include "../common/sha256.h"
 
 /* ----- 辅助函数 ----- */
 

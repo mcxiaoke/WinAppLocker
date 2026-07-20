@@ -40,9 +40,11 @@
 
 #include "payload.h"
 #include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS / IDC_PWD_EDIT */
-/* 复用 stub/sha256.h 的纯 C SHA-256 + UTF-16LE->UTF-8 + 常量时间比较
+#include "../common/winlock_compat.h"
+/* 复用 common/sha256.h 的纯 C SHA-256 + UTF-16LE->UTF-8 + 常量时间比较
  * 不定义 WINLOCK_PIC，作为普通 host 函数（loader.c 用 CRT 编译，无 .lock 节）*/
-#include "../stub/sha256.h"
+#include "../common/sha256.h"
+#include "../common/peb_walk.h"
 
 /* ---- 架构相关类型别名 ----
  * 让下面代码用统一的 IMAGE_NT_HEADERS_X / thunk_t 等符号，
@@ -113,77 +115,20 @@ static void log_init(void) {
 static void log_init(void) {}
 #endif
 
-/* ---- PEB 访问 ----
- * x64: PEB 在 gs:[0x60]
- * x86: PEB 在 fs:[0x30]
- * PVOID 自动按架构变大小 */
-typedef struct {
-    UCHAR  a, b, c, d;       /* offset 0-3: InheritedAddressSpace 等  */
-    PVOID  Mutant;           /* offset 8 (x64) / 4 (x86)，前面有 padding */
-    PVOID  ImageBaseAddress; /* offset 16 (x64) / 8 (x86) */
-    PVOID  Ldr;              /* offset 24 (x64) / 12 (x86) -> PEB_LDR_DATA */
-} PEBX;
-
-#ifdef _WIN64
-#define WINLOCK_PEB() ((PEBX*)__readgsqword(0x60))
-#else
-#define WINLOCK_PEB() ((PEBX*)(uintptr_t)__readfsdword(0x30))
-#endif
-
-/* ---- PEB_LDR_DATA + LDR_DATA_TABLE_ENTRY（简化版，仅含需要的字段） ----
- * 用于修改主 EXE 在 PEB.Ldr 里的条目，让 OS 识别反射加载的 PE 为模块。
- * 这样 LoadString / LoadResource 等走 LdrFindResource_U 的 API 能工作。
- *
- * 布局参考：MS Internal `nt!_LDR_DATA_TABLE_ENTRY` 和 AlushPacker structs.h
- * 字段顺序/偏移必须与 OS 一致，因此用 BYTE 数组占位未用字段 */
-typedef struct _MY_LIST_ENTRY {
-    struct _MY_LIST_ENTRY* Flink;
-    struct _MY_LIST_ENTRY* Blink;
-} MY_LIST_ENTRY;
-
-typedef struct _PEB_LDR_DATA_X {
-    ULONG      Length;                              /* +0x00 */
-    BOOLEAN    Initialized;                         /* +0x04 */
-    PVOID      SsHandle;                            /* +0x08 */
-    MY_LIST_ENTRY InLoadOrderModuleList;            /* +0x10 */
-    MY_LIST_ENTRY InMemoryOrderModuleList;          /* +0x20 */
-    MY_LIST_ENTRY InInitializationOrderModuleList;  /* +0x30 */
-} PEB_LDR_DATA_X;
-
-/* LDR_DATA_TABLE_ENTRY 仅前几个字段需要精确偏移，后面用 BYTE[] 占位
- * InLoadOrderLinks        +0x00 (16 字节)
- * InMemoryOrderLinks      +0x10 (16 字节)
- * InInitializationOrderLinks +0x20 (16 字节)
- * DllBase                 +0x30
- * EntryPoint              +0x38
- * SizeOfImage             +0x40 (ULONG)
- * FullDllName             +0x48 (UNICODE_STRING: USHORT Length, USHORT MaxLength, PVOID Buffer)
- * BaseDllName             +0x58
- */
-typedef struct _LDR_DATA_TABLE_ENTRY_X {
-    MY_LIST_ENTRY InLoadOrderLinks;          /* +0x00 */
-    MY_LIST_ENTRY InMemoryOrderLinks;        /* +0x10 */
-    MY_LIST_ENTRY InInitializationOrderLinks;/* +0x20 */
-    PVOID         DllBase;                   /* +0x30 */
-    PVOID         EntryPoint;                /* +0x38 */
-    ULONG         SizeOfImage;               /* +0x40 */
-    ULONG         _pad1;                     /* +0x44 对齐 */
-    struct { USHORT Length; USHORT MaxLength; PVOID Buffer; } FullDllName; /* +0x48 */
-    struct { USHORT Length; USHORT MaxLength; PVOID Buffer; } BaseDllName; /* +0x58 */
-} LDR_DATA_TABLE_ENTRY_X;
+/* ---- PEB / LDR 类型定义已抽取到 common/peb_walk.h ---- */
 
 /* ---- OEP return 后的兜底处理 ----
  * _mainCRTStartup 正常路径会调用 exit() 不返回；但如果原 PE 直接 return，
  * 会回到这里。这时调用 ExitProcess 终止，避免跳到栈上的垃圾地址。
  * noinline + used 防止编译器优化掉 */
-static void __attribute__((noinline, used)) oep_returned(int exit_code) {
+static void WINLOCK_NOINLINE WINLOCK_USED oep_returned(int exit_code) {
     if (g_logf) {
         fprintf(g_logf, "[REFL] OEP returned (unexpected, exit_code=%d), calling ExitProcess\n",
                 exit_code);
         fflush(g_logf);
     }
     ExitProcess((UINT)exit_code);
-    __builtin_unreachable();
+    WINLOCK_UNREACHABLE();
 }
 
 /* ---- x64 栈对齐跳 OEP（借鉴 winlock stub.c:743-759 + peldr） ----
@@ -210,7 +155,7 @@ static void jump_to_oep(void* oep, void* ret_addr) {
         : : "r"(oep), "r"(ret_addr) : "memory"
     );
 #endif
-    __builtin_unreachable();
+    WINLOCK_UNREACHABLE();
 }
 
 /* ---- 节权限查表（借鉴 peldr ProtTab + AlushPacker 8 项） ----
@@ -272,33 +217,8 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
  *   返回 1 表示密码正确，0 表示不可恢复失败（已 ExitProcess 不会真返回 0）
  * ============================================================ */
 
-/* XTEA 解密单个 8 字节块（与 builder_reflective.c xtea_encrypt_block 互逆） */
-static void xtea_decrypt_block(uint32_t* v, const uint32_t* key) {
-    uint32_t v0 = v[0], v1 = v[1];
-    uint32_t sum = XTEA_DELTA * XTEA_ROUNDS;  /* 0xC6EF3720 */
-    int i;
-    for (i = 0; i < XTEA_ROUNDS; i++) {
-        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
-        sum -= XTEA_DELTA;
-        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
-    }
-    v[0] = v0; v[1] = v1;
-}
-
-/* XTEA 解密缓冲区：8 字节块解密，尾部不足 8 字节按字节异或 key 字节
- * 与 builder_reflective.c xtea_encrypt_buf 互逆 */
-static void xtea_decrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
-    size_t n_blocks = size / 8;
-    size_t i;
-    for (i = 0; i < n_blocks; i++) {
-        xtea_decrypt_block((uint32_t*)(data + i * 8), key);
-    }
-    size_t tail_off = n_blocks * 8;
-    uint8_t* k = (uint8_t*)key;
-    for (i = 0; i < size - tail_off; i++) {
-        data[tail_off + i] ^= k[i];
-    }
-}
+/* XTEA 解密实现已抽取到 common/xtea.h */
+#include "../common/xtea.h"
 
 /* ---- 对话框模板构造工具（参考 stub.c 的 put_word/put_wstr/align_dword） ---- */
 static uint8_t* put_word(uint8_t* p, uint16_t w) {

@@ -114,7 +114,7 @@ static int parse_pe(const uint8_t* pe, size_t pe_size, pe_info_t* info) {
 
 /* ---- 加密工具：随机数 / SHA-256 / UTF-8 转换 / XTEA 加密 ----
  * 与 packer/builder/builder.c 共用同一套算法（CryptGenRandom + CryptoAPI）
- * stub 端 (loader.c) 用 packer/stub/sha256.h 的纯 C SHA-256 实现来校验，
+ * stub 端 (loader.c) 用 common/sha256.h 的纯 C SHA-256 实现来校验，
  * 两端算法必须字节级一致（参考 tests/stub_sha256_test.c 的回归测试） */
 
 /* 用 CryptGenRandom 生成密码学安全随机字节（XTEA key + salt） */
@@ -160,32 +160,8 @@ static int wstr_to_utf8(const wchar_t* src, uint8_t* dst, size_t dst_max) {
     return n - 1;  /* 去掉 null terminator */
 }
 
-/* XTEA 加密单个 8 字节块（与 stub.c xtea_decrypt_block 互逆） */
-static void xtea_encrypt_block(uint32_t* v, const uint32_t* key) {
-    uint32_t v0 = v[0], v1 = v[1], sum = 0;
-    int i;
-    for (i = 0; i < XTEA_ROUNDS; i++) {
-        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
-        sum += XTEA_DELTA;
-        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
-    }
-    v[0] = v0; v[1] = v1;
-}
-
-/* XTEA 加密缓冲区：8 字节块加密，尾部不足 8 字节按字节异或 key 字节
- * 与 stub.c xtea_decrypt_buf 互逆（同样的尾部处理） */
-static void xtea_encrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
-    size_t n_blocks = size / 8;
-    size_t i;
-    for (i = 0; i < n_blocks; i++) {
-        xtea_encrypt_block((uint32_t*)(data + i * 8), key);
-    }
-    size_t tail_off = n_blocks * 8;
-    uint8_t* k = (uint8_t*)key;
-    for (i = 0; i < size - tail_off; i++) {
-        data[tail_off + i] ^= k[i];
-    }
-}
+/* XTEA 加密（共享实现，host 模式：普通 static inline） */
+#include "../common/xtea.h"
 
 /* ---- 用法 ---- */
 

@@ -56,31 +56,8 @@
 static int g_debug = 0;
 #define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
 
-/* ---- XTEA 加密 ---- */
-
-static void xtea_encrypt_block(uint32_t* v, const uint32_t* key) {
-    uint32_t v0 = v[0], v1 = v[1], sum = 0;
-    int i;
-    for (i = 0; i < XTEA_ROUNDS; i++) {
-        v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
-        sum += XTEA_DELTA;
-        v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
-    }
-    v[0] = v0; v[1] = v1;
-}
-
-static void xtea_encrypt_buf(uint8_t* data, size_t size, const uint32_t* key) {
-    size_t n_blocks = size / 8;
-    size_t i;
-    for (i = 0; i < n_blocks; i++) {
-        xtea_encrypt_block((uint32_t*)(data + i * 8), key);
-    }
-    size_t tail_off = n_blocks * 8;
-    uint8_t* k = (uint8_t*)key;
-    for (i = 0; i < size - tail_off; i++) {
-        data[tail_off + i] ^= k[i];
-    }
-}
+/* ---- XTEA 加密（共享实现，host 模式：普通 static inline） ---- */
+#include "../common/xtea.h"
 
 /* ---- 文件 IO ---- */
 
