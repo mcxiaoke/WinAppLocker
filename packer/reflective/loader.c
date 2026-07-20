@@ -123,6 +123,13 @@ static void my_strcat(char* dst, const char* src) {
     while (*dst) dst++;
     while ((*dst++ = *src++) != 0) {}
 }
+/* 自实现 strnlen：返回 s 长度，最多 maxlen 字节
+ * 替代 CRT strnlen（Win32 API 模式无 CRT 依赖） */
+static size_t my_strnlen(const char* s, size_t maxlen) {
+    size_t n = 0;
+    while (n < maxlen && s[n]) n++;
+    return n;
+}
 
 /* ---- 调试开关 ----
  * MVP 阶段开启 RDEBUG，日志写到 reflective_loader.log（与 EXE 同目录）
@@ -859,12 +866,29 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
     uint64_t range_end = old_base + size_of_image;
 
     /* 分配 skip bitmap：每字节标记一个 RVA 是否不能修改
-     * SizeOfImage 通常 1MB 左右，分配代价小 */
+     * SizeOfImage 通常 1MB 左右，分配代价小
+     *
+     * 阶段 4 步骤 B（spec 第 306-313 行）：
+     *   - 默认（Win32 API 模式）用 VirtualAlloc（MEM_RESERVE|MEM_COMMIT，
+     *     PAGE_READWRITE 自动清零，行为与 calloc(n,1) 等价）
+     *   - WINLOCK_KEEP_CRT 模式保留 calloc（回滚路径）
+     *   - memset/memcmp 保留（MSVC intrinsics，非 CRT 依赖） */
+#ifdef WINLOCK_KEEP_CRT
     uint8_t* skip = (uint8_t*)calloc(size_of_image, 1);
     if (!skip) {
         DBG("reloc: fallback calloc(%u) failed\n", size_of_image);
         return 0;
     }
+#else
+    uint8_t* skip = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)size_of_image,
+                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!skip) {
+        DBG("reloc: fallback VirtualAlloc(%u) failed (err=%lu)\n",
+            size_of_image, (unsigned long)GetLastError());
+        return 0;
+    }
+    /* VirtualAlloc 的 MEM_COMMIT 页是零页，无需 memset 清零 */
+#endif
 
     /* 标记 IMPORT/IAT/DELAY_IMPORT 表本身所在区域 */
     uint32_t import_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
@@ -891,7 +915,7 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
             uint32_t name_rva = imp->Name;
             if (name_rva && name_rva < size_of_image) {
                 const char* p = (const char*)(img + name_rva);
-                size_t slen = strnlen(p, size_of_image - name_rva);
+                size_t slen = my_strnlen(p, size_of_image - name_rva);
                 uint32_t end = name_rva + (uint32_t)slen + 1;
                 if (end <= size_of_image) {
                     memset(skip + name_rva, 1, slen + 1);
@@ -909,7 +933,7 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
                     if (iibn_rva == 0 || iibn_rva >= size_of_image) continue;
                     /* IMAGE_IMPORT_BY_NAME: WORD hint + char name[] + '\0' */
                     const char* p = (const char*)(img + iibn_rva + 2);
-                    size_t slen = strnlen(p, size_of_image - iibn_rva - 2);
+                    size_t slen = my_strnlen(p, size_of_image - iibn_rva - 2);
                     uint32_t end = iibn_rva + 2 + (uint32_t)slen + 1;
                     if (end <= size_of_image) {
                         memset(skip + iibn_rva, 1, 2 + slen + 1);
@@ -952,7 +976,11 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
         DBG("reloc: fallback scanned %*.8s VA=0x%lx size=0x%zx, fixed %d refs\n",
             8, sec[i].Name, (unsigned long)sec[i].VirtualAddress, (size_t)size, sec_count);
     }
+#ifdef WINLOCK_KEEP_CRT
     free(skip);
+#else
+    VirtualFree(skip, 0, MEM_RELEASE);
+#endif
     DBG("reloc: fallback total fixed %d absolute refs (delta=0x%x)\n",
         count, (unsigned)delta32);
     return 1;  /* 即使 count=0 也返回成功，让流程继续（可能 PE 真的不需要 reloc） */

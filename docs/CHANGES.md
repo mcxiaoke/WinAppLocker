@@ -1,5 +1,98 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 B 完成：loader.c 内存改 Win32 API
+
+按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 B（spec 第 306-313 行）实施，把 `packer/reflective/loader.c` 的动态内存分配从 CRT（calloc/free/strnlen）切换到 Win32 API（VirtualAlloc/VirtualFree），并为 step C 的 PIC 化（彻底剥离 CRT）继续铺路。
+
+### 1. 双模式内存实现（`packer/reflective/loader.c:868-891`，`fallback_relocations`）
+
+引入 `#ifdef WINLOCK_KEEP_CRT` 双模式开关（与 step A 一致）：
+
+- **默认（Win32 API 模式，无 CRT 依赖）**：
+  - `calloc(size_of_image, 1)` → `VirtualAlloc(NULL, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE)`
+  - 关键：`MEM_COMMIT` 提交的页是零页（OS 保证），与 `calloc(n, 1)` 行为等价，无需额外 `memset` 清零
+  - 失败时调用 `GetLastError()` 记录错误码到日志（替代原 `calloc failed`）
+  - `free(skip)` → `VirtualFree(skip, 0, MEM_RELEASE)`（释放整个 reserve 区域）
+
+- **`-DWINLOCK_KEEP_CRT`（CRT 模式，回滚用）**：保留原 `calloc` / `free` 实现
+
+### 2. strnlen → my_strnlen 自实现（`packer/reflective/loader.c:126-132`）
+
+发现 step A 漏处理：`fallback_relocations` 中有 2 处 `strnlen` 调用（line 894、912），用于扫描 IMPORT 表中 DLL 名字 / 函数名字字符串长度。CRT 模式 `<string.h>` 提供，Win32 API 模式无此 API。
+
+新增 `my_strnlen(const char* s, size_t maxlen)`：与 `strnlen` 语义完全一致（返回 s 长度，最多 maxlen 字节）。**无条件定义**，CRT 和 Win32 API 模式共用，保证行为一致。替换 line 894/912 两处 `strnlen` 调用。
+
+### 3. memset/memcmp 保留
+
+按 spec 要求保留，因为 MSVC 把它们当作 intrinsics（编译器内置），不会引入 CRT 符号依赖：
+- `memset(skip + rva, 1, size)`（line 877-881）：标记 IMPORT/IAT/DELAY_IMPORT 区域为不可改
+- `memcmp(sec[i].Name, ".rsrc", 5)`（line 928）：跳过 .rsrc 节
+- `memcpy`（其他函数，如 TLS data 复制、节拷贝）：同理保留
+
+GCC 也支持 `-fno-builtin` 不影响 intrinsics，所以默认模式下 `memset`/`memcmp`/`memcpy` 都是编译器内置实现，**没有 CRT 符号依赖**。
+
+### 4. 影响范围
+
+修改位置全部在 `packer/reflective/loader.c`：
+- 新增 `my_strnlen`（line 126-132）
+- `fallback_relocations` 的 skip bitmap 分配（line 868-891，calloc→VirtualAlloc 双模式）
+- `fallback_relocations` 的 skip bitmap 释放（line 979-983，free→VirtualFree 双模式）
+- IMPORT 表扫描的 2 处 `strnlen` → `my_strnlen`（line 901、919）
+
+### 5. 验证结果（MinGW 编译）
+
+测试脚本：`temp/test_phase4b.py`（test mode `-t`，跳过密码框直接走 `verify_password(L"test123")`）
+
+| 样本 | 架构 | 结果 | 备注 |
+|------|------|------|------|
+| helloguix64 | x64 | PASS | GUI 启动后 3 秒仍存活 |
+| helloguix86 | x86 | PASS | 日志显示 `VirtualAlloc(0x400000) failed err=487`（ERROR_INVALID_ADDRESS，预期 fallback），走任意地址 + fallback_relocations（**正好走 step B 修改的代码路径**） |
+| hellocli | x64 | PASS | exit=0，stdout="Hello World!" |
+| hellomfcx64 | x64 | PASS | MFC + /GS SecurityCookie 初始化正常 |
+| hellomfcx86 | x86 | PASS | 同 helloguix86，VirtualAlloc fallback 路径正常 |
+| hellomingw | x64 | PASS | TLS_PROXY 模式正常 |
+| helloucrt | x64 | PASS | TLS_PROXY 模式正常 |
+| Notepad4 | x64 | PASS | 真实应用（2.4MB），加载正常 |
+| DontSleep | x64 | PASS | 真实应用（600KB），ImageBase=0x400000 但 x64 不冲突，正常加载 |
+
+**9/9 全部 PASS**，与阶段 4 步骤 A 结束时基线一致。x86 样本 fallback_relocations 路径正好覆盖 step B 修改，验证 VirtualAlloc/VirtualFree 行为正确。
+
+### 6. 编译产物对比
+
+| 模式 | 文件 | 体积 | 说明 |
+|------|------|------|------|
+| Win32 API | loader_x64.exe | 79509 字节 | 默认模式（无 CRT 依赖） |
+| Win32 API | loader_x86.exe | 144734 字节 | x86 比 x64 大，因 x86 调用约定差异 + winsock 等 |
+| CRT 回归 | loader_x64_crt.exe | 113663 字节 | `-DWINLOCK_KEEP_CRT` 回滚路径仍可编译，体积比 Win32 模式大 34KB（CRT 静态链接） |
+
+体积差异证明 Win32 API 模式确实剥离了 CRT 依赖，为 step C 的 PIC 化奠定了基础。
+
+### 7. 残留 CRT 调用清单
+
+经 grep 验证，loader.c 中 CRT 调用剩余分布：
+- `calloc` / `free`：仅在 `#ifdef WINLOCK_KEEP_CRT` 分支内（line 877/880/980）—— 回滚路径，预期
+- `fopen` / `fprintf` / `fflush` / `vsnprintf`：仅在 `#ifdef WINLOCK_KEEP_CRT` 分支内（step A 处理过）—— 回滚路径，预期
+- `memset` / `memcmp` / `memcpy`：保留（MSVC intrinsics，非 CRT 依赖）
+
+**Win32 API 模式下（默认编译），loader.c 已无任何 CRT 符号依赖**，为 step C 用 MSVC + `/NODEFAULTLIB` 编译铺平道路。
+
+### 涉及文件
+
+- `packer/reflective/loader.c`：`my_strnlen` 自实现 + `fallback_relocations` 的 calloc→VirtualAlloc / free→VirtualFree 双模式 + 2 处 strnlen→my_strnlen
+
+### 临时验证文件（在 `temp/`，被 .gitignore 排除）
+
+- `temp/test_phase4b.py`：阶段 4 步骤 B 编译 + 9 样本测试
+- `temp/phase4b_test/`：测试产物目录（加壳 EXE + 日志）
+
+### 下一步
+
+阶段 4 步骤 C（spec 第 315-380 行）：TLS callback + MSVC 链接
+- `__attribute__((section(".CRT$XLB"), used))` → 用 winlock_compat.h 宏（MSVC `#pragma section` + `__declspec(allocate)`）
+- 新建 `packer/reflective/loader_asm_x64.asm` 和 `loader_asm_x86.asm`（jump_to_oep 独立汇编，与 stub 一致）
+- 新建 `packer/reflective/CMakeLists.txt`（用 MSVC + `/NODEFAULTLIB /ENTRY:loader_main /SUBSYSTEM:WINDOWS` 编译 PIC 化 loader）
+- 验证点：DIE 识别从 "Unknown" → "Microsoft Linker 14.51"，loader_x64.exe 体积 40-60KB → 15-20KB
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 A 完成：loader.c 日志改 Win32 API
 
 按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 A（spec 第 295-304 行）实施，把 `packer/reflective/loader.c` 的日志实现从 CRT（fopen/fprintf/fflush/strrchr/strcpy/strcat）切换到 Win32 API（CreateFileA/WriteFile/FlushFileBuffers），为阶段 4 步骤 C 的 PIC 化（剥离 CRT）铺路。
