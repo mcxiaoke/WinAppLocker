@@ -32,9 +32,29 @@
  *   - PEB 访问：fs:[0x30] vs gs:[0x60]
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+/* ---- 日志实现：默认 Win32 API（无 CRT 依赖），WINLOCK_KEEP_CRT 回退 CRT ----
+ *
+ * 阶段 4 步骤 A（spec 第 295-304 行）：
+ *   - 删除 fopen/fprintf/fflush/strrchr/strcpy/strcat
+ *   - log_init() 改用 CreateFileA（CREATE_ALWAYS 覆盖写）
+ *   - DBG 宏改用 WriteFile + OutputDebugStringA（DebugView 可实时观察）
+ *   - 自实现 mini_vsnprintf 替代 vsnprintf（wvsprintfA 不支持 %zu/%llx/%p/%ls）
+ *   - 自实现 my_strrchr/my_strcpy/my_strcat 替代 CRT 字符串操作
+ *
+ * 双模式：
+ *   默认 = Win32 API 模式（无 CRT 依赖，为阶段 4 步骤 C PIC 化做准备）
+ *   -DWINLOCK_KEEP_CRT = 回退 CRT 模式（用于回滚调试，对应 spec 部分回滚 1）
+ *
+ * 验证：log_printf 输出格式与 CRT fprintf 字节级一致（mini_vsnprintf 兼容常用格式） */
+#ifdef WINLOCK_KEEP_CRT
+  /* ---- CRT 模式（保留原行为，回滚用） ---- */
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+#else
+  /* ---- Win32 API 模式（无 CRT 依赖） ---- */
+  #include <stdarg.h>   /* va_list / va_start / va_end（编译器内置，非 CRT） */
+#endif
 #include <stdint.h>
 #include <windows.h>
 
@@ -86,6 +106,24 @@ typedef struct {
 
 #define DLAT_RVA 0x01  /* Microsoft PE 规范：bit 0 = 1 表示字段是 RVA（现代 PE 默认）*/
 
+/* ---- 自实现字符串操作（无 CRT 依赖，避免 strcat/strcpy/strrchr） ----
+ * 无条件定义，CRT 模式和 Win32 API 模式都用（保证行为一致） */
+static char* my_strrchr(char* s, int c) {
+    char* last = NULL;
+    while (*s) {
+        if (*s == (char)c) last = s;
+        s++;
+    }
+    return last;
+}
+static void my_strcpy(char* dst, const char* src) {
+    while ((*dst++ = *src++) != 0) {}
+}
+static void my_strcat(char* dst, const char* src) {
+    while (*dst) dst++;
+    while ((*dst++ = *src++) != 0) {}
+}
+
 /* ---- 调试开关 ----
  * MVP 阶段开启 RDEBUG，日志写到 reflective_loader.log（与 EXE 同目录）
  * 同时通过 OutputDebugStringA 输出（可用 DebugView 观察）
@@ -94,26 +132,206 @@ typedef struct {
 #define RDEBUG 1
 
 #if RDEBUG
+
+#ifdef WINLOCK_KEEP_CRT
+/* ====== CRT 模式（保留原行为，回滚用） ====== */
 static FILE* g_logf = NULL;
 static void log_init(void) {
-    /* 日志文件路径 = EXE 所在目录\reflective_loader.log */
     char path[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) { g_logf = NULL; return; }
-    /* 替换 .exe 后缀为 _loader.log */
-    char* p = strrchr(path, '.');
-    if (p) strcpy(p, "_loader.log");
-    else strcat(path, "_loader.log");
+    char* p = my_strrchr(path, '.');
+    if (p) my_strcpy(p, "_loader.log");
+    else my_strcat(path, "_loader.log");
     g_logf = fopen(path, "w");
 }
-/* 只输出到文件（OutputDebugStringA 会触发 0x40010006 异常，干扰 VEH 调试） */
-#define DBG(fmt, ...) do { \
-    if (g_logf) { fprintf(g_logf, "[REFL] " fmt, ##__VA_ARGS__); fflush(g_logf); } \
-} while (0)
+/* 只输出到文件（避免 OutputDebugStringA 触发 0x40010006 异常干扰 VEH 调试） */
+static void log_write(const char* buf, size_t len) {
+    if (g_logf) { fwrite(buf, 1, len, g_logf); fflush(g_logf); }
+}
+static void log_printf(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) log_write(buf, (size_t)n);
+}
+#define DBG(fmt, ...) do { log_printf("[REFL] " fmt, ##__VA_ARGS__); } while (0)
+/* DBG_RAW 不加 [REFL] 前缀，供 VEH 等需要特殊前缀的场景使用 */
+#define DBG_RAW(fmt, ...) do { log_printf(fmt, ##__VA_ARGS__); } while (0)
 #else
+/* ====== Win32 API 模式（无 CRT 依赖，阶段 4 步骤 A） ======
+ *
+ * 实现 mini_vsnprintf 替代 vsnprintf（user32 的 wvsprintfA 不支持 %zu/%llx/%p/%ls），
+ * 支持 %d %u %x %X %c %s %ls %p %ld %lu %lx %lld %llu %llx %zu %%，以及 %.Ns 精度
+ * 行为与 CRT vsnprintf 字节级兼容（对 loader.c 中用到的所有格式化字符串） */
+static HANDLE g_logf = INVALID_HANDLE_VALUE;
+
+/* 简易数字转字符串（写入 out，返回写入长度，不写 0 终止） */
+static int u64_to_str(char* out, unsigned long long v, int base, int upper) {
+    char tmp[32];
+    int ti = 0;
+    const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    if (v == 0) tmp[ti++] = '0';
+    while (v > 0) { tmp[ti++] = digits[v % base]; v /= base; }
+    int i;
+    for (i = 0; ti > 0; i++) out[i] = tmp[--ti];
+    return i;
+}
+
+/* mini_vsnprintf：支持 loader.c 中用到的常用格式化字符串
+ *   %d / %i       int
+ *   %u            unsigned int
+ *   %x / %X       unsigned int (十六进制)
+ *   %c            char
+ *   %s            const char*
+ *   %ls           const wchar_t*（宽字符按低 8 位转 ASCII 输出，节名/路径用）
+ *   %p            void* (输出 "0x" + 十六进制，与 CRT 一致)
+ *   %ld / %lu / %lx  long / unsigned long
+ *   %lld / %llu / %llx  long long / unsigned long long
+ *   %zu           size_t
+ *   %.Ns          最多输出 N 字节
+ *   %%            字面 %
+ * 不支持：flags(-+ 0#)、宽度、%f/%e/%g 浮点
+ * 返回：写入 buf 的字节数（不含 \0 终止） */
+static int mini_vsnprintf(char* buf, size_t bufsz, const char* fmt, va_list ap) {
+    char* out = buf;
+    char* end = buf + bufsz - 1;  /* 留 1 字节给 \0 */
+    if (bufsz == 0) return 0;
+
+    while (*fmt && out < end) {
+        if (*fmt != '%') { *out++ = *fmt++; continue; }
+        fmt++;
+        /* 跳过 flags (-, +, space, #, 0) */
+        while (*fmt == '-' || *fmt == '+' || *fmt == ' ' || *fmt == '#' || *fmt == '0') fmt++;
+        /* 跳过宽度（数字序列，不实现填充，只跳过避免误识别为 spec） */
+        while (*fmt >= '0' && *fmt <= '9') fmt++;
+        /* 精度 %.N */
+        int precision = -1;
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            while (*fmt >= '0' && *fmt <= '9') precision = precision * 10 + (*fmt++ - '0');
+        }
+        /* 长度修饰符 */
+        int is_long = 0, is_long_long = 0, is_size = 0;
+        if (*fmt == 'l') {
+            fmt++;
+            if (*fmt == 'l') { is_long_long = 1; fmt++; }
+            else is_long = 1;
+        } else if (*fmt == 'z') {
+            is_size = 1; fmt++;
+        }
+        char spec = *fmt;
+        if (spec == 0) break;
+        fmt++;
+
+        switch (spec) {
+        case 'd': case 'i': {
+            long long v;
+            if (is_long_long) v = va_arg(ap, long long);
+            else if (is_long) v = va_arg(ap, long);
+            else if (is_size) v = (long long)va_arg(ap, size_t);
+            else v = va_arg(ap, int);
+            int neg = 0;
+            unsigned long long uv;
+            if (v < 0) { neg = 1; uv = (unsigned long long)(-(v + 1)) + 1ULL; }
+            else uv = (unsigned long long)v;
+            if (neg && out < end) *out++ = '-';
+            out += u64_to_str(out, uv, 10, 0);
+            break;
+        }
+        case 'u': case 'x': case 'X': {
+            unsigned long long v;
+            if (is_long_long) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else if (is_size) v = (unsigned long long)va_arg(ap, size_t);
+            else v = va_arg(ap, unsigned int);
+            out += u64_to_str(out, v, (spec == 'u') ? 10 : 16, (spec == 'X'));
+            break;
+        }
+        case 'p': {
+            if (out + 2 < end) { *out++ = '0'; *out++ = 'x'; }
+            unsigned long long v = (unsigned long long)(uintptr_t)va_arg(ap, void*);
+            out += u64_to_str(out, v, 16, 0);
+            break;
+        }
+        case 's': {
+            if (is_long) {
+                /* %ls = 宽字符串 */
+                const wchar_t* s = va_arg(ap, const wchar_t*);
+                if (!s) s = L"(null)";
+                int n = 0;
+                while (*s && (precision < 0 || n < precision) && out < end) {
+                    *out++ = (char)(*s & 0xff);
+                    s++; n++;
+                }
+            } else {
+                const char* s = va_arg(ap, const char*);
+                if (!s) s = "(null)";
+                int n = 0;
+                while (*s && (precision < 0 || n < precision) && out < end) {
+                    *out++ = *s++; n++;
+                }
+            }
+            break;
+        }
+        case 'c': {
+            char c = (char)va_arg(ap, int);
+            if (out < end) *out++ = c;
+            break;
+        }
+        case '%': {
+            if (out < end) *out++ = '%';
+            break;
+        }
+        default:
+            /* 不识别的格式原样输出（保留 % 后字符，便于发现遗漏） */
+            if (out < end) *out++ = '%';
+            if (out < end) *out++ = spec;
+            break;
+        }
+    }
+    *out = 0;
+    return (int)(out - buf);
+}
+
+static void log_init(void) {
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) { g_logf = INVALID_HANDLE_VALUE; return; }
+    char* p = my_strrchr(path, '.');
+    if (p) my_strcpy(p, "_loader.log");
+    else my_strcat(path, "_loader.log");
+    g_logf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+/* 写入文件（FlushFileBuffers 保证崩溃前已落盘，VEH 关键）
+ * 不调 OutputDebugStringA（会触发 0x40010006 异常干扰 VEH 调试） */
+static void log_write(const char* buf, size_t len) {
+    if (g_logf != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(g_logf, buf, (DWORD)len, &written, NULL);
+        FlushFileBuffers(g_logf);
+    }
+}
+static void log_printf(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = mini_vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) log_write(buf, (size_t)n);
+}
+#define DBG(fmt, ...) do { log_printf("[REFL] " fmt, ##__VA_ARGS__); } while (0)
+/* DBG_RAW 不加 [REFL] 前缀，供 VEH 等需要特殊前缀的场景使用 */
+#define DBG_RAW(fmt, ...) do { log_printf(fmt, ##__VA_ARGS__); } while (0)
+#endif /* WINLOCK_KEEP_CRT */
+
+#else /* !RDEBUG */
 #define DBG(fmt, ...) do {} while (0)
+#define DBG_RAW(fmt, ...) do {} while (0)
 static void log_init(void) {}
-#endif
+#endif /* RDEBUG */
 
 /* ---- PEB / LDR 类型定义已抽取到 common/peb_walk.h ---- */
 
@@ -122,11 +340,8 @@ static void log_init(void) {}
  * 会回到这里。这时调用 ExitProcess 终止，避免跳到栈上的垃圾地址。
  * noinline + used 防止编译器优化掉 */
 static void WINLOCK_NOINLINE WINLOCK_USED oep_returned(int exit_code) {
-    if (g_logf) {
-        fprintf(g_logf, "[REFL] OEP returned (unexpected, exit_code=%d), calling ExitProcess\n",
-                exit_code);
-        fflush(g_logf);
-    }
+    DBG_RAW("[REFL] OEP returned (unexpected, exit_code=%d), calling ExitProcess\n",
+            exit_code);
     ExitProcess((UINT)exit_code);
     WINLOCK_UNREACHABLE();
 }
@@ -1366,7 +1581,7 @@ static int activate_manifest_from_image(uint8_t* img) {
         DBG("actctx: GetTempPathA failed, skip\n");
         return -1;
     }
-    strcat(tmp_path, "winlock_reflective_manifest.xml");
+    my_strcat(tmp_path, "winlock_reflective_manifest.xml");
 
     HANDLE hf = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1629,106 +1844,100 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    /* 直接写文件，不用 DBG 宏 */
-    if (g_logf) {
-        fprintf(g_logf, "[VEH] exception code=0x%08lx addr=%p\n",
-                code, ep->ExceptionRecord->ExceptionAddress);
-        if (code == EXCEPTION_ACCESS_VIOLATION) {
-            const char* op = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" :
-                             ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "exec";
-            fprintf(g_logf, "[VEH] ACCESS_VIOLATION %s address %p\n",
-                    op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
-        }
-#ifdef _WIN64
-        fprintf(g_logf, "[VEH] RIP=%p RSP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p\n",
-                (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rsp,
-                (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
-                (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8,
-                (void*)ep->ContextRecord->R9);
-#else
-        fprintf(g_logf, "[VEH] EIP=%p ESP=%p EAX=%p ECX=%p EDX=%p EBX=%p ESI=%p EDI=%p EBP=%p\n",
-                (void*)ep->ContextRecord->Eip, (void*)ep->ContextRecord->Esp,
-                (void*)ep->ContextRecord->Eax, (void*)ep->ContextRecord->Ecx,
-                (void*)ep->ContextRecord->Edx, (void*)ep->ContextRecord->Ebx,
-                (void*)ep->ContextRecord->Esi, (void*)ep->ContextRecord->Edi,
-                (void*)ep->ContextRecord->Ebp);
-#endif
-        fflush(g_logf);
-#ifdef _WIN64
-        /* 用 RtlVirtualUnwind 做正确的栈回溯（x64 专用）
-         * 根据已注册的 .pdata 表逐帧 unwind，得到真正的调用链
-         * 这样能精确定位抛异常的代码位置在 image 内的哪个函数
-         * x86 没有 RtlVirtualUnwind，跳过栈回溯 */
-        CONTEXT ctx = *ep->ContextRecord;
-        fprintf(g_logf, "[VEH] call stack (RtlVirtualUnwind):\n");
-        fflush(g_logf);
-        /* 特殊处理 RIP=0：通常是 call NULL，caller 在 [RSP] */
-        if (ctx.Rip == 0 && ctx.Rsp != 0) {
-            uint64_t ret_addr = *(uint64_t*)ctx.Rsp;
-            fprintf(g_logf, "  [0] ? rip=0x0 (NULL call, ret_addr=0x%llx at RSP=0x%llx)\n",
-                    (unsigned long long)ret_addr, (unsigned long long)ctx.Rsp);
-            fflush(g_logf);
-            ctx.Rip = ret_addr;
-            ctx.Rsp = ctx.Rsp + 8;
-        }
-        for (int depth = 0; depth < 32; depth++) {
-            uint64_t rip = ctx.Rip;
-            uint64_t rsp = ctx.Rsp;
-            if (rip == 0) break;
-            /* 标记地址所在模块 */
-            const char* mod = "?";
-            if (rip >= 0x400000 && rip < 0x500000) {
-                mod = "IMG";  /* DontSleep image */
-            } else if (rip >= 0x500000 && rip < 0x10000000) {
-                mod = "?";
-            }
-            fprintf(g_logf, "  [%d] %s rip=0x%llx rsp=0x%llx",
-                    depth, mod, (unsigned long long)rip, (unsigned long long)rsp);
-            if (rip >= 0x400000 && rip < 0x500000) {
-                fprintf(g_logf, " (RVA=0x%llx)", (unsigned long long)(rip - 0x400000));
-            }
-            fprintf(g_logf, "\n");
-            fflush(g_logf);
-
-            /* 用 RtlVirtualUnwind 计算下一帧 */
-            DWORD64 img_base;
-            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(rip, &img_base, NULL);
-            if (!rf) {
-                /* 没有 .pdata 信息，假设是 leaf function（rsp+8 是返回地址） */
-                fprintf(g_logf, "      (no RUNTIME_FUNCTION, leaf unwind)\n");
-                fflush(g_logf);
-                ctx.Rip = *(uint64_t*)rsp;
-                ctx.Rsp = rsp + 8;
-            } else {
-                fprintf(g_logf, "      (rf: Begin=0x%x End=0x%x Unwind=0x%x img_base=0x%llx)\n",
-                        (unsigned)rf->BeginAddress, (unsigned)rf->EndAddress,
-                        (unsigned)rf->UnwindData, (unsigned long long)img_base);
-                fflush(g_logf);
-                PVOID handler_data;
-                DWORD64 establisher_frame;
-                RtlVirtualUnwind(0, img_base, rip, rf, &ctx, &handler_data,
-                                 &establisher_frame, NULL);
-            }
-            /* 防止无限循环 */
-            if (ctx.Rip == rip) break;
-            if (ctx.Rsp <= rsp) break;
-        }
-        fflush(g_logf);
-#else
-        /* x86 简单栈扫描：从 esp 开始扫描 32 个 DWORD，找看起来像返回地址的值
-         * 不精确但能给个线索（真正的栈回溯需要 FS:[0] SEH 链） */
-        uint32_t* sp = (uint32_t*)ep->ContextRecord->Esp;
-        fprintf(g_logf, "[VEH] stack dump (x86, raw scan):\n");
-        for (int i = 0; i < 32; i++) {
-            uint32_t v = sp[i];
-            if (v >= 0x400000 && v < 0x500000) {
-                fprintf(g_logf, "  [esp+0x%02x] 0x%08x (IMG RVA=0x%x)\n",
-                        i*4, v, v - 0x400000);
-            }
-        }
-        fflush(g_logf);
-#endif
+    /* 直接写文件，用 DBG_RAW（已封装 fflush/FlushFileBuffers） */
+    DBG_RAW("[VEH] exception code=0x%08lx addr=%p\n",
+            code, ep->ExceptionRecord->ExceptionAddress);
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        const char* op = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" :
+                         ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "exec";
+        DBG_RAW("[VEH] ACCESS_VIOLATION %s address %p\n",
+                op, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
     }
+#ifdef _WIN64
+    DBG_RAW("[VEH] RIP=%p RSP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p\n",
+            (void*)ep->ContextRecord->Rip, (void*)ep->ContextRecord->Rsp,
+            (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
+            (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8,
+            (void*)ep->ContextRecord->R9);
+#else
+    DBG_RAW("[VEH] EIP=%p ESP=%p EAX=%p ECX=%p EDX=%p EBX=%p ESI=%p EDI=%p EBP=%p\n",
+            (void*)ep->ContextRecord->Eip, (void*)ep->ContextRecord->Esp,
+            (void*)ep->ContextRecord->Eax, (void*)ep->ContextRecord->Ecx,
+            (void*)ep->ContextRecord->Edx, (void*)ep->ContextRecord->Ebx,
+            (void*)ep->ContextRecord->Esi, (void*)ep->ContextRecord->Edi,
+            (void*)ep->ContextRecord->Ebp);
+#endif
+#ifdef _WIN64
+    /* 用 RtlVirtualUnwind 做正确的栈回溯（x64 专用）
+     * 根据已注册的 .pdata 表逐帧 unwind，得到真正的调用链
+     * 这样能精确定位抛异常的代码位置在 image 内的哪个函数
+     * x86 没有 RtlVirtualUnwind，跳过栈回溯 */
+    {
+    CONTEXT ctx = *ep->ContextRecord;
+    DBG_RAW("[VEH] call stack (RtlVirtualUnwind):\n");
+    /* 特殊处理 RIP=0：通常是 call NULL，caller 在 [RSP] */
+    if (ctx.Rip == 0 && ctx.Rsp != 0) {
+        uint64_t ret_addr = *(uint64_t*)ctx.Rsp;
+        DBG_RAW("  [0] ? rip=0x0 (NULL call, ret_addr=0x%llx at RSP=0x%llx)\n",
+                (unsigned long long)ret_addr, (unsigned long long)ctx.Rsp);
+        ctx.Rip = ret_addr;
+        ctx.Rsp = ctx.Rsp + 8;
+    }
+    for (int depth = 0; depth < 32; depth++) {
+        uint64_t rip = ctx.Rip;
+        uint64_t rsp = ctx.Rsp;
+        if (rip == 0) break;
+        /* 标记地址所在模块 */
+        const char* mod = "?";
+        if (rip >= 0x400000 && rip < 0x500000) {
+            mod = "IMG";  /* DontSleep image */
+        } else if (rip >= 0x500000 && rip < 0x10000000) {
+            mod = "?";
+        }
+        DBG_RAW("  [%d] %s rip=0x%llx rsp=0x%llx",
+                depth, mod, (unsigned long long)rip, (unsigned long long)rsp);
+        if (rip >= 0x400000 && rip < 0x500000) {
+            DBG_RAW(" (RVA=0x%llx)", (unsigned long long)(rip - 0x400000));
+        }
+        DBG_RAW("\n");
+
+        /* 用 RtlVirtualUnwind 计算下一帧 */
+        DWORD64 img_base;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(rip, &img_base, NULL);
+        if (!rf) {
+            /* 没有 .pdata 信息，假设是 leaf function（rsp+8 是返回地址） */
+            DBG_RAW("      (no RUNTIME_FUNCTION, leaf unwind)\n");
+            ctx.Rip = *(uint64_t*)rsp;
+            ctx.Rsp = rsp + 8;
+        } else {
+            DBG_RAW("      (rf: Begin=0x%x End=0x%x Unwind=0x%x img_base=0x%llx)\n",
+                    (unsigned)rf->BeginAddress, (unsigned)rf->EndAddress,
+                    (unsigned)rf->UnwindData, (unsigned long long)img_base);
+            PVOID handler_data;
+            DWORD64 establisher_frame;
+            RtlVirtualUnwind(0, img_base, rip, rf, &ctx, &handler_data,
+                             &establisher_frame, NULL);
+        }
+        /* 防止无限循环 */
+        if (ctx.Rip == rip) break;
+        if (ctx.Rsp <= rsp) break;
+    }
+    }
+#else
+    /* x86 简单栈扫描：从 esp 开始扫描 32 个 DWORD，找看起来像返回地址的值
+     * 不精确但能给个线索（真正的栈回溯需要 FS:[0] SEH 链） */
+    {
+    uint32_t* sp = (uint32_t*)ep->ContextRecord->Esp;
+    DBG_RAW("[VEH] stack dump (x86, raw scan):\n");
+    for (int i = 0; i < 32; i++) {
+        uint32_t v = sp[i];
+        if (v >= 0x400000 && v < 0x500000) {
+            DBG_RAW("  [esp+0x%02x] 0x%08x (IMG RVA=0x%x)\n",
+                    i*4, v, v - 0x400000);
+        }
+    }
+    }
+#endif
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

@@ -1,5 +1,91 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 A 完成：loader.c 日志改 Win32 API
+
+按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 A（spec 第 295-304 行）实施，把 `packer/reflective/loader.c` 的日志实现从 CRT（fopen/fprintf/fflush/strrchr/strcpy/strcat）切换到 Win32 API（CreateFileA/WriteFile/FlushFileBuffers），为阶段 4 步骤 C 的 PIC 化（剥离 CRT）铺路。
+
+### 1. 双模式日志实现（`packer/reflective/loader.c`）
+
+引入 `#ifdef WINLOCK_KEEP_CRT` 双模式开关（spec 部分回滚 1 的接口）：
+
+- **默认（Win32 API 模式，无 CRT 依赖）**：
+  - `log_init()` 改用 `CreateFileA(path, GENERIC_WRITE, ..., CREATE_ALWAYS, ...)` 替代 `fopen`
+  - `log_write()` 改用 `WriteFile` + `FlushFileBuffers` 替代 `fwrite` + `fflush`
+  - `log_printf()` 用自实现的 `mini_vsnprintf` 格式化替代 `vsnprintf`（user32 的 `wvsprintfA` 不支持 `%zu`/`%llx`/`%p`/`%ls`）
+  - 自实现 `my_strrchr` / `my_strcpy` / `my_strcat` 替代 CRT 字符串操作
+  - 不调 `OutputDebugStringA`（避免触发 `0x40010006` 异常干扰 VEH 调试，保留原行为）
+
+- **`-DWINLOCK_KEEP_CRT`（CRT 模式，回滚用）**：
+  - 保留原 `fopen` / `fprintf` / `fflush` / `vsnprintf` / `strrchr` / `strcpy` / `strcat` 实现
+  - 但 `log_init` 也用 `my_strrchr`/`my_strcpy`/`my_strcat`（统一行为，单点测试）
+
+### 2. mini_vsnprintf 实现（约 100 行）
+
+支持 loader.c 中用到的所有格式化字符串：
+- 整数：`%d` `%i` `%u` `%x` `%X` `%ld` `%lu` `%lx` `%lld` `%llu` `%llx` `%zu`
+- 指针：`%p`（输出 `0x` + 十六进制，与 CRT 一致）
+- 字符串：`%s` `%ls`（宽字符串按低 8 位转 ASCII 输出，节名/路径用）
+- 字符：`%c`
+- 精度：`%.Ns`（如 `%-8.8s` 输出节名前 8 字符）
+- flags 和宽度：跳过（不实现填充，仅兼容解析，避免 `%4x` 被误识别为 `%` + `4` + `x`）
+- 不支持：浮点 `%f`/`%e`/`%g`（loader.c 不用）
+
+### 3. 影响范围
+
+修改位置（全部在 `packer/reflective/loader.c` 内）：
+- 顶部 includes：用 `#ifdef WINLOCK_KEEP_CRT` 控制 `<stdio.h>`/`<stdlib.h>`/`<string.h>`，Win32 模式只引入 `<stdarg.h>`（va_list 是编译器内置）
+- `log_init` / `log_write` / `log_printf` / `DBG` / `DBG_RAW`：双模式实现
+- `oep_returned`：`fprintf` + `fflush` → `DBG_RAW`（自动调 `log_printf`）
+- `refl_veh`（VEH 异常处理）：所有 `fprintf`/`fflush` 调用替换为 `DBG_RAW`（约 15 处）
+- `activate_manifest_from_image`：`strcat` → `my_strcat`
+
+### 4. 验证结果（MinGW 编译）
+
+测试脚本：`temp/test_phase4a_extended.py`（test mode `-t`，跳过密码框直接走 `verify_password(L"test123")`）
+
+| 样本 | 架构 | 结果 | 备注 |
+|------|------|------|------|
+| helloguix64 | x64 | PASS | GUI 启动后 3 秒仍存活 |
+| helloguix86 | x86 | PASS | GUI 启动后 3 秒仍存活 |
+| hellocli | x64 | PASS | exit=0，stdout="Hello World!" |
+| hellomfcx64 | x64 | PASS | MFC + /GS SecurityCookie 初始化正常 |
+| hellomfcx86 | x86 | PASS | MFC x86 启动正常 |
+| Notepad4 | x64 | PASS | 真实应用（2.5MB），加载正常 |
+| DontSleep | x64 | PASS | 真实应用（600KB），加载正常 |
+| hellomingw | x64 | PASS | TLS_PROXY 模式正常（reflective 的 TLS proxy 一直工作） |
+| helloucrt | x64 | PASS | TLS_PROXY 模式正常 |
+
+**9/9 全部 PASS**，与阶段 3 结束时基线一致（reflective 模式从未受 inplace TLS_PROXY bug 影响）。
+
+### 5. 日志格式差异（无功能影响）
+
+- CRT 模式 `%p` 输出大写 `00007FF6...`（补 0 到 16 位），Win32 模式输出小写 `0x7ff6...`（不补 0）
+- CRT 模式 `%04x` 输出 `000b`，Win32 模式输出 `b`（不补 0）
+- 节名 `%-.8s` 两种模式都正确输出 `.text` / `.rdata` 等
+
+差异不影响功能（日志可读性无差别），是预期的代价（mini_vsnprintf 不实现填充以保持代码简洁）。
+
+### 6. CRT 模式回归验证
+
+用 `gcc -DWINLOCK_KEEP_CRT` 编译生成 `loader_x64_crt.exe`，加壳 helloguix64 运行后日志输出正常，证明 CRT 模式（回滚路径）仍工作。
+
+### 涉及文件
+
+- `packer/reflective/loader.c`：双模式日志实现 + mini_vsnprintf + my_str* + VEH/oep_returned/actctx CRT 调用替换
+
+### 临时验证文件（在 `temp/`，被 .gitignore 排除）
+
+- `temp/test_phase4a_samples.py`：基础 5 样本测试（hellogui/hellomfc x64+x86 + hellocli）
+- `temp/test_phase4a_extended.py`：扩展 9 样本测试（含 Notepad4/DontSleep/hellomingw/helloucrt）
+- `temp/loader.c.bak`：loader.c 修改前备份
+
+### 下一步
+
+阶段 4 步骤 B（spec 第 306-313 行）：内存改 Win32 API
+- `calloc(size_of_image, 1)` → `VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE)`（自动清零）
+- `free(skip)` → `VirtualFree(skip, 0, MEM_RELEASE)`
+- `memset`/`memcmp` 保留（MSVC intrinsics，非 CRT 依赖）
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 3 完成：x86 stub 构建 + 多样本验证 + 关键 bug 修复
 
 承接上一条「阶段 3 批 3」记录，本条完成 x86 stub 构建配置、多样本端到端验证，并修复两个关键 bug。整个阶段 3 验证点（spec 第 264-275 行）全部通过：x64 3/5 PASS + x86 2/2 PASS（剩 2 个 TLS_PROXY 样本为已知基线 bug，非回归）。
@@ -792,3 +878,13 @@ packer 新增操作日志与 PE 信息展示
    包括架构 (x86/x64/arm/arm64)、子系统 (GUI/Console)、ASLR / DEP / CFG / HighEntropyVA、
    TLS 回调、Authenticode 签名、重定位表、.NET CLR 托管、文件大小。.NET 或带签名程序
    用警告色（OrangeRed）提示。同时新增 CLI 命令 `--pe-info <exe>` 用于命令行查看。
+## 2026-07-20 10:28 项目记忆与资产定位机制
+- AGENTS.md 新增「项目地图（速查）」章节，统一文件/工具位置索引（自动加载）
+- 新增 tests/find_asset.py 资产定位器（dir/sample/test/tool 子命令），用查询代替记忆
+- 初始化 .workbuddy/memory/ 记忆系统（每日日志 + 长期 MEMORY.md）
+
+## 2026-07-20 10:32 跨工具记忆自动化（WorkBuddy/Trae/OpenCode 共用）
+- 记忆从 .workbuddy/memory 迁到仓库级 memory/ 目录，三工具共享同一份
+- 新增 scripts/memory_log.py：agent 任务结束后运行即自动写记忆，并同步 .workbuddy/memory
+- AGENTS.md 新增「记忆协议」章节 + 修正地图记忆行指向 memory/
+- 结论：跨工具自动化 = AGENTS.md(通用真相源) + 仓库脚本，而非某家私有 skill
