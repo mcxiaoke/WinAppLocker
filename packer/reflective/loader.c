@@ -361,6 +361,30 @@ static void WINLOCK_NOINLINE WINLOCK_USED oep_returned(int exit_code) {
  * x64 ABI: 函数入口 RSP % 16 == 8
  *   andq $-16, rsp  -> RSP % 16 == 0
  *   pushq ret       -> RSP -= 8, RSP % 16 == 8 ✓ */
+/* ---- x64/x86 栈对齐跳 OEP（借鉴 winlock stub.c:743-759 + peldr） ----
+ * 用 push + jmp 模拟 call，压入返回地址（oep_returned）
+ * 这样原 PE 内的 C++ 异常 dispatch 能正确 unwind 到本 stub 帧，
+ * 不会因找不到 caller 而 terminate（修复 DontSleep/MFC42u 崩溃问题）
+ *
+ * x64 ABI: 函数入口 RSP % 16 == 8
+ *   andq $-16, rsp  -> RSP % 16 == 0
+ *   pushq ret       -> RSP -= 8, RSP % 16 == 8 ✓
+ *
+ * 阶段 4 步骤 C：
+ *   - GCC：保留原 __asm__ volatile 内联汇编
+ *   - MSVC：x64 不支持内联汇编，改为 extern 调用 loader_asm_x64.asm 实现
+ *           （loader_asm_x86.asm 同理） */
+#ifdef _MSC_VER
+/* MSVC：声明 extern，调用独立 .asm 文件中的实现 */
+#ifdef _WIN64
+extern void jump_to_oep_x64(void* oep, void* ret_addr);
+#define jump_to_oep(oep, ret_addr)  jump_to_oep_x64((oep), (ret_addr))
+#else
+extern void __cdecl jump_to_oep_x86(void* oep, void* ret_addr);
+#define jump_to_oep(oep, ret_addr)  jump_to_oep_x86((oep), (ret_addr))
+#endif
+#else
+/* GCC：保留原内联汇编实现 */
 static void jump_to_oep(void* oep, void* ret_addr) {
 #ifdef _WIN64
     __asm__ volatile (
@@ -379,6 +403,7 @@ static void jump_to_oep(void* oep, void* ret_addr) {
 #endif
     WINLOCK_UNREACHABLE();
 }
+#endif /* _MSC_VER */
 
 /* ---- 节权限查表（借鉴 peldr ProtTab + AlushPacker 8 项） ----
  * 根据 IMAGE_SECTION_HEADER.Characteristics 的高 3 位
@@ -947,35 +972,64 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
 
     int count = 0;
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    /* x64：按 1 字节步长扫 8 字节绝对地址引用（DIR64）
+     * x86：按 1 字节步长扫 4 字节绝对地址引用（HIGHLOW）
+     *
+     * x64 必须扫 8 字节的原因：
+     *   - .CRT$XCA..XLB..XCZ 节中的 CRT init 函数指针表是 8 字节对齐的指针
+     *   - 4 字节扫描只会改指针的低 4 字节，高 4 字节保留，
+     *     导致指针变成 0x00000001_20e01234（原本 0x0000000140001234），
+     *     _initterm 遍历时调用这种坏指针会触发 AV
+     *   - DontSleep 启用 CFG，所有间接 call 走 guard_dispatch_icall_nop，
+     *     AV 时 read address=0xffffffffffffffff 即来自坏指针越界读 */
+#ifdef _WIN64
+    #define FALLBACK_SCAN_UNIT 8
+    int64_t delta64 = (int64_t)(new_base - old_base);
+#else
+    #define FALLBACK_SCAN_UNIT 4
+#endif
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         /* 跳过 .rsrc（资源节很少有绝对地址引用） */
         if (memcmp(sec[i].Name, ".rsrc", 5) == 0) continue;
-        if (sec[i].SizeOfRawData < 4) continue;
+        if (sec[i].SizeOfRawData < FALLBACK_SCAN_UNIT) continue;
 
         uint8_t* start = img + sec[i].VirtualAddress;
         SIZE_T size = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
         if (size > sec[i].SizeOfRawData) size = sec[i].SizeOfRawData;
         int sec_count = 0;
         /* 1 字节步长扫描（x86 absolute address 在指令中位置不固定，4 字节对齐会漏）
-         * 跳过任何与 skip bitmap 相交的 4 字节范围 */
-        for (SIZE_T off = 0; off + 4 <= size; off++) {
+         * 跳过任何与 skip bitmap 相交的扫描单元 */
+        for (SIZE_T off = 0; off + FALLBACK_SCAN_UNIT <= size; off++) {
             uint32_t rva_here = sec[i].VirtualAddress + (uint32_t)off;
-            /* 如果当前 4 字节范围内有任何 skip 标记，跳过这 4 字节
+            /* 如果当前扫描单元范围内有任何 skip 标记，跳过
              * （保护 IAT 表和字符串内容） */
-            if (rva_here + 4 <= size_of_image) {
-                if (skip[rva_here] | skip[rva_here+1] | skip[rva_here+2] | skip[rva_here+3])
-                    continue;
+            if (rva_here + FALLBACK_SCAN_UNIT <= size_of_image) {
+                int skip_this = 0;
+                for (size_t k = 0; k < FALLBACK_SCAN_UNIT; k++) {
+                    if (skip[rva_here + k]) { skip_this = 1; break; }
+                }
+                if (skip_this) continue;
             }
+#ifdef _WIN64
+            uint64_t val = *(uint64_t*)(start + off);
+            if (val >= range_start && val < range_end) {
+                *(uint64_t*)(start + off) = (uint64_t)(val + delta64);
+                count++;
+                sec_count++;
+            }
+#else
             uint32_t val = *(uint32_t*)(start + off);
             if (val >= range_start && val < range_end) {
                 *(uint32_t*)(start + off) = val + delta32;
                 count++;
                 sec_count++;
             }
+#endif
         }
         DBG("reloc: fallback scanned %*.8s VA=0x%lx size=0x%zx, fixed %d refs\n",
             8, sec[i].Name, (unsigned long)sec[i].VirtualAddress, (size_t)size, sec_count);
     }
+#undef FALLBACK_SCAN_UNIT
 #ifdef WINLOCK_KEEP_CRT
     free(skip);
 #else
@@ -1315,8 +1369,13 @@ static void NTAPI tls_callback_proxy(PVOID hModule, DWORD reason, PVOID ctx) {
 /* 注册 TLS callback 到 stub 的 .CRT$XLB section
  * MinGW CRT 会合并 .CRT$XLA/XLB/XLZ 为一个数组
  * _tls_used.AddressOfCallBacks 指向 &__xl_a + 1（跳过首部 0）
- * 我们的 callback 在 .CRT$XLB 中，位于 __xl_a 和 __xl_z 之间 */
-__attribute__((section(".CRT$XLB"), used))
+ * 我们的 callback 在 .CRT$XLB 中，位于 __xl_a 和 __xl_z 之间
+ *
+ * 阶段 4 步骤 C：
+ *   - GCC：__attribute__((section(".CRT$XLB"), used))
+ *   - MSVC：#pragma section(".CRT$XLB", read) + __declspec(allocate(".CRT$XLB"))
+ *   两种写法等价，都把变量放进 .CRT$XLB 节，被 link.exe 按 $ 分组合并到 .rdata */
+WINLOCK_SECTION_CRT_XLB
 static const PIMAGE_TLS_CALLBACK g_tls_cb_ptr = tls_callback_proxy;
 
 static int init_tls_data(uint8_t* img, uint64_t preferred_base) {
@@ -1972,9 +2031,19 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
 /* ---- stub 入口 ----
  * MinGW-w64 + CRT 编译，mainCRTStartup 调用 main()
  * main() 完成反射式加载后 jump_to_oep 跳走，不返回
- * CRT 的 cleanup 不会执行（无害，因为 stub 自己的全局状态不再使用） */
+ * CRT 的 cleanup 不会执行（无害，因为 stub 自己的全局状态不再使用）
+ *
+ * 阶段 4 步骤 C：
+ *   - GCC：保持 main()（MinGW GUI 子系统接受 main，自动跳板到 WinMain）
+ *   - MSVC：/SUBSYSTEM:WINDOWS 期望 WinMain，用 #ifdef 切换函数签名
+ *           （参数都不用，只是入口名不同） */
+#ifdef _MSC_VER
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
+    (void)hInstance; (void)hPrev; (void)lpCmdLine; (void)nCmdShow;
+#else
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;  /* stub 不处理命令行参数 */
+#endif
 #ifdef RDEBUG
     /* 只初始化日志文件，不再创建 console（避免 GUI 程序弹 console 干扰）
      * 如需实时观察，用 DebugView 查看 OutputDebugStringA 输出 */

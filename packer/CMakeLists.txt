@@ -62,7 +62,8 @@ add_compile_definitions(
 add_subdirectory(builder)
 # 阶段 3：Inplace stub（PIC 自包含 + MASM 汇编 jump_to_oep）
 add_subdirectory(stub)
-# add_subdirectory(reflective)  # 阶段 4 启用（loader 反射式）
+# 阶段 4：Reflective loader（MSVC 迁移 + MASM 汇编 jump_to_oep）
+add_subdirectory(reflective)
 
 if(WINLOCK_BUILD_TESTS)
     # add_subdirectory(tests)    # 后续阶段启用

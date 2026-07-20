@@ -1,5 +1,122 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 C 完成：TLS callback + MSVC 链接 + 8/8 全样本 PASS
+
+按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 C（spec 第 315-380 行）实施，把 `packer/reflective/loader.c` + 汇编 stub 通过 CMake + MSVC 工具链编译，使 MSVC stub 替代 MinGW stub 作为加壳用的 loader。
+
+### 1. C1：新增 jump_to_oep 独立 .asm 文件
+
+MSVC x64 不支持内联汇编，必须把 `jump_to_oep` 抽到独立 MASM 文件实现。`__attribute__((section))` 在 MSVC 上也不支持 `$` 字符的节名，需要通过 `winlock_compat.h` 宏切换。
+
+- **`packer/reflective/loader_asm_x64.asm`**（新建）：MASM 实现 `jump_to_oep_x64(oep, ret_addr)`，做 16 字节栈对齐 + push ret_addr + jmp oep
+- **`packer/reflective/loader_asm_x86.asm`**（新建）：MASM x86 实现 `jump_to_oep_x86`，使用 `__cdecl` 调用约定
+
+### 2. C2：loader.c 编译器抽象切换
+
+`packer/reflective/loader.c` 中所有 GCC 内联汇编 / GCC section 属性都改为 `#ifdef _MSC_VER` 双模式：
+
+- `jump_to_oep`：GCC 内联汇编 → MSVC extern 调用 .asm（`packer/reflective/loader.c:355-406`）
+- TLS callback 节区属性：`__attribute__((section(".CRT$XLB"), used))` → `WINLOCK_SECTION_CRT_XLB` 宏（`packer/reflective/loader.c:1340-1350`）
+- 入口函数：GCC `main` → MSVC `WinMain`（`/SUBSYSTEM:WINDOWS` 期望 `WinMain`，`packer/reflective/loader.c:2002-2017`）
+
+`packer/common/winlock_compat.h` 提供 `WINLOCK_SECTION_CRT_XLB` 宏的跨编译器实现（MSVC `__pragma(section) + __declspec(allocate)`，GCC `__attribute__((section))`）。
+
+### 3. C3：新建 reflective/CMakeLists.txt
+
+`packer/reflective/CMakeLists.txt`（新建）+ `packer/CMakeLists.txt` 启用 `add_subdirectory(reflective)`：
+
+- x64 target：`add_executable(loader_x64 WIN32 loader.c loader_asm_x64.asm)`
+- 编译选项：`/O2 /Gy`（不定义 `WINLOCK_PIC`，loader 用普通 `.text` 节，不像 stub 那样做 `.lock` 节提取）
+- 链接选项：`/SUBSYSTEM:WINDOWS /BASE:0x140000000 /DYNAMICBASE:NO /OPT:REF /OPT:ICF`
+  - `/BASE:0x140000000` 与 MinGW 基线一致，避免撞上输入 PE 的 0x400000
+  - （试过 `/BASE:0x10000` 导致系统在 0x400000 附近映射 shared section，VirtualAlloc 失败；后查证真正根因是 fallback_relocations 的 x64 8 字节扫描缺失，见下文 §6）
+- 链接 user32（DialogBoxParamW / LoadStringW / MessageBoxW）
+- x86 target：`if(WINLOCK_BUILD_X86 AND CMAKE_SIZEOF_VOID_P EQUAL 4)`，需用 `-A Win32` 单独配置，加 `/FIXED:NO` 保留 .reloc
+
+### 4. C4：MSVC 编译验证
+
+| 项目 | MSVC 新编译 | MinGW 基线 |
+|------|------------|-----------|
+| loader_x64.exe | 127488 字节 | 118098 字节 |
+| ImageBase | 0x140000000 | 0x140000000 |
+| 子系统 | WINDOWS | WINDOWS |
+| builder_reflective.exe | 170496 字节 | — |
+
+MSVC 版稍大（约 9KB），因为 `/MT` 静态链接 CRT（spec 中 C3b 才用 `/NODEFAULTLIB` 完全剥离 CRT）。
+
+### 5. C5：MSVC vs MinGW 基线对比测试
+
+用 `release/packer-mingw-git-7311644/` 作 MinGW 基线，运行 `temp/test_phase4c_compare.py` 双向对比：
+
+| 样本 | MSVC | MinGW | 一致 |
+|------|------|-------|------|
+| helloguix64 | PASS | PASS | yes |
+| helloguix86 | PASS | PASS | yes |
+| hellocli | PASS | PASS | yes |
+| hellomfcx64 | PASS | PASS | yes |
+| hellomingw | PASS | PASS | yes |
+| helloucrt | PASS | PASS | yes |
+| Notepad4 | PASS | PASS | yes |
+| **DontSleep** | **PASS** | PASS | yes |
+
+**8/8 全部 PASS**，与 MinGW 基线完全一致。
+
+### 6. 修复关键 bug：fallback_relocations 在 x64 上必须扫 8 字节（DIR64）
+
+调试 DontSleep 时发现：原本 DontSleep 在 MSVC 下崩溃（exit=0xC0000005），VEH 日志显示崩溃在 `msvcrt!guard_dispatch_icall_nop`，`read address=0xffffffffffffffff`。
+
+**根因**：`fallback_relocations` 原本无条件按 4 字节步长扫描绝对地址引用。在 x64 上这会破坏 8 字节对齐的指针：
+
+- 例如 .CRT$XLB 节中的 CRT init 函数指针 `0x0000000140001234`（指向 DontSleep 内部函数）
+- 4 字节扫描只改低 4 字节：`0x40001234` → `0x40001234 + delta = 0x20e01234`
+- 高 4 字节 `0x00000001` 不变，最终指针变成 `0x00000001_20e01234`（错误地址，比目标 0x20e01234 多 1GB 偏移）
+- DontSleep 启用 CFG，所有间接 call 走 `guard_dispatch_icall_nop`，调用坏指针时触发 AV，target 显示为 `0xffffffffffffffff`（越界读到栈垃圾）
+
+**修复**（`packer/reflective/loader.c:973-1031`）：用 `#ifdef _WIN64` 区分扫描宽度，x64 上扫 8 字节、用 int64 delta；x86 保持 4 字节 + int32 delta：
+
+```c
+#ifdef _WIN64
+    #define FALLBACK_SCAN_UNIT 8
+    int64_t delta64 = (int64_t)(new_base - old_base);
+#else
+    #define FALLBACK_SCAN_UNIT 4
+#endif
+```
+
+修复后 DontSleep fallback 改了 1469 个 8 字节引用（原 1918 个 4 字节引用），全部正确，PASS。
+
+### 7. 清理：移除调试用 PEB.Ldr 模块遍历诊断代码
+
+调试 DontSleep 时在 `loader.c` 中临时添加了 PEB.Ldr 模块遍历代码（找占用 0x400000 的 DLL）。问题修复后已移除（`packer/reflective/loader.c:1776` 处保留 VirtualQueryEx 区域查询作通用诊断，移除 PEB.Ldr 遍历）。
+
+### 涉及文件
+
+- **新建** `packer/reflective/loader_asm_x64.asm`：MASM x64 实现 jump_to_oep
+- **新建** `packer/reflective/loader_asm_x86.asm`：MASM x86 实现 jump_to_oep
+- **新建** `packer/reflective/CMakeLists.txt`：MSVC 编译配置
+- **修改** `packer/CMakeLists.txt`：启用 `add_subdirectory(reflective)`
+- **修改** `packer/reflective/loader.c`：
+  - `jump_to_oep` 双模式（GCC 内联汇编 / MSVC extern + .asm）
+  - TLS callback 用 `WINLOCK_SECTION_CRT_XLB` 宏
+  - 入口函数 `main` → MSVC `WinMain`
+  - `fallback_relocations` x64 改 8 字节扫描（DIR64 修复）
+  - 移除 PEB.Ldr 调试诊断代码
+
+### 临时验证文件（在 `temp/`，被 .gitignore 排除）
+
+- `temp/build_phase4c_msvc.py`：MSVC 编译脚本（vcvars64.bat + cmake + ninja）
+- `temp/test_phase4c_compare.py`：MSVC vs MinGW 基线双向对比测试（8 样本）
+- `temp/test_phase4c_regression.py`：精简回归测试（8 样本）
+- `temp/check_imagebase.ps1` / `temp/dump_sections.ps1` / `temp/dump_imports.ps1` / `temp/dump_dllchars.ps1`：dumpbin PE 分析脚本
+- `temp/phase4c_compare/`：对比测试产物目录（msvc/ + mingw_baseline/）
+
+### 下一步
+
+阶段 4 步骤 C 完成，按 spec 进入阶段 5：
+- 阶段 5：**C3b 完全 PIC 化**（用 `/NODEFAULTLIB /ENTRY:loader_main` 编译 loader，剥离 CRT 静态链接，loader_x64.exe 体积从 127KB 降到 15-20KB）
+- 阶段 6：stub 提取 .lock 节（与 builder 整合）
+- 阶段 7：端到端验证
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 B 完成：loader.c 内存改 Win32 API
 
 按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 B（spec 第 306-313 行）实施，把 `packer/reflective/loader.c` 的动态内存分配从 CRT（calloc/free/strnlen）切换到 Win32 API（VirtualAlloc/VirtualFree），并为 step C 的 PIC 化（彻底剥离 CRT）继续铺路。
