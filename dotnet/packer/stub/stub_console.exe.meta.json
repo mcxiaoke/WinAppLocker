@@ -1,7 +1,0 @@
-{
-  "description": "AppLocker Console stub (tempfile mode, stdin password)",
-  "name": "applocker-console",
-  "subsystem": "console",
-  "version": "1.0.0",
-  "kind": "tempfile"
-}

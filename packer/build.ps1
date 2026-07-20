@@ -55,10 +55,16 @@ if (-not (Test-Path $vcvarsall)) {
 }
 
 # 辅助函数：调用 vcvarsall.bat 注入环境变量到当前 PowerShell session
-function Invoke-Vcvarsall([string]$arch) {
-    Write-Host "==> 设置 MSVC 环境: vcvarsall.bat $arch" -ForegroundColor Cyan
-    $envOutput = & cmd /c "`"$vcvarsall`" $arch && set" 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "vcvarsall.bat $arch 调用失败" }
+# 参数：
+#   $vcvarsArch - vcvarsall.bat 的参数（"x64" 或 "x86"）
+#                注意：x86 构建仍用 x64 host 交叉编译，所以两个架构都传 "x64"
+function Invoke-Vcvarsall([string]$vcvarsArch) {
+    Write-Host "==> 设置 MSVC 环境: vcvarsall.bat $vcvarsArch" -ForegroundColor Cyan
+    # 先在同一个 cmd 进程里 /clean_env 清理上一轮 vcvarsall 的环境污染，
+    # 再设置新架构，最后输出 set 结果。避免 PATH 等变量累积导致"路径太长"错误。
+    # 注意：cmd 中用 & 无条件串联（不用 &&，因为 /clean_env 可能在无残留时报错）
+    $envOutput = & cmd /c "`"$vcvarsall`" /clean_env >nul 2>&1 & `"$vcvarsall`" $vcvarsArch >nul 2>&1 & set" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "vcvarsall.bat $vcvarsArch 调用失败" }
     foreach ($line in $envOutput) {
         if ($line -match '^([^=]+)=(.*)$') {
             Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
@@ -70,15 +76,19 @@ function Invoke-Vcvarsall([string]$arch) {
 
 # 辅助函数：构建一个架构
 # 参数：
-#   $arch         - "x64" 或 "x86"
-#   $cmakelistSrc - 源 CMakeLists 文件名（CMakeLists-x64.txt 或 CMakeLists-x86.txt）
+#   $arch         - 目标架构 "x64" 或 "x86"
+#   $cmakelistSrc - 源 CMakeLists 文件名
 #   $buildDir     - build 输出目录
 function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
     Write-Host ""
     Write-Host "======== 构建 $arch ========" -ForegroundColor Cyan
 
-    # 1. 设置 MSVC 环境（x86 用 32 位 cl.exe，x64 用 64 位 cl.exe）
-    Invoke-Vcvarsall $arch
+    # 1. 设置 MSVC 环境
+    #    x86 构建用 x64 host 交叉编译（HostX64\x86\cl.exe），
+    #    因为系统未安装 x86 host 工具集（vcvarsall.bat x86 会失败）
+    #    vcvarsall.bat x64_x86 设置 x64->x86 交叉编译环境
+    $vcvarsArg = if ($arch -eq "x86") { "x64_x86" } else { "x64" }
+    Invoke-Vcvarsall $vcvarsArg
 
     # 2. 清理
     if ($Clean -and (Test-Path $buildDir)) {
@@ -90,7 +100,6 @@ function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
     }
 
     # 3. 临时把 CMakeLists-xXX.txt 复制为 CMakeLists.txt
-    #    CMake 必须读名为 CMakeLists.txt 的文件，不支持 -f 指定其他文件名
     $tempCmake = Join-Path $root "CMakeLists.txt"
     if (Test-Path $tempCmake) {
         throw "存在意外文件 $tempCmake，请手动删除后重试"
@@ -99,6 +108,8 @@ function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
 
     try {
         # 4. CMake configure
+        #    x86 交叉编译：host 是 x64，target 是 Win32，通过 vcvarsall x64_x86 设置环境
+        #    不使用 -A Win32（Ninja 不支持）
         Write-Host "==> CMake configure ($arch, Ninja)..." -ForegroundColor Cyan
         $cmakeArgs = @("-S", $root, "-B", $buildDir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=$config")
         Write-Host "    $ cmake $($cmakeArgs -join ' ')" -ForegroundColor DarkGray

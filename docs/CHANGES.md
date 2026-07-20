@@ -1,5 +1,70 @@
 # 变更记录
 
+## 2026-07-20 16:00 packer 目录重构 + x86 MSVC 迁移 + dotnet 构建链统一
+
+继 C3b 完全 PIC 化（commit `1ac443b`）之后，本轮提交（commit `eb9a523`）完成 packer 目录结构重组、x86 架构 MSVC 迁移、.NET 构建链从 MinGW 切换到 MSVC 三大改动。除 DontSleep 反射式加载修复另见专条外，其余主要改动如下。
+
+### 1. packer 目录重构（builder/stub → inplace/reflective）
+
+按 spec `2026-07-20-x86-msvc-migration-and-build-refactor.md` 重构 packer 子目录，让 inplace 与 reflective 两种模式各自独立、文件名统一：
+
+| 旧路径 | 新路径 | 说明 |
+|--------|--------|------|
+| `packer/builder/builder.c` | `packer/inplace/builder.c` | inplace 加壳器，stub 路径改为 `stub_inplace_xXX.bin` |
+| `packer/builder/builder_reflective.c` | `packer/reflective/builder_reflective.c` | reflective 加壳器，stub 路径改为 `stub_reflective_xXX.exe` |
+| `packer/stub/*` | `packer/inplace/*` | inplace stub 源码整体迁移 |
+| `packer/CMakeLists.txt`（单文件） | `packer/CMakeLists-x64.txt` + `packer/CMakeLists-x86.txt` | 按架构拆分顶层 CMakeLists |
+| 各子目录 `CMakeLists.txt` | `inplace/CMakeLists.inc` + `reflective/CMakeLists.inc` | 用 `include()` 引入，避免重复 |
+
+### 2. x86 MSVC 迁移关键修改
+
+- **新增 `packer/CMakeLists-x86.txt`**：x86 专用顶层 CMakeLists，强制 MSVC，使用 `vcvarsall.bat x64_x86` 交叉编译
+- **`pic_u64_divmod()`（loader.c）**：纯 C 位运算实现的 64 位长除法，替代 `__aulldvrm` MASM 实现
+  - 二进制长除法循环 64 次，所有位移都是常数，MSVC 编译为纯 `shl/rcl/shr` 指令
+  - 64 位比较/减法是纯 `cmp/sbb/sub` 指令序列，不引入任何外部符号引用
+  - 100% PIC 安全，参考 PE Packer 无 CRT 除法的标准做法
+- **`u64_to_str()` 改用 `pic_u64_divmod()`** 替代 `v % base` 和 `v /= base`，消除 64 位除法对 `__aulldvrm` 的依赖
+- **`manual_test.ps1`** 增加 `-Reflective` 开关，按模式选 builder（`builder_inplace.exe` / `builder_reflective.exe`）
+
+### 3. dotnet 构建链统一（MinGW → MSVC）
+
+- **`dotnet/build.ps1`** 删除 `mingw32-make` + PATH 设置 + Push-Location 逻辑，改为调用 `& "$winlockDir\build.ps1" @winlockBuildArgs`
+- 所有 `dotnet build` 调用加 `-p:Platform=AnyCPU`：.NET 10 SDK 默认 `Platform=x64` 会把产物输出到 `bin\x64\Release\`，与脚本假设的 `bin\$(Configuration)\` 路径不一致
+- **`dotnet/packer/ReflectivePacker.cs`** stub 文件名改为 `stub_reflective_xXX.exe`（与新目录布局一致）
+- **`dotnet/packer/stub/*.meta.json`** components 字段更新为新命名（`stub_inplace_x64.bin` / `stub_reflective_x64.exe` 等）
+- **移除过时的 MinGW 产物**：`winlock_stub_x64.bin` / `winlock_stub_x86.bin` / `winlock_builder.exe.meta.json` / `winlock_reflective_builder.exe.meta.json`
+
+### 4. 新增测试与调试脚本
+
+- **`tests/test_e2e_msvc.py`**：MSVC 迁移端到端测试脚本，覆盖 8 个样本（x64 + x86 × inplace + reflective），支持自动调用 `packer/build.ps1 -Clean` clean build
+- **`tests/test_aulldvrm.exe`**：64 位除法 CRT 辅助函数验证程序
+- **`tests/debug_dontsleep_refl.ps1`**：cdb 调试 DontSleep reflective 模式的脚本（hook FindResourceW/LoadResource/LoadStringW）
+- **`tests/debug_wfopen.py`**：Python + ctypes 调用 cdb，hook `_wfopen` 看打开什么文件
+- **`packer/tests/manual_test.ps1`** 支持 `-Reflective` 参数，分别测试 inplace / reflective 两种模式
+
+### 5. dist/ 最终产物（9 个文件）
+
+```
+builder_inplace.exe          stub_inplace_x64.bin     stub_reflective_x64.exe
+builder_reflective.exe       stub_inplace_x64.exe     stub_reflective_x86.exe
+                             stub_inplace_x86.bin
+                             stub_inplace_x86.exe
+```
+
+x86 builder 不再单独输出（现代 Windows 都是 64 位，x64 builder 通过 WOW64 也能加壳 x86 PE）。
+
+---
+
+## 2026-07-20 23:45 修复 x86 构建 + e2e 测试脚本自动 clean build
+
+### x86 构建修复
+- `vcvarsall.bat x86` 需要 x86 host 工具集（未安装），改为 `vcvarsall.bat x64_x86` 交叉编译
+- 使用 x64 host 的 cl.exe 交叉编译 x86 target（HostX64\x86\cl.exe）
+
+### e2e 测试脚本更新
+- `test_e2e_msvc.py` 在测试前自动调用 `packer/build.ps1 -Clean` 执行 clean build
+- 确保始终使用最新的 stub 和 builder
+
 ## 2026-07-20 23:30 修复 DontSleep 反射式加载崩溃 + 强制基址加载
 
 ### 问题

@@ -35,28 +35,30 @@ namespace WinAppLocker.Packer
         }
 
         /// <summary>
-        /// 调用 builder_reflective.exe 加壳。
-        ///
-        /// 调用形式：builder_reflective.exe input.exe output.exe --stub loader_xXX.exe
-        /// builder 按输入 PE 架构自动选 stub（x64→loader_x64.exe，x86→loader_x86.exe）。
-        /// 用 --stub 显式指定可覆盖自动选择（用于 components 路径解析）。
-        ///
-        /// 命令行格式与 WinLockPacker 不同：
-        ///   - 无密码参数（MVP v1 明文模式）
-        ///   - 无 -i/-o 前缀，用位置参数
-        ///   - 用 --stub 指定单个 stub（不是 --stub-dir）
-        /// </summary>
-        /// <param name="builderExe">builder_reflective.exe 完整路径</param>
-        /// <param name="stubDir">stub/ 目录路径（builder_reflective.exe 所在目录，用于相对路径解析）</param>
-        /// <param name="inputExe">原 EXE 路径</param>
-        /// <param name="outputExe">输出 EXE 路径</param>
-        /// <param name="machine">原 PE 的 Machine 字段（IMAGE_FILE_MACHINE_AMD64=0x8664 / I386=0x14c），用于选 stub</param>
-        public static ReflectiveResult Pack(
-            string builderExe,
-            string stubDir,
-            string inputExe,
-            string outputExe,
-            ushort machine)
+/// 调用 builder_reflective.exe 加壳。
+///
+/// 调用形式：builder_reflective.exe input.exe output.exe --stub loader_xXX.exe [-p password] [-t]
+/// builder 按输入 PE 架构自动选 stub（x64→loader_x64.exe，x86→loader_x86.exe）。
+/// 用 --stub 显式指定可覆盖自动选择（用于 components 路径解析）。
+///
+/// -p 指定密码时走 v2 XTEA 加密分支，否则走 v1 明文分支
+/// -t 测试模式，硬编码密码 "test123"（CI 自动化测试用）
+/// </summary>
+/// <param name="builderExe">builder_reflective.exe 完整路径</param>
+/// <param name="stubDir">stub/ 目录路径（builder_reflective.exe 所在目录，用于相对路径解析）</param>
+/// <param name="inputExe">原 EXE 路径</param>
+/// <param name="outputExe">输出 EXE 路径</param>
+/// <param name="machine">原 PE 的 Machine 字段（IMAGE_FILE_MACHINE_AMD64=0x8664 / I386=0x14c），用于选 stub</param>
+/// <param name="password">加密密码（null/空串走 v1 明文模式）</param>
+/// <param name="testMode">测试模式（-t 参数，硬编码密码 "test123"，CI 用）</param>
+public static ReflectiveResult Pack(
+    string builderExe,
+    string stubDir,
+    string inputExe,
+    string outputExe,
+    ushort machine,
+    string password = null,
+    bool testMode = false)
         {
             var result = new ReflectiveResult();
 
@@ -80,9 +82,13 @@ namespace WinAppLocker.Packer
                 return result;
             }
 
-            // 命令行：builder_reflective.exe <input> <output> --stub <stub_path>
+            // 命令行：builder_reflective.exe <input> <output> --stub <stub_path> [-p <pwd>] [-t]
             // 注意：builder_reflective 用位置参数（不是 -i/-o）
             var args = $"\"{inputExe}\" \"{outputExe}\" --stub \"{stubPath}\"";
+            if (testMode)
+                args += " -t";
+            else if (!string.IsNullOrEmpty(password))
+                args += $" -p \"{password}\"";
 
             var psi = new ProcessStartInfo
             {

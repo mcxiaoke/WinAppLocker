@@ -219,7 +219,7 @@ namespace WinAppLocker.Packer
             IProgress<int> progress,
             Action<string> logger)
         {
-            logger?.Invoke($"[Reflective] 使用 {stub.Name} 加壳（MVP v1 明文模式）...");
+            logger?.Invoke($"[Reflective] 使用 {stub.Name} 加壳...");
 
             // builder 不能原地覆盖输入文件，复制到临时文件
             string tempInput = Path.Combine(Path.GetTempPath(),
@@ -234,10 +234,10 @@ namespace WinAppLocker.Packer
                 string stubDir = stub.StubDir;
 
                 // 调用 builder_reflective.exe
-                // 命令行：builder_reflective.exe <input> <output> --stub <stub_path>
-                // builder 按 PE 架构自动选 stub（x64→loader_x64.exe，x86→loader_x86.exe）
+                // 命令行：builder_reflective.exe <input> <output> --stub <stub_path> [-p <pwd>] [-t]
                 var result = ReflectivePacker.Pack(
-                    builderExe, stubDir, tempInput, tempOutput, peInfo.Machine);
+                    builderExe, stubDir, tempInput, tempOutput, peInfo.Machine,
+                    opts.Password, opts.WinLockTestMode);
 
                 // 输出 builder 日志
                 if (!string.IsNullOrEmpty(result.Stdout))
