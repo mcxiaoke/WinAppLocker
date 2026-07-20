@@ -66,6 +66,39 @@
 #include "../common/sha256.h"
 #include "../common/peb_walk.h"
 
+/* ============================================================
+ * MSVC /NODEFAULTLIB 下提供 memset/memcpy/memcmp 本地实现
+ *
+ * C3b 完全 PIC 化后不链接 CRT，需要自实现这三个函数。
+ * #pragma function(...) 强制编译器使用函数调用（不用 intrinsic），
+ * 让这里提供的本地实现被实际调用。
+ *
+ * 与 stub.c 的实现一致（但不用 WINLOCK_SECTION_TEXT，loader 用普通 .text）。
+ * ============================================================ */
+#ifdef _MSC_VER
+#pragma function(memset, memcpy, memcmp)
+void* memset(void* dst, int val, size_t n) {
+    uint8_t* p = (uint8_t*)dst;
+    while (n--) *p++ = (uint8_t)val;
+    return dst;
+}
+void* memcpy(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+int memcmp(const void* a, const void* b, size_t n) {
+    const uint8_t* pa = (const uint8_t*)a;
+    const uint8_t* pb = (const uint8_t*)b;
+    while (n--) {
+        if (*pa != *pb) return (int)*pa - (int)*pb;
+        pa++; pb++;
+    }
+    return 0;
+}
+#endif /* _MSC_VER */
+
 /* ---- 架构相关类型别名 ----
  * 让下面代码用统一的 IMAGE_NT_HEADERS_X / thunk_t 等符号，
  * 实际类型由 _WIN64 宏决定。
@@ -2035,11 +2068,19 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
  *
  * 阶段 4 步骤 C：
  *   - GCC：保持 main()（MinGW GUI 子系统接受 main，自动跳板到 WinMain）
- *   - MSVC：/SUBSYSTEM:WINDOWS 期望 WinMain，用 #ifdef 切换函数签名
- *           （参数都不用，只是入口名不同） */
+ *   - MSVC C3：/SUBSYSTEM:WINDOWS 期望 WinMain，用 #ifdef 切换函数签名
+ *   - MSVC C3b：/NODEFAULTLIB /ENTRY:loader_main 完全剥离 CRT，
+ *     入口改为 void WINAPI loader_main(void)，return N 改为 ExitProcess(N)
+ *
+ * LOADER_EXIT 宏统一处理：MSVC 用 ExitProcess（void 函数不能 return 值），
+ * GCC 保持 return（main 函数返回 exit code 给 CRT） */
 #ifdef _MSC_VER
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
-    (void)hInstance; (void)hPrev; (void)lpCmdLine; (void)nCmdShow;
+#define LOADER_EXIT(n) ExitProcess((UINT)(n))
+#else
+#define LOADER_EXIT(n) return (n)
+#endif
+#ifdef _MSC_VER
+void WINAPI loader_main(void) {
 #else
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;  /* stub 不处理命令行参数 */
@@ -2061,7 +2102,7 @@ int main(int argc, char* argv[]) {
     uint8_t* payload_sec = find_payload_section(&payload_sec_size);
     if (!payload_sec) {
         DBG("FATAL: .payload section not found in stub\n");
-        return 1;
+        LOADER_EXIT(1);
     }
     DBG("found .payload section at %p, size=0x%x\n",
         (void*)payload_sec, payload_sec_size);
@@ -2070,21 +2111,21 @@ int main(int argc, char* argv[]) {
     if (payload_sec_size < sizeof(reflective_payload_t)) {
         DBG("FATAL: payload section too small (%u < %zu)\n",
             payload_sec_size, sizeof(reflective_payload_t));
-        return 1;
+        LOADER_EXIT(1);
     }
     reflective_payload_t* hdr = (reflective_payload_t*)payload_sec;
     if (hdr->magic != REFLECTIVE_PAYLOAD_MAGIC) {
         DBG("FATAL: bad payload magic 0x%llx (expected 0x%llx)\n",
             (unsigned long long)hdr->magic,
             (unsigned long long)REFLECTIVE_PAYLOAD_MAGIC);
-        return 1;
+        LOADER_EXIT(1);
     }
     /* 同时接受 v1（明文）和 v2（XTEA 加密 + SHA-256 密码校验） */
     if (hdr->version != REFLECTIVE_PAYLOAD_VERSION
         && hdr->version != REFLECTIVE_PAYLOAD_VERSION_V2) {
         DBG("FATAL: unsupported payload version %u (expected v1=%u or v2=%u)\n",
             hdr->version, REFLECTIVE_PAYLOAD_VERSION, REFLECTIVE_PAYLOAD_VERSION_V2);
-        return 1;
+        LOADER_EXIT(1);
     }
     DBG("payload header: version=%u flags=0x%04x original_size=%llu stored_size=%llu\n",
         hdr->version, hdr->flags,
@@ -2099,7 +2140,7 @@ int main(int argc, char* argv[]) {
     if (needed > payload_sec_size) {
         DBG("FATAL: payload data truncated (need %zu, have %u)\n",
             needed, payload_sec_size);
-        return 1;
+        LOADER_EXIT(1);
     }
 
     uint8_t* payload_data = payload_sec + sizeof(reflective_payload_t);
@@ -2108,14 +2149,14 @@ int main(int argc, char* argv[]) {
      * 解密成功后 payload_data 变成原 PE 明文字节，可继续 map_image */
     if (!decrypt_payload_if_needed(hdr, payload_data, (size_t)hdr->stored_size)) {
         DBG("FATAL: decrypt_payload_if_needed failed\n");
-        return 2;
+        LOADER_EXIT(2);
     }
 
     /* 3. 反射式映射 */
     uint8_t* new_img = map_image(hdr, payload_data);
     if (!new_img) {
         DBG("FATAL: map_image failed\n");
-        return 2;
+        LOADER_EXIT(2);
     }
     DBG("=== image mapped at %p, jumping to OEP ===\n", (void*)new_img);
 
@@ -2129,5 +2170,5 @@ int main(int argc, char* argv[]) {
     DBG("jump_to_oep(%p) ret=%p\n", oep, (void*)oep_returned);
     jump_to_oep(oep, (void*)oep_returned);
     /* never returns */
-    return 0;
+    LOADER_EXIT(0);
 }

@@ -1,5 +1,147 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 C3b 完成：完全 PIC 化（剥离 CRT）
+
+按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 C3b（spec 第 337-349 行）实施，把 `loader_x64.exe` 从 `/MT` 静态 CRT 模式改为 `/NODEFAULTLIB` 完全 PIC 化模式，剥离所有 CRT 依赖。
+
+### 1. 核心收益
+
+| 指标 | C3（/MT 静态 CRT） | C3b（完全 PIC） | 改善 |
+|------|-------------------|----------------|------|
+| loader_x64.exe 体积 | 127488 字节 | 29184 字节 | **-77%** |
+| kernel32 导入函数数 | 80+ | 25 | **-69%** |
+| CFG（Guard CF 表） | 启用（`.fptable` 节 + `guard_dispatch_icall_nop`） | 禁用（`/loadconfig` 输出空） | ✓ |
+| CRT 启动依赖 | FlsAlloc/HeapAlloc/InitializeCriticalSectionEx/GetStartupInfoW/GetCommandLineW 等 | 无 | ✓ |
+| DIE 识别特征 | "Microsoft Linker 14.51 + UCRT" | 仅 user32+kernel32 25 个 API | ✓ |
+
+### 2. 实施内容
+
+#### 2.1 编译选项（`packer/reflective/CMakeLists.txt`）
+
+新增 MSVC PIC 化编译选项：
+- `/GS-` 关闭 stack cookie（避免引用 `__security_cookie`）
+- `/Gs1048576` 关闭栈探针（阈值 1MB，避免引用 `__chkstk`）
+- `/GL-` 关闭 LTCG（避免引入额外 CRT 依赖）
+- `/Zl` 不在 .obj 中引用默认库（配合 `/NODEFAULTLIB`）
+- `/guard:cf-` 关闭 CFG 插桩（cl.exe 语法，避免生成 CFG 函数表）
+- `/GUARD:NO` 链接阶段禁用 CFG（link.exe 语法，与 cl.exe 对应）
+
+链接选项：
+- `/NODEFAULTLIB` 不链接任何默认库（CRT/kernel32 等都不链）
+- `/ENTRY:loader_main` 自定义入口（跳过 `mainCRTStartup`，不依赖 CRT 启动代码）
+- 显式链接 `user32 + kernel32`（`/NODEFAULTLIB` 后需手动指定）
+
+#### 2.2 loader.c 入口函数改造（`packer/reflective/loader.c:2044-2054`）
+
+`WinMain` → `void WINAPI loader_main(void)`：
+- MSVC：`void WINAPI loader_main(void)` + `LOADER_EXIT(n)` 宏（调用 `ExitProcess(n)`）
+- GCC：保持 `int main(int argc, char* argv[])`（MinGW GUI 子系统接受 main）
+
+```c
+#ifdef _MSC_VER
+#define LOADER_EXIT(n) ExitProcess((UINT)(n))
+#else
+#define LOADER_EXIT(n) return (n)
+#endif
+#ifdef _MSC_VER
+void WINAPI loader_main(void) {
+#else
+int main(int argc, char* argv[]) {
+    (void)argc; (void)argv;
+#endif
+```
+
+#### 2.3 自实现 memset/memcpy/memcmp（`packer/reflective/loader.c:69-100`）
+
+`/NODEFAULTLIB` 下没有 CRT 提供的 memset/memcpy/memcmp，需要自实现。用 `#pragma function(memset, memcpy, memcmp)` 强制编译器使用函数调用（不用 intrinsic），让本地实现被实际调用。
+
+与 stub.c 的实现一致（但不用 `WINLOCK_SECTION_TEXT`，loader 用普通 .text 节）。
+
+### 3. CFG 禁用前后对比
+
+#### C3（启用 CFG，`/MT`）
+
+```
+$ dumpbin /loadconfig loader_x64.exe
+  Guard CF address of check-function pointer: 0x1400122C0
+  Guard CF address of dispatch-function pointer: 0x1400122D0
+  Guard Flags: 0x100 (CF instrumented)
+  .fptable 节（CFG 函数表）
+```
+
+IAT 从 kernel32 导入 80+ 函数（HeapAlloc/FlsAlloc/InitializeCriticalSectionEx/QueryPerformanceCounter/GetStartupInfoW 等 CRT 启动依赖）。
+
+#### C3b（禁用 CFG，`/NODEFAULTLIB`）
+
+```
+$ dumpbin /loadconfig loader_x64.exe
+  (空输出 - 没有 Load Config Directory)
+```
+
+IAT 只剩 25 个真正用到的 kernel32 函数：
+- `AddVectoredExceptionHandler` / `RtlAddFunctionTable` / `RtlLookupFunctionEntry` / `RtlVirtualUnwind`（VEH + SEH）
+- `VirtualAlloc` / `VirtualProtect` / `VirtualFree` / `VirtualQueryEx`（反射式加载）
+- `LoadLibraryA` / `GetProcAddress` / `GetModuleHandleW`（IAT 解析）
+- `CreateFileA` / `WriteFile` / `FlushFileBuffers` / `CloseHandle` / `DeleteFileA`（日志）
+- `ExitProcess` / `GetLastError` / `GetCurrentProcess`（控制流）
+- `CreateActCtxA` / `ActivateActCtx` / `SetDllDirectoryW` / `SetCurrentDirectoryW` / `GetTempPathA` / `GetModuleFileNameA/W`（ActCtx + 路径）
+
+节布局精简（无 `.fptable` 节）：
+```
+  .CRT   1000  (TLS callback)
+  .data  1000
+  .pdata 1000  (x64 SEH)
+  .rdata 3000
+  .rsrc  1000
+  .text  4000
+```
+
+### 4. 测试结果
+
+用 `temp/test_phase4c_compare.py` 双向对比测试（8 样本）：
+
+| 样本 | MSVC C3b | MinGW 基线 | 一致 |
+|------|---------|-----------|------|
+| helloguix64 | PASS | PASS | yes |
+| helloguix86 | PASS | PASS | yes |
+| hellocli | PASS | PASS | yes |
+| hellomfcx64 | PASS | PASS | yes |
+| hellomingw | PASS | PASS | yes |
+| helloucrt | PASS | PASS | yes |
+| Notepad4 | PASS | PASS | yes |
+| DontSleep | PASS | PASS | yes |
+
+**8/8 全 PASS，与 MinGW 基线完全一致**。
+
+### 5. 已知差异（不影响功能）
+
+MSVC stub 的 `VirtualAlloc(preferred=0x140000000)` 失败（err=487），因为 stub 自身 ImageBase=0x140000000 占用了该地址。MinGW stub 启用 ASLR 运行时被重定位到其他地址，让出 0x140000000。
+
+- 不影响功能：fallback_relocations 能处理（DontSleep 走此路径，8 字节扫描修复后 PASS）
+- 不影响性能：大多数 PE 有 .reloc 表，走 apply_relocations 正常路径
+- 后续优化：可改 /BASE 到不常用地址（如 0x10000000）让出 0x140000000
+
+### 6. 涉及文件
+
+- **修改** `packer/reflective/CMakeLists.txt`：加 PIC 化编译/链接选项（`/GS- /Gs1048576 /GL- /Zl /guard:cf- /NODEFAULTLIB /ENTRY:loader_main /GUARD:NO`）
+- **修改** `packer/reflective/loader.c`：
+  - 新增 memset/memcpy/memcmp 自实现（`#pragma function` + 本地实现）
+  - 入口函数 `WinMain` → `void WINAPI loader_main(void)` + `LOADER_EXIT` 宏
+
+### 7. 临时验证文件
+
+- `temp/build_phase4c_msvc.py`：MSVC 编译脚本
+- `temp/test_phase4c_compare.py`：MSVC vs MinGW 基线对比测试（8 样本）
+- `temp/test_phase4c_regression.py`：精简回归测试（8 样本）
+- `temp/analyze_loader_crt_deps.ps1`：dumpbin 分析 imports/loadconfig/symbols
+
+### 下一步
+
+阶段 4 步骤 C3b 完成，按 spec 进入：
+- 阶段 5：方案 B 节名伪装 + 特征消除（`.lock` 节重命名、CheckSum 清零等）
+- 阶段 6：stub 提取 .lock 节（与 builder 整合）
+- 阶段 7：端到端验证
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 4 步骤 C 完成：TLS callback + MSVC 链接 + 8/8 全样本 PASS
 
 按 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 阶段 4 步骤 C（spec 第 315-380 行）实施，把 `packer/reflective/loader.c` + 汇编 stub 通过 CMake + MSVC 工具链编译，使 MSVC stub 替代 MinGW stub 作为加壳用的 loader。
