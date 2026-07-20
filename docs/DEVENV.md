@@ -27,9 +27,10 @@
 
 | 工具 | 路径 | 说明 |
 |------|------|------|
-| w64devkit | `C:\Home\Develop\w64devkit\bin\` | GCC 13+/mingw-w64 x64 工具链（winlock 主用） |
-| msys2 mingw32 | `C:\Home\Develop\msys64\mingw32\bin\` | x86 GCC（winlock x86 stub 用） |
+| w64devkit | `C:\Home\Develop\w64devkit\bin\` | GCC 13+/mingw-w64 x64 工具链 |
+| msys2 mingw32 | `C:\Home\Develop\msys64\mingw32\bin\` | x86 GCC |
 | msys2 mingw64 | `C:\Home\Develop\msys64\mingw64\bin\` | x64 GCC 备选 |
+| msys2 clang64 | `C:\Home\Develop\msys64\clang64\bin\` | x64 GCC 备选 |
 | msys2 shell   | `C:\Home\Develop\msys64\msys2.exe`     | msys2 终端 |
 | cygwin64      | `C:\Home\Develop\cygwin64\bin\`        | cygwin 工具集 |
 
@@ -194,33 +195,10 @@
 | ctop         | scoop shim: `ctop.exe`       | 容器/进程 top |
 | copyq        | scoop shim: `copyq.exe`      | 剪贴板管理 |
 
-### 7-Zip
-
-| 工具 | 路径 | 说明 |
-|------|------|------|
-| 7z | `C:\Home\Develop\msys64\usr\bin\7z`、`C:\Home\Tools\BCompare\7z.dll` | 压缩/解压 |
 
 ---
 
-## 6. 文件 / 磁盘 / 系统
-
-### 文件管理
-
-| 工具 | 路径 | 说明 |
-|------|------|------|
-| Bandizip       | `C:\Home\Tools\Bandizip\`                  | 压缩工具 |
-| BCompare       | `C:\Home\Tools\BCompare\BComp.exe`          | Beyond Compare 对比工具 |
-| WinMerge       | `C:\Home\Tools\WinMerge\`                   | 文件/目录对比 |
-| FastCopy       | `C:\Home\Tools\FastCopy\fcp.exe`            | 快速复制 |
-| BulkRename     | `C:\Home\Tools\BulkRename\`                 | 批量重命名 |
-| zRenamer       | `C:\Home\Tools\zRenamer\`                   | 重命名工具 |
-| LockHunter     | `C:\Home\Tools\LockHunter\`                 | 文件锁定解除 |
-| filebrowser    | `C:\Home\Tools\filebrowser\`                | Web 文件管理 |
-| Ditto          | `C:\Home\Tools\Ditto\Ditto.exe`             | 剪贴板历史 |
-
----
-
-## 7. 包管理 / 构建
+## 6. 包管理 / 构建
 
 | 工具 | 路径 | 说明 |
 |------|------|------|
@@ -232,17 +210,6 @@
 | npm / npx     | `C:\Home\Develop\nodejs\npm.cmd`          | Node 包管理 |
 | corepack      | `C:\Home\Develop\nodejs\corepack`        | pnpm/yarn 管理 |
 
-### Scoop 常用包列表（已装）
-
-```
-ack bat bbdown bun copyq croc ctop curl dark delta dependencies
-dependenciesgui diskinfo diskmark dua eview evim ex exiftool fd
-file fpcalc fzf gdu git git-bash git-lfs gite gitextensions gpg
-gpg-agent gradle gview gvim gvimdiff idle idle3 idle313 nuget
-pinentry python3 python313 rg rgview rgvim rview rvim scoop
-scoop-search starship sudo upx uv uvw uvx vi view vim vimdiff
-wget xxd yt-dlp
-```
 
 
 ---

@@ -26,9 +26,22 @@
 #include "config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
 
 /* PIC stub 模式：函数进 .lock.text 节；host 模式：普通 static inline。
- * 注意：不带 used 属性 —— 未调用的 encrypt 函数不应被 emit 到 stub 二进制。 */
+ * 注意：不带 used 属性 —— 未调用的 encrypt 函数不应被 emit 到 stub 二进制。
+ *
+ * MSVC 与 GCC 的节名约定不同（见 winlock_compat.h）：
+ *   - GCC:   __attribute__((section(".lock.text")))   → 节名 .lock.text
+ *   - MSVC:  #pragma code_seg(".lock$text")           → 节名 .lock$text
+ * 链接时 GCC 用 stub.ld KEEP(*(.lock.text))，MSVC 用 /MERGE:.lock$text=.lock
+ */
 #ifdef WINLOCK_PIC
-  #define WINLOCK_XTEA_FN __attribute__((section(".lock.text"), noinline))
+  #ifdef _MSC_VER
+    /* MSVC: 与 winlock_compat.h 的 WINLOCK_SECTION_TEXT 一致，无 used 概念
+     * /OPT:REF 会自动移除未引用函数（如 stub 不用的 xtea_encrypt_*） */
+    #define WINLOCK_XTEA_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
+  #else
+    /* GCC: section + noinline 不带 used，--gc-sections 移除未调用函数 */
+    #define WINLOCK_XTEA_FN __attribute__((section(".lock.text"), noinline))
+  #endif
 #else
   #define WINLOCK_XTEA_FN
 #endif

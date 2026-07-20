@@ -1,5 +1,41 @@
 # 变更记录
 
+## 变更记录 2026-07-20 MSVC 迁移阶段 3 批 3 完成：jump_to_oep_x64 修复 + SHA-256 用 Brad Conte 实现
+
+承接上一条「阶段 3 进度」记录，本条完成批 3（MASM 实现 jump_to_oep_x64）并修复 SHA-256 bug，整个 stub 现在可在 MSVC 下端到端工作（加壳→密码校验→解密 .text→跳 OEP）。
+
+### 1. SHA-256 实现替换（`packer/common/sha256.h`）
+- 原 `packer/common/sha256.h` 的 K[] 常量数组有 1 位错误：`K[52] = 0x5b9cca5f`（应为 `0x5b9cca4f`），导致 stub 内 `verify_password` 永远失败，test mode 退出码 2
+- 用 Brad Conte 的标准实现（`temp/crypto-algorithms-master/sha256.c`，已用 `C:\Home\Tools\coreutils\sha256sum.exe` 对比验证）整体替换 `sha256.h` 内部实现
+- 保留三层 PIC 节区切换架构（MSVC `#pragma const_seg(".lock$rdata")` / GCC `__attribute__((section(".lock.rdata")))` / host 普通常量）和对外接口（`sha256_hash` / `bytes_eq_const` / `utf16le_to_utf8`）
+- 主循环 `sha256_transform` 与 Brad Conte 实现完全一致；宏 `SHA256_ROTR/CH/MAJ/EP0/EP1/SIG0/SIG1` 沿用
+- 验证：`temp/test_sha256_host.c` 在 host 模式下跑通 3 项测试（空串、"abc"、与 builder 写入的实际 pwd_hash 比对），全部匹配
+
+### 2. jump_to_oep_x64 节区修复（`packer/stub/stub_asm_x64.asm`）
+- 原 `.asm` 用默认 `.code` 段，MASM 把 `jump_to_oep_x64` 放进默认 `.text` 节，link.exe 不会自动合并到 `.lock`
+- `extract_lock_section.py` 只提取 PE 中 `.lock*` 节，导致 `stub_x64.bin` 缺失此函数
+- 运行时 stub 调用 `jump_to_oep_x64`（RVA 0x13000）落到 `.lock` 节内 padding 区域（全 0），执行 `add byte ptr [rax],al` 引发 AV，test mode 退出码 0xC0000005
+- **修复**：用 MASM `SEGMENT ... ALIAS('.lock$text')` 语法把函数放进 `.lock$text` COFF 节，link.exe 按 `$` 分组合并规则把它合并到 `.lock` 节
+- 重建 stub_x64.bin 新增第 4 个 `.lock` 子节（10 字节，VA=0x7000），机器码验证：`48 83 E4 F0 48 83 EC 28 FF E1` = `and rsp,-16; sub rsp,40; jmp rcx`
+
+### 3. 端到端验证（test mode + 密码模式）
+- **test mode（`-t`）**：加壳 `helloguix64.exe` 后运行，3 秒后仍存活，原 PE GUI 正常显示（不再 crash）
+- **密码模式（`-p test123`）**：加壳后运行弹出 "WinLock - Password Required" 对话框，输入 `test123` 回车后密码校验通过，原 PE `.text` 被解密、jump_to_oep_x64 跳到 OEP，原窗口 "helloguiaslr" 正常显示
+- dumpbin /disasm 确认 Section Summary 中只有 `.lock`（合并显示 3 个），不再有 `.text` 节
+- `call 0x17000`（jump_to_oep_x64 新位置，在 .lock 节内）替代旧 `call 0x13000`（在 .text 节）
+
+### 涉及文件
+- `packer/common/sha256.h`：整体重写（保留接口和三层 PIC 节区架构）
+- `packer/stub/stub_asm_x64.asm`：`SEGMENT ALIAS('.lock$text')` 替代默认 `.code` 段
+
+### 临时验证文件（在 `temp/`，已被 .gitignore 排除）
+- `temp/test_brad_sha256.c` / `temp/build_brad_sha256.ps1`：验证 Brad Conte 实现正确
+- `temp/test_sha256_host.c`：验证新 sha256.h host 模式
+- `temp/disasm_stub_full.ps1` / `temp/stub_disasm.txt`：dumpbin /disasm 反汇编 stub_x64.exe
+- `temp/run_testmode.ps1`：运行 test mode 检查退出码
+- `temp/debug_testmode.ps1`：cdb 调试 AV crash
+- `temp/dump_jump_to_oep.py`：dump stub_x64.bin 确认 jump_to_oep_x64 机器码
+
 ## 变更记录 2026-07-20 MSVC 迁移阶段 0-2：MinGW 后备 + 共享代码抽取 + CMake/Builder 迁移
 
 按照 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 推进 MSVC 工具链迁移，阶段 0/1/2 全部完成。MinGW 版 Makefile 保留为后备，CMake 与之并存可随时回退。

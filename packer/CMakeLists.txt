@@ -42,20 +42,26 @@ include_directories(${CMAKE_SOURCE_DIR}/common)
 # _CRT_SECURE_NO_WARNINGS  关闭 fopen/wcscpy 等 CRT 安全警告 C4996
 # _CRT_NONSTDC_NO_DEPRECATE  关闭 strdup 等 POSIX 函数弃用警告
 # NOMINMAX / WIN32_LEAN_AND_MEAN  精简 windows.h，避免 min/max 宏
-add_compile_options(/utf-8 /Zc:preprocessor)
+#
+# 用 $<$<COMPILE_LANGUAGE:C>:...> 限定只传给 C 编译器，
+# 否则会传给 ASM_MASM（ml64.exe/ml.exe），触发 A4018 警告（MASM 不识别这些 C 选项）
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:C>:/utf-8>
+    $<$<COMPILE_LANGUAGE:C>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C>:/MT>
+)
 add_compile_definitions(
     _CRT_SECURE_NO_WARNINGS
     _CRT_NONSTDC_NO_DEPRECATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
 )
-# 默认静态链接 CRT（/MT），生成的 exe 无需 vcruntime140.dll
-add_compile_options(/MT)
 
 # ---- 子目录 ----
 # 阶段 2：builder（纯 C，无 GCC 扩展，最简单的迁移）
 add_subdirectory(builder)
-# add_subdirectory(stub)        # 阶段 3 启用（stub PIC + MASM 汇编）
+# 阶段 3：Inplace stub（PIC 自包含 + MASM 汇编 jump_to_oep）
+add_subdirectory(stub)
 # add_subdirectory(reflective)  # 阶段 4 启用（loader 反射式）
 
 if(WINLOCK_BUILD_TESTS)

@@ -4,7 +4,6 @@
 bin/
 release/
 dist/
-*.exe
 *.o
 *.obj
 *.pdb
@@ -96,6 +95,7 @@ temp*
 
 # packer 内嵌的预编译 stub（build 产物，不跟踪）
 packer/stubs/
+dotnet/packer/stub/
 
 # 但测试样本 EXE 需要跟踪
 tests/samples/

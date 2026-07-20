@@ -32,9 +32,11 @@ applocker/
 - **Visual Studio 2026** —— dotnet 项目的 IDE
 - **.NET 10 SDK** —— 编译 dotnet stub 和 packer 主项目
 - **w64devkit** (`C:\Home\Develop\w64devkit`) —— WinLock x64 GCC 工具链
-- **msys2 mingw32** (`C:\Home\Develop\msys64\mingw32`) —— WinLock x86 GCC 工具链（可选）
+- **msys2** (`C:\Home\Develop\msys64\`) —— GCC 工具链（可选）
 - **pwsh**（PowerShell 7）—— 优先使用的 shell，构建/测试脚本基于它
 - **venv**（Python VENV）—— 根目录venv，已安装 pywinauto/pyautogui/pefile 等常用包
+
+测试样本exe都在 ** temp\samples **
 
 ## 构建流程
 

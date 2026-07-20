@@ -20,11 +20,45 @@
 
 #include <stdint.h>
 #include "../common/winlock_compat.h"
-/* Provide __faststorefence for windows.h under -mno-sse2 (sfence is SSE2) */
+#ifndef _MSC_VER
+/* GCC-only: 为 windows.h 提供 __faststorefence 的替代实现
+ * MinGW 的 -mno-sse2 编译模式下 sfence 是 SSE2 指令，需手动包装
+ * MSVC 用 _mm_sfence()（intrin.h 已在 winlock_compat.h 中引入） */
 static __inline__ void __winlock_sfence(void) { WINLOCK_SFENCE(); }
 #define __builtin_ia32_sfence() __winlock_sfence()
+#endif
 #include <windows.h>
 #include "../common/config.h"
+
+/* ============================================================
+ * MSVC /NODEFAULTLIB 下提供 memset/memcpy 本地实现
+ *
+ * MSVC /O1 优化会把"清零循环"识别为 memset 模式并转为 memset 调用，
+ * 但 PIC stub 不链接 CRT，没有 memset 可解析。
+ *
+ * #pragma function(memset, memcpy) 强制编译器对这两个函数使用函数调用
+ * （不用 intrinsic），让我们提供的本地实现被实际调用。
+ *
+ * 函数本身用 WINLOCK_SECTION_TEXT 放进 .lock$text 节，保持 PIC 自包含。
+ *
+ * GCC 不需要：-fno-builtin 已禁用 builtin 识别，循环保持为循环。
+ * ============================================================ */
+#ifdef _MSC_VER
+#pragma function(memset, memcpy)
+WINLOCK_SECTION_TEXT
+void* memset(void* dst, int val, size_t n) {
+    uint8_t* p = (uint8_t*)dst;
+    while (n--) *p++ = (uint8_t)val;
+    return dst;
+}
+WINLOCK_SECTION_TEXT
+void* memcpy(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+#endif
 
 /* ============================================================
  * 类型定义：PEB / LDR 类型由 common/peb_walk.h 提供
@@ -578,6 +612,12 @@ static void clear_fn_pointers(void) {
 /* ============================================================
  * 栈对齐跳 OEP（P0-2，借鉴 peldr loader.c:1144-1152）
  *
+ * GCC 分支保持内联汇编不变（保证 stub 二进制字节级不变）；
+ * MSVC 分支调用独立 .asm 文件实现的函数：
+ *   x64: stub_asm_x64.asm（ml64.exe 编译）
+ *   x86: stub_asm_x86.asm（ml.exe 编译）
+ *   原因：MSVC x64 不支持内联汇编，必须独立 .asm + ml64.exe
+ *
  *   - 用 jmp 而非 call：不压入返回地址，stub 不返回
  *   - x64: 强制 RSP ≡ 8 mod 16（MSVC ABI 假设 call 进入后栈对齐）
  *       andq $-16, %rsp  → RSP ≡ 0 mod 16
@@ -586,10 +626,23 @@ static void clear_fn_pointers(void) {
  *   - x86: 16 对齐（避免 SSE 指令对齐异常，CRT 启动代码可能要求）
  *       andl $-16, %esp
  *       jmp *reg
- *   - __builtin_unreachable 告诉 GCC 函数不返回，避免 fallthrough 警告
+ *   - WINLOCK_UNREACHABLE 告诉编译器函数不返回，避免 fallthrough 警告
  * ============================================================ */
+#ifdef _MSC_VER
+/* MSVC: 独立 .asm 实现的函数声明
+ * x64 ABI: 参数走 RCX，无需 name decoration
+ * x86 __cdecl: MASM 符号名带前导下划线 _jump_to_oep_x86 */
+#ifdef _WIN64
+extern void jump_to_oep_x64(void* oep);
+#else
+extern void __cdecl jump_to_oep_x86(void* oep);
+#endif
+#endif
+
 WINLOCK_SECTION_TEXT
 static void jump_to_oep(void* oep) {
+#ifndef _MSC_VER
+    /* GCC: 内联汇编（保持 stub 二进制不变） */
 #ifdef _WIN64
     __asm__ volatile (
         "andq $-16, %%rsp\n\t"   /* 16 字节对齐 */
@@ -603,6 +656,14 @@ static void jump_to_oep(void* oep) {
         "jmp *%0\n\t"
         : : "r"(oep) : "memory"
     );
+#endif
+#else
+    /* MSVC: 调用独立 .asm 实现的 jump_to_oep_xXX */
+#ifdef _WIN64
+    jump_to_oep_x64(oep);
+#else
+    jump_to_oep_x86(oep);
+#endif
 #endif
     WINLOCK_UNREACHABLE();
 }

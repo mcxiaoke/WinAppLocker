@@ -111,9 +111,16 @@ typedef struct _LDR_DATA_TABLE_ENTRY_X {
  * ============================================================ */
 #ifdef PEB_WALK_IMPLEMENT
 
-/* PIC stub 模式：函数进 .lock.text 节；host 模式：普通 static inline */
+/* PIC stub 模式：函数进 .lock.text 节；host 模式：普通 static inline
+ * 节名约定（见 winlock_compat.h）：
+ *   - MSVC: .lock$text（用 #pragma code_seg，/MERGE 进 .lock）
+ *   - GCC:  .lock.text（stub.ld KEEP 保留） */
 #ifdef WINLOCK_PIC
-  #define WINLOCK_PEBWALK_FN __attribute__((section(".lock.text"), used, noinline))
+  #ifdef _MSC_VER
+    #define WINLOCK_PEBWALK_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
+  #else
+    #define WINLOCK_PEBWALK_FN __attribute__((section(".lock.text"), used, noinline))
+  #endif
 #else
   #define WINLOCK_PEBWALK_FN
 #endif

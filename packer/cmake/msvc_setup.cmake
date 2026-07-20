@@ -5,6 +5,7 @@
 #   1. 记录 vcvars64.bat 路径（文档/调试用，VS 生成器自动检测 MSVC）
 #   2. 查找 w64devkit / msys2 mingw32 的 binutils（objcopy / nm）
 #      这些工具与编译器无关，后续阶段 stub 提取 .lock 节仍需要
+#   3. 查找 Python3（用于 cmake/extract_lock_section.py 提取 .lock 节）
 #
 # 设计原则：
 #   - 路径作为 CACHE 变量，用户可用 -DW64DEVKIT_BIN=... 覆盖
@@ -22,6 +23,15 @@ if(NOT EXISTS "${WINLOCK_VCVARS64}")
     message(WARNING "vcvars64.bat not found at: ${WINLOCK_VCVARS64}\n"
                     "  If using Ninja generator, ensure vcvars64.bat is called first.\n"
                     "  If using Visual Studio generator, this warning can be ignored.")
+endif()
+
+# ---- 查找 Python3（用于 cmake/extract_lock_section.py 提取多 .lock 节） ----
+# MSVC link.exe 不合并不同特性的 .lock$X 子节（LNK4078），
+# 导致 objcopy -j .lock 输出包含中间 padding（25KB 而非 5KB）。
+# 用 Python 脚本按 VA 顺序拼接所有 .lock 节的 raw data（无 padding）。
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR "Python3 not found. Required for extract_lock_section.py")
 endif()
 
 # ---- binutils 路径根目录 ----

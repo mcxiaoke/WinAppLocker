@@ -1,0 +1,29 @@
+; ============================================================
+; stub_asm_x86.asm - x86 jump_to_oep 实现（MSVC MASM 语法）
+;
+; 功能：
+;   跳转到原 PE 的 OEP，不返回。
+;   - 16 字节对齐 ESP（避免 SSE 指令对齐异常，CRT 启动代码可能要求）
+;   - 用 jmp 而非 call，不压入返回地址
+;
+; 入口签名：void __cdecl jump_to_oep_x86(void* oep);
+;   x86 __cdecl: [esp+4] = 第一个参数 = oep
+;
+; 注意：
+;   x86 MASM 的符号名需前导下划线（_jump_to_oep_x86），
+;   与 __cdecl 调用约定的 name decoration 一致。
+; ============================================================
+
+.586
+.model flat
+
+.code
+
+; void __cdecl jump_to_oep_x86(void* oep /*[esp+4]*/);
+_jump_to_oep_x86 PROC
+    mov  eax, [esp+4]   ; 取参数 oep
+    and  esp, -16       ; 16 字节对齐（清除 ESP 低 4 位）
+    jmp  eax            ; 跳到 OEP（不压返回地址）
+_jump_to_oep_x86 ENDP
+
+END
