@@ -1,5 +1,37 @@
 # 变更记录
 
+## 2026-07-22 06:00 构建系统重构第 2 步：builder 四重校验 + reflective 薄封装日志
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 2 步（改动 5+6），让 builder 在加壳时严格校验 stub 身份信息，防止误用错误架构/版本的 stub。
+
+### 1. builder.c 新增 verify_stub_identity 函数（改动 5）
+
+[packer/inplace/builder.c](file:///C:/Home/Projects/applocker/packer/inplace/builder.c)：
+- 新增 `verify_stub_identity` 函数（第 436-504 行），实现 **四重校验** 定位 stub_data_t：
+  1. magic == `STUB_DATA_MAGIC`（防误报）
+  2. version == `STUB_DATA_VERSION`（防结构版本漂移导致字段偏移错位）
+  3. stub_size == 0 或 == 文件大小（patch 前为 0 跳过，patch 后必须匹配）
+  4. stub_arch ∈ {`STUB_ARCH_X86`, `STUB_ARCH_X64`}（防 magic+version 巧合匹配）
+- 找到后再校验 arch 是否匹配输入 PE 架构（防止 "x86 PE 用了 x64 stub"）
+- 打印身份信息到 stderr（arch/toolchain/bin_ver/build_time/source_crc/githash/size）
+- 替换原 main() 中只搜 STUB_DATA_MAGIC 的简单循环（新第 964-983 行）为 `verify_stub_identity` 调用
+- 函数返回 `const stub_data_t*`，调用处强制转 non-const 供后续修改字段
+
+### 2. builder_reflective.c 薄封装 Machine 校验 + 日志（改动 6）
+
+[packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c)：
+- 在既有 `s_machine != info.machine` 检查处加 `fprintf(stderr, ...)` 详细日志（stub_machine / pe_machine / stub_path）
+- 成功路径也加 `[*] reflective stub arch OK` 日志（machine / stub / size）
+- **不新增独立 verify 函数**：reflective stub 是普通 PE，无 stub_data_t 结构，直接用 PE Machine 字段校验即可
+
+### 测试结果
+
+- clean build 成功：8 个产物全部正确生成
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+  - 已知失败（与本步无关）：helloguix86/hellomfcx86 inplace_password CRASH exit=2、DontSleep reflective CRASH exit=-1073741819
+
+---
+
 ## 2026-07-22 03:00 构建系统重构第 1 步：stub 身份字段 + CMake/build.ps1/patch 脚本注入
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 1 步（改动 1+2+3+4），让所有 inplace stub 二进制携带完整身份信息（arch/toolchain/bin_ver/build_time/source_crc/size/githash）。

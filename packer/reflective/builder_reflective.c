@@ -528,14 +528,20 @@ int main(int argc, char* argv[]) {
         free(stub); free(payload); free(in_pe);
         return 1;
     }
-    /* 检查 stub 架构与输入 PE 架构匹配（防止用 x64 stub 加壳 x86 PE） */
+    /* 检查 stub 架构与输入 PE 架构匹配（防止用 x64 stub 加壳 x86 PE）
+     * 改动 6：薄封装既有逻辑，加详细日志便于排查（不新增独立函数避免重复读取 PE Machine）*/
     if (s_machine != info.machine) {
+        fprintf(stderr, "[-] reflective stub arch mismatch! "
+                "stub_machine=0x%04x pe_machine=0x%04x (stub=%s)\n",
+                s_machine, info.machine, stub_path);
         printf("[-] Stub arch (0x%04x) doesn't match input PE arch (0x%04x)\n",
                s_machine, info.machine);
         printf("    Use --stub to specify a matching stub, or omit --stub for auto-select.\n");
         free(stub); free(payload); free(in_pe);
         return 1;
     }
+    fprintf(stderr, "[*] reflective stub arch OK (machine=0x%04x, stub=%s, %zu bytes)\n",
+            s_machine, stub_path, stub_size);
 
     /* 用统一的字段提取避免后续代码 #ifdef 分支 */
     WORD  s_n_sec;

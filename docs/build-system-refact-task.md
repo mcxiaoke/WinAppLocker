@@ -10,7 +10,7 @@
 
 - [x] 第 0 步（前置 P0）：改动 10（CMake hack 消除）+ 改动 11（malloc 检查）
 - [x] 第 1 步（身份字段 + 注入）：改动 1 + 2 + 3 + 4
-- [ ] 第 2 步（builder 校验）：改动 5 + 6
+- [x] 第 2 步（builder 校验）：改动 5 + 6
 - [ ] 第 3 步（inspect 工具 + manifest）：改动 7 + 8
 - [ ] 第 4 步（测试校验）：改动 9
 - [ ] 第 5 步（清理）：改动 12
@@ -73,6 +73,31 @@
 **状态**：完成
 **开始时间**：2026-07-22 02:30
 **完成时间**：2026-07-22 03:00
+**Commit hash**：`1ecbf9a`
+
+---
+
+### ✅ 已完成 — 第 2 步：builder 四重校验 + reflective 薄封装日志
+
+**改动清单**：
+- 改动 5：`packer/inplace/builder.c` 新增 `verify_stub_identity` 函数（四重校验：magic + version + stub_size + arch 范围），替代原本只搜 `STUB_DATA_MAGIC` 的简单循环。函数返回 `const stub_data_t*`，调用处强制转 non-const 供后续修改字段
+- 改动 6：`packer/reflective/builder_reflective.c` 在既有 `s_machine != info.machine` 检查处加 `fprintf(stderr, ...)` 详细日志（薄封装，不新增独立函数避免重复读取 PE Machine）。成功路径也加 `[*] reflective stub arch OK` 日志
+
+**实施细节**：
+- `verify_stub_identity` 第 3 重校验（stub_size）允许 0：patch_stub_identity.py 写入前 stub_size 为 0，patch 后才等于文件大小。这样 patch 前后的 stub.bin 都能被识别
+- `verify_stub_identity` 第 4 重校验（arch 范围 1/2）防 magic+version 巧合匹配（patch 前 arch 已由 CMake -D 注入，不为 0）
+- 找到 stub_data_t 后再校验 arch 是否匹配输入 PE 架构（`want_arch = pe_is_x64 ? STUB_ARCH_X64 : STUB_ARCH_X86`），防止 "x86 PE 用了 x64 stub" 这类严重错误
+- 打印身份信息到 stderr（arch/toolchain/bin_ver/build_time/source_crc/githash/size），方便加壳时立即确认用了哪个 stub
+- `builder_reflective.c` 不新增独立 verify 函数：reflective stub 是普通 PE，无 stub_data_t 结构，直接用 PE Machine 字段校验即可，加日志足够
+
+**测试结果**：
+- clean build 成功，8 个产物全部正确生成
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+  - 已知失败（与本步无关）：helloguix86/hellomfcx86 inplace_password CRASH exit=2、DontSleep reflective CRASH exit=-1073741819
+
+**状态**：完成
+**开始时间**：2026-07-22 05:30
+**完成时间**：2026-07-22 06:00
 **Commit hash**：（待 commit）
 
 ---

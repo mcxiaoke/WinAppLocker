@@ -433,6 +433,76 @@ static void make_default_output_path(const char* in_path, char* out, size_t out_
     strcpy(out + prefix_len, suffix);
 }
 
+/* ---- stub 身份校验（改动 5）----
+ * 替代原本只搜 STUB_DATA_MAGIC 的简单逻辑，加四重校验：
+ *   1. magic == "WINLOCK!"（防误报）
+ *   2. version == STUB_DATA_VERSION（防结构版本漂移导致字段偏移错位）
+ *   3. stub_size == 0 或 stub_size == 文件大小（patch 前为 0 跳过，patch 后必须匹配）
+ *   4. stub_arch ∈ {STUB_ARCH_X86, STUB_ARCH_X64}（防 magic+version 巧合匹配）
+ *
+ * 找到后再校验 stub_arch 是否匹配输入 PE 的架构，防止"x86 PE 用了 x64 stub"。
+ * 成功返回 0 并通过 *out_sd 返回 stub_data_t 指针，失败返回 -1。
+ */
+static int verify_stub_identity(const uint8_t* stub_bin, size_t stub_bin_size,
+                                int pe_is_x64, const char* stub_path,
+                                const stub_data_t** out_sd) {
+    const uint64_t magic = STUB_DATA_MAGIC;
+    const stub_data_t* found = NULL;
+
+    /* 1. 四重校验定位 stub_data_t */
+    for (size_t i = 0; i + sizeof(stub_data_t) <= stub_bin_size; i += 8) {
+        if (*(const uint64_t*)(stub_bin + i) != magic) continue;
+        const stub_data_t* cand = (const stub_data_t*)(stub_bin + i);
+        /* version 必须匹配（防结构版本不一致导致字段偏移错位）*/
+        if (cand->version != STUB_DATA_VERSION) continue;
+        /* stub_size 必须匹配文件大小（patch 前为 0 跳过，patch 后必须匹配）*/
+        if (cand->identity.stub_size != 0
+            && cand->identity.stub_size != (uint32_t)stub_bin_size) continue;
+        /* stub_arch 必须是合法值（防 magic 重复 + version 巧合的误报）*/
+        if (cand->identity.stub_arch != STUB_ARCH_X86
+            && cand->identity.stub_arch != STUB_ARCH_X64) continue;
+        found = cand;
+        break;
+    }
+    if (!found) {
+        fprintf(stderr, "[-] stub_data not found (magic+version+size+arch mismatch) in %s\n",
+                stub_path);
+        return -1;
+    }
+
+    /* 2. arch 必须匹配输入 PE */
+    uint32_t want_arch = pe_is_x64 ? STUB_ARCH_X64 : STUB_ARCH_X86;
+    if (found->identity.stub_arch != want_arch) {
+        fprintf(stderr, "[-] stub arch mismatch! stub=%s pe=%s (stub_path=%s)\n",
+                found->identity.stub_arch == STUB_ARCH_X64 ? "x64" : "x86",
+                pe_is_x64 ? "x64" : "x86",
+                stub_path);
+        return -1;
+    }
+
+    /* 3. stub_size 不匹配时警告（patch 失败检测，不 fail）*/
+    if (found->identity.stub_size != 0
+        && found->identity.stub_size != (uint32_t)stub_bin_size) {
+        fprintf(stderr, "[!] stub_size mismatch (field=%u, file=%zu), patch may have failed\n",
+                found->identity.stub_size, stub_bin_size);
+    }
+
+    /* 4. 打印身份信息到 stderr（调试用，加壳时立刻能确认用了哪个 stub）*/
+    char githash[9] = {0};
+    memcpy(githash, found->identity.stub_githash, 8);
+    fprintf(stderr, "[*] stub %s: arch=%s toolchain=%s bin_ver=0x%04x "
+            "build_time=%u source_crc=0x%08x githash=%s size=%zu\n",
+            stub_path,
+            found->identity.stub_arch == STUB_ARCH_X64 ? "x64" : "x86",
+            found->identity.stub_toolchain == STUB_TOOLCHAIN_MSVC ? "MSVC" : "MinGW",
+            found->identity.stub_bin_ver, found->identity.stub_build_time,
+            found->identity.stub_source_crc,
+            githash[0] ? githash : "(none)", stub_bin_size);
+
+    *out_sd = found;
+    return 0;
+}
+
 /* ---- 主 ---- */
 
 static void print_usage(const char* prog) {
@@ -891,18 +961,24 @@ int main(int argc, char* argv[]) {
                stub_reloc_size);
     }
 
-    /* 8. 在 stub.bin 中搜索 STUB_DATA_MAGIC */
-    stub_data_t* sd = NULL;
-    for (size_t off = 0; off + sizeof(stub_data_t) <= stub_size; off += 8) {
-        if (*(uint64_t*)(stub + off) == STUB_DATA_MAGIC) {
-            sd = (stub_data_t*)(stub + off);
-            break;
-        }
-    }
-    if (!sd) {
-        printf("[-] STUB_DATA_MAGIC not found in stub.bin\n");
+    /* 8. 在 stub.bin 中定位 stub_data_t（四重校验：magic+version+stub_size+arch）
+     *    替代原本只搜 STUB_DATA_MAGIC 的简单逻辑，防止：
+     *      - magic 在代码段重复导致的误报
+     *      - stub_data 结构版本不一致导致字段偏移错位
+     *      - stub.bin 截断或 patch 失败（stub_size 不匹配文件大小）
+     *      - "x86 PE 用了 x64 stub" 这类严重错误
+     *    详细身份信息（arch/toolchain/bin_ver/build_time/source_crc/githash）由
+     *    patch_stub_identity.py 在 POST_BUILD 阶段写入，verify_stub_identity 会打印到 stderr。*/
+    const stub_data_t* sd_const = NULL;
+    if (verify_stub_identity(stub, stub_size, g_is_x64,
+                             stub_candidates[0], &sd_const) != 0) {
+        printf("[-] stub identity verification failed\n");
+        free(stub);
         return 1;
     }
+    /* verify_stub_identity 返回的是 const 指针，但后续需要修改 stub_data 字段，
+     * 强制转 non-const（stub 缓冲区本身是可写的，只是校验时用 const 防止误改）*/
+    stub_data_t* sd = (stub_data_t*)sd_const;
     DBG("[*] stub_data found at offset 0x%zX\n",
            (size_t)((uint8_t*)sd - stub));
 
