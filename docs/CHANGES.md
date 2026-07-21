@@ -1,5 +1,35 @@
 # 变更记录
 
+## 2026-07-21 22:39 构建系统重构第 4 步：测试脚本 source_crc 警告 + 端到端 identity 校验
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 4 步（改动 9），让 e2e 测试自动校验 stub 新鲜度和加壳产物身份一致性。
+
+### 1. 新建 check_stub_freshness.py（改动 9）
+
+[packer/cmake/check_stub_freshness.py](file:///C:/Home/Projects/applocker/packer/cmake/check_stub_freshness.py)：
+- 校验 `dist/stub_*.bin` 的 `stub_source_crc` 是否与当前源码一致
+- 复用 `patch_stub_identity.py` 的 `parse_config_h` / `find_stub_data` / `compute_source_crc` 函数
+- **warn-only 模式**：始终 `sys.exit(0)`，不阻断 e2e 测试（源码小改动不应强制 rebuild 才能跑 e2e）
+- 不匹配时打印 `[stub] WARN: source CRC mismatch! ... — stub is stale, rebuild recommended`
+
+### 2. auto_e2e_test.ps1 加 stub 校验（改动 9）
+
+[packer/tests/auto_e2e_test.ps1](file:///C:/Home/Projects/applocker/packer/tests/auto_e2e_test.ps1)：
+- 头部加 `$pythonExe` 检测（与 build.ps1 一致）
+- 新增 `Check-StubFreshness` 函数：在 e2e 主流程开头调用，校验 `dist/stub_*.bin` 与当前源码 CRC 一致
+- 新增 `Verify-PackedIdentity` 函数：`Pack-Sample` 成功后调用（只对 inplace 模式），用 `inspect_stub.py` 读 packed.exe `.lock` 节里的 stub_data_t，与 `dist/stub_*.bin` 的 identity 对比
+- 对比字段：`stub_arch` / `stub_toolchain` / `stub_bin_ver` / `stub_build_time` / `stub_source_crc` / `stub_githash`（不含 `stub_size`，因 builder 在 `.lock` 末尾追加 callbacks 会扩展节大小）
+- 一致时打印 `[identity OK] packed.exe .lock 节与 stub.bin 身份一致`
+- 不一致时打印 `[WARN] identity mismatch: <field> stub=... packed=...`，warn-only 不 fail
+
+### 测试结果
+
+- `check_stub_freshness.py` 单独测试：两个 stub.bin 的 `source_crc` 都匹配当前源码
+- 完整 e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+- `[identity OK]` 在所有 inplace 加壳样本后正确打印
+
+---
+
 ## 2026-07-22 06:30 构建系统重构第 3 步：inspect_stub.py + build.ps1 manifest 生成
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 3 步（改动 7+8），让构建产物可追溯、可检查。

@@ -12,7 +12,7 @@
 - [x] 第 1 步（身份字段 + 注入）：改动 1 + 2 + 3 + 4
 - [x] 第 2 步（builder 校验）：改动 5 + 6
 - [x] 第 3 步（inspect 工具 + manifest）：改动 7 + 8
-- [ ] 第 4 步（测试校验）：改动 9
+- [x] 第 4 步（测试校验）：改动 9
 - [ ] 第 5 步（清理）：改动 12
 
 ---
@@ -134,6 +134,39 @@
 **开始时间**：2026-07-22 06:00
 **完成时间**：2026-07-22 06:30
 **Commit hash**：`12ce97d`
+
+---
+
+### ✅ 已完成 — 第 4 步：测试脚本 source_crc 警告 + 端到端 identity 校验
+
+**改动清单**：
+- 改动 9：新建 `packer/cmake/check_stub_freshness.py`：校验 `dist/stub_*.bin` 的 `stub_source_crc` 是否与当前源码一致（warn-only 模式，不阻断 e2e）
+- 改动 9：`packer/tests/auto_e2e_test.ps1`：
+  - 头部加 `$pythonExe` 检测（与 build.ps1 一致）
+  - 新增 `Check-StubFreshness` 函数，在主流程开头调用（e2e 测试开始前先校验 stub 新鲜度）
+  - 新增 `Verify-PackedIdentity` 函数，在 `Pack-Sample` 成功后调用（只对 inplace 模式）：用 `inspect_stub.py` 读 packed.exe `.lock` 节里的 stub_data_t，与 `dist/stub_*.bin` 的 identity 对比，确认加壳产物用的是预期 stub
+
+**实施细节**：
+- `check_stub_freshness.py` 复用 `patch_stub_identity.py` 的 `parse_config_h` / `find_stub_data` / `compute_source_crc` 函数，避免代码重复
+- 始终 `sys.exit(0)`（warn-only）：源码小改动不应强制 rebuild 才能跑 e2e，只警告不 fail
+- `Verify-PackedIdentity` 只对 inplace 模式生效：reflective 产物无 `.lock` 节，跳过
+- 对比字段排除 `stub_size`：builder 在 `.lock` 末尾追加 callbacks 数组会扩展节大小，packed.exe 的 `.lock` 节比 stub.bin 大
+- `$pythonExe` 不存在时 `Verify-PackedIdentity` 直接返回 `$true`（不阻断测试），与 build.ps1 的严格 fail 逻辑区分（e2e 是 warn-only，构建是 strict）
+- PowerShell `inspect_stub.py ... 2>$null | ConvertFrom-Json` 静默 stderr，避免 PE 解析失败噪音干扰测试输出
+- `Check-StubFreshness` 在 `Add-Type` 之前调用，确保 e2e 开始前先打印 stub 校验结果
+
+**测试结果**：
+- `check_stub_freshness.py` 单独测试：两个 stub.bin 的 `source_crc` 都匹配当前源码
+  - `[stub] OK: stub_inplace_x64.bin source_crc=0xe5035ac9 githash=a266a22a matches current source`
+  - `[stub] OK: stub_inplace_x86.bin source_crc=0x4f28d90d githash=a266a22a matches current source`
+- 部分 e2e 测试（inplace_test 子集）：9 pass / 0 fail，`[identity OK]` 正确打印
+- 完整 e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+  - 已知失败（与本步无关）：helloguix86/hellomfcx86 inplace_password CRASH、DontSleep reflective CRASH/ERROR_WINDOW
+
+**状态**：完成
+**开始时间**：2026-07-22 06:30
+**完成时间**：2026-07-21 22:39
+**Commit hash**：（commit 后回填）
 
 ---
 

@@ -26,6 +26,10 @@ $reflectiveBuilder = "$dist\builder_reflective.exe"
 # 密码对话框标题（inplace 和 reflective 通用）
 $PwdDialogTitle = "WinLock - Password Required"
 
+# Python 路径（用于调用 inspect_stub.py / check_stub_freshness.py）
+$pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $pythonExe) { $pythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
+
 if (-not (Test-Path $inplaceBuilder)) {
     Write-Host "builder_inplace.exe 不存在，请先运行 build.ps1" -ForegroundColor Red
     exit 1
@@ -36,6 +40,26 @@ if (-not (Test-Path $reflectiveBuilder)) {
 }
 
 if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
+
+# ---- stub source_crc 新鲜度校验（改动 9，审查 A10）----
+# 在 e2e 测试开始前，校验 dist/stub_*.bin 的 stub_source_crc 是否与当前源码一致
+# warn-only 模式：不匹配只警告，不 fail（避免源码小改动强制 rebuild 才能跑 e2e）
+function Check-StubFreshness {
+    param([string]$StubDir, [string]$WinlockRoot)
+    if (-not $pythonExe) {
+        Write-Host "[stub] SKIP: Python 不在 PATH，跳过 source_crc 校验" -ForegroundColor Yellow
+        return
+    }
+    $script = Join-Path $WinlockRoot "cmake\check_stub_freshness.py"
+    if (-not (Test-Path $script)) {
+        Write-Host "[stub] SKIP: $script 不存在" -ForegroundColor Yellow
+        return
+    }
+    Write-Host "==== stub source_crc 新鲜度校验 ====" -ForegroundColor Cyan
+    & $pythonExe $script --stub-dir $StubDir --winlock-root $WinlockRoot
+}
+
+Check-StubFreshness -StubDir $dist -WinlockRoot $packerRoot
 
 # 自动输入密码所需的 Win32 API 封装类（与 input_password.ps1 等价，但不依赖该脚本）
 Add-Type @"
@@ -245,6 +269,55 @@ function Pack-Sample {
     return @{ ok=($rc -eq 0 -and (Test-Path $OutPath)); rc=$rc; out=($packOut -join "`n") }
 }
 
+# ---- 端到端 identity 校验（改动 9，审查 A7）----
+# 加壳后用 inspect_stub.py 读 packed.exe 的 .lock 节里的 stub_data_t，
+# 与 dist/stub_*.bin 的 identity 对比，确认加壳产物用的是预期的 stub
+# 只对 inplace 模式生效（reflective 产物无 .lock 节）
+# warn-only：不一致只警告，不 fail（避免 inspect_stub.py 解析失败阻断 e2e）
+function Verify-PackedIdentity {
+    param(
+        [string]$PackedExe,
+        [string]$Mode
+    )
+    if ($Mode -ne "inplace") { return $true }
+    if (-not $pythonExe) { return $true }
+
+    $inspectScript = Join-Path $packerRoot "cmake\inspect_stub.py"
+    if (-not (Test-Path $inspectScript)) { return $true }
+
+    # 判断输入 PE 架构选对应的 stub.bin
+    # 简化：用文件名约定（x86 样本名含 x86，否则 x64）
+    $sampleArch = if ($PackedExe -match "x86") { "x86" } else { "x64" }
+    $stubBin = Join-Path $dist "stub_inplace_$sampleArch.bin"
+    if (-not (Test-Path $stubBin)) { return $true }
+
+    # 读 stub.bin 的 identity
+    $stubInfo = & $pythonExe $inspectScript $stubBin --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
+    # 读 packed.exe 的 identity（从 .lock 节）
+    $packedInfo = & $pythonExe $inspectScript $PackedExe --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
+    if (-not $stubInfo -or -not $packedInfo) {
+        # inspect_stub.py 失败（如 PE 解析失败），不阻断测试
+        return $true
+    }
+
+    # 对比关键字段（不含 stub_size：builder 在 .lock 末尾追加 callbacks 数组会扩展节大小）
+    $fieldsToCompare = @("stub_arch", "stub_toolchain", "stub_bin_ver",
+                         "stub_build_time", "stub_source_crc", "stub_githash")
+    $allMatch = $true
+    foreach ($field in $fieldsToCompare) {
+        $s = $stubInfo.$field
+        $p = $packedInfo.$field
+        if ($s -ne $p) {
+            Write-Host "      [WARN] identity mismatch: $field stub=$s packed=$p" -ForegroundColor Yellow
+            $allMatch = $false
+        }
+    }
+    if ($allMatch) {
+        Write-Host "      [identity OK] packed.exe .lock 节与 stub.bin 身份一致" -ForegroundColor DarkGray
+    }
+    return $allMatch
+}
+
 function Test-One {
     param(
         [string]$Mode,         # "inplace" / "reflective"
@@ -280,6 +353,10 @@ function Test-One {
         return @{ tag=$tag; sample=$sampleName; result="PACK_FAIL"; detail="rc=$($pack.rc)" }
     }
     Write-Host "      产物: $outPath ($((Get-Item $outPath).Length) bytes)" -ForegroundColor DarkGray
+
+    # 端到端 identity 校验（改动 9，审查 A7）
+    # 只对 inplace 模式：用 inspect_stub.py 读 packed.exe 的 .lock 节，与 stub.bin 对比
+    Verify-PackedIdentity -PackedExe $outPath -Mode $Mode | Out-Null
 
     # 2. 运行
     Write-Host "[2/3] 运行..."
