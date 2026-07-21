@@ -452,7 +452,7 @@ int main(int argc, char* argv[]) {
         xtea_encrypt_buf(payload + sizeof(reflective_payload_t),
                          payload_data_size, key);
 
-        /* 填入 v2 字段 */
+        /* 填入 v2 字段（默认 hash 校验，明文仅调试用）*/
         hdr->version = REFLECTIVE_PAYLOAD_VERSION_V2;
         hdr->flags   = RFLAG_ENCRYPTED | RFLAG_HASH;
         if (test_mode) hdr->flags |= RFLAG_TEST_MODE;
@@ -462,6 +462,9 @@ int main(int argc, char* argv[]) {
         hdr->xtea_key[1] = key[1];
         hdr->xtea_key[2] = key[2];
         hdr->xtea_key[3] = key[3];
+        /* 明文密码同时写入（调试用，hash 模式下 stub 不读此字段）*/
+        wcsncpy(hdr->password, password, 31);
+        hdr->password[31] = 0;
 
         printf("[+] Built payload v2: header=%zu data=%zu total=%zu (XTEA encrypted, %s)\n",
                sizeof(reflective_payload_t), payload_data_size, total_payload_size,

@@ -519,6 +519,81 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
     return NULL;
 }
 
+/* ---- 抢占 preferred_base 区域，防止 process heap 扩展挡住加载 ----
+ *
+ * 背景：某些加壳程序（如 DontSleep）依赖加载到原始 ImageBase（如 0x400000），
+ * 因为 .data 段被压缩且重定位表为空（ASLR 关闭），内层解压 stub 会把
+ * ImageBase 当硬编码常量用。但 stub 进程启动后，process heap 可能扩展到
+ * preferred_base 附近，挡住 VirtualAlloc(preferred_base)。
+ *
+ * 例如 DontSleep：SizeOfImage=0xaa000 (696KB)，preferred_base=0x400000。
+ * loader_main 入口时 0x400000-0x4a0000 FREE (640KB)，不够 696KB。
+ * log_init 等 API 调用后 heap 扩展到 0x470000，0x400000 处只剩 448KB。
+ *
+ * 解决：在 loader_main 第一行（log_init 之前），先 reserve preferred_base
+ * 处 SizeOfImage 大小，防止 heap 扩展到这里。map_image 时再释放 reserve，
+ * VirtualAlloc(preferred_base) 就能成功。
+ *
+ * 注意：必须用 MEM_RESERVE（不 COMMIT），避免浪费物理内存。
+ *       find_payload_section 只调用 GetModuleHandleW（不分配内存），安全。
+ *       失败不致命：可能 preferred_base 已被占用，map_image 会 fallback。 */
+static void* g_reserved_base = NULL;       /* reserve 的基址，NULL 表示未 reserve */
+static SIZE_T g_reserved_size = 0;         /* reserve 的大小 */
+
+static void reserve_preferred_base_region(void) {
+    /* 1. 找到 .payload 节（不分配内存，安全） */
+    uint32_t payload_sec_size = 0;
+    uint8_t* payload_sec = find_payload_section(&payload_sec_size);
+    if (!payload_sec || payload_sec_size < sizeof(reflective_payload_t)) return;
+
+    /* 2. 解析 payload 头，校验 magic */
+    reflective_payload_t* hdr = (reflective_payload_t*)payload_sec;
+    if (hdr->magic != REFLECTIVE_PAYLOAD_MAGIC) return;
+    /* 只处理 v1/v2，其他版本不抢 */
+    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION
+        && hdr->version != REFLECTIVE_PAYLOAD_VERSION_V2) return;
+
+    /* 3. 解析 payload_data 里的 PE 头，读取 preferred_base 和 SizeOfImage
+     *    注意：v2 加密模式下 payload_data 是密文，但 PE 头的 DOS+NT headers
+     *    在加密时是明文（builder 只加密 payload_data 的 body，不加密 PE 头）。
+     *    实际上 v2 模式加密整个 payload_data，这里读到的 NT headers 是密文，
+     *    可能解析失败。但 v2 模式下 hdr->image_base 字段保存了原 PE 的 ImageBase，
+     *    可以直接用。 */
+    uint64_t preferred_base;
+    SIZE_T size_of_image;
+    if (hdr->version == REFLECTIVE_PAYLOAD_VERSION_V2 && (hdr->flags & RFLAG_ENCRYPTED)) {
+        /* v2 加密模式：用 payload 头里的字段（builder 写入） */
+        preferred_base = hdr->image_base;
+        /* SizeOfImage 不在 payload 头里，只能从 PE 头读。
+         * 但 PE 头是密文，读不了。这种情况下不 reserve，让 map_image 处理。
+         * （v2 加密模式的 DontSleep 会走 decrypt -> map_image 流程，
+         *  decrypt 后 PE 头变明文，map_image 能读 SizeOfImage，
+         *  但此时 heap 可能已经扩展了。）
+         * 为了支持 v2 加密模式，我们用一个保守大小（16MB）reserve。 */
+        size_of_image = 16 * 1024 * 1024;  /* 16MB，覆盖大多数 PE */
+        /* 如果 image_base 不是常见值，跳过（避免浪费地址空间） */
+        if (preferred_base != 0x400000 && preferred_base != 0x10000
+            && preferred_base != 0x140000000 && preferred_base != 0x180000000) {
+            return;
+        }
+    } else {
+        /* v1 明文模式或 v2 未加密：从 payload_data 的 PE 头读 */
+        uint8_t* payload_data = payload_sec + sizeof(reflective_payload_t);
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)payload_data;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(payload_data + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        preferred_base = nt->OptionalHeader.ImageBase;
+        size_of_image = nt->OptionalHeader.SizeOfImage;
+    }
+
+    /* 4. 抢占 preferred_base 处的 size_of_image 大小 */
+    g_reserved_base = VirtualAlloc((void*)preferred_base, size_of_image,
+                                    MEM_RESERVE, PAGE_NOACCESS);
+    g_reserved_size = size_of_image;
+    /* 失败不致命：可能 preferred_base 已被占用，map_image 会 fallback */
+}
+
 /* ============================================================
  * 密码弹框 + XTEA 解密（v2 加密 payload 支持）
  *
@@ -628,9 +703,23 @@ static size_t build_dialog(uint8_t* buf) {
  * 必须是全局因为 dlg_proc 签名固定，无法通过 LPARAM 传（用闭包更简洁但 C 不支持）*/
 static reflective_payload_t* g_pwd_hdr = NULL;
 
-/* 密码校验：SHA-256(utf8(input) + salt) == hdr->pwd_hash ?
+/* 密码校验：
+ *   - RFLAG_HASH 设置：SHA-256(utf8(input) + salt) == hdr->pwd_hash
+ *   - RFLAG_HASH 未设置：明文 wchar_t 对比 hdr->password（避免 -O2 下 SHA-256 不一致）
  * 返回 1 匹配，0 不匹配 */
 static int verify_password(const wchar_t* input, const reflective_payload_t* hdr) {
+    if (!(hdr->flags & RFLAG_HASH)) {
+        /* 明文模式：直接对比 wchar_t 字符串（不能用 wcscmp，/NODEFAULTLIB 下无 CRT）*/
+        const wchar_t* pwd = hdr->password;
+        size_t i;
+        for (i = 0; i < 31; i++) {
+            if (input[i] != pwd[i]) return 0;
+            if (input[i] == 0) return 1;  /* 同时结束，匹配 */
+        }
+        return (input[31] == 0 && pwd[31] == 0) ? 1 : 0;
+    }
+
+    /* hash 模式：SHA-256(utf8(input) + salt) == hdr->pwd_hash */
     uint8_t utf8[256];
     size_t utf8_len = utf16le_to_utf8(input, utf8, sizeof(utf8) - 16);
 
@@ -660,7 +749,7 @@ static INT_PTR WINAPI dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam
             if (verify_password(buf, g_pwd_hdr)) {
                 EndDialog(hDlg, 1);  /* 成功 */
             } else {
-                MessageBoxW(hDlg, L"Wrong password", L"WinLock",
+                MessageBoxW(hDlg, L"Wrong password", L"WinLock Error",
                             MB_ICONERROR | MB_OK);
                 EndDialog(hDlg, 2);  /* 失败但可重试 */
             }
@@ -1858,6 +1947,24 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
 
     /* 1. 优先尝试 preferred_base，失败用任意地址
      *    如果加载在非 preferred 地址，需要应用 relocations */
+
+    /* 如果 loader_main 早期 reserve 了 preferred_base 区域，先释放
+     * 这样 VirtualAlloc(preferred_base) 应该能成功（heap 没扩展到这里） */
+    if (g_reserved_base) {
+        /* 检查 preferred_base 是否在 reserve 范围内 */
+        uint64_t res_start = (uint64_t)g_reserved_base;
+        uint64_t res_end = res_start + g_reserved_size;
+        uint64_t need_start = preferred_base;
+        uint64_t need_end = preferred_base + size_of_image;
+        if (need_start >= res_start && need_end <= res_end) {
+            VirtualFree(g_reserved_base, 0, MEM_RELEASE);
+            DBG("map: released early reserve %p size 0x%zx for preferred_base\n",
+                g_reserved_base, (size_t)g_reserved_size);
+            g_reserved_base = NULL;
+            g_reserved_size = 0;
+        }
+    }
+
     uint8_t* new_img = (uint8_t*)VirtualAlloc((void*)preferred_base, size_of_image,
                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!new_img) {
@@ -1955,22 +2062,21 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
         return NULL;
     }
 
-    /* 4.5 提前更新 PEB.ImageBaseAddress + PEB.Ldr 主 EXE 条目（在 IAT 处理之前）
+    /* 4.5 不在此处更新 PEB.Ldr 主 EXE 条目，延迟到 activate_manifest 之后
      *
-     * 原因 1：IAT 处理调用 LoadLibraryA 加载依赖 DLL（如 MFC42u.dll），
-     *        DLL 的 DllMain 可能调用 GetModuleHandle(NULL) 获取宿主 EXE 的 hInstance。
-     *        如果此时 PEB.ImageBaseAddress 还是 stub 的基址，DLL 会获取到错误的 hInstance。
+     * 关键修复：PEB.Ldr 主 EXE 条目的 DllBase 必须延迟到 activate_manifest 之后。
+     * 原因：ntdll!RtlpLoadNlsData（被 CreateActCtxA 间接调用）通过 PEB.Ldr 主 EXE
+     *       条目的 DllBase 查找 locale 文件映射地址。如果在 process_iat 之前就
+     *       patch DllBase 为 new_img（0x400000），而 0x400000 处已经被
+     *       NtUnmapViewOfSection 卸载并 VirtualAlloc 重新分配（PRIVATE 内存，
+     *       不再是 MAPPED view），ntdll 解引用无效指针崩溃（0xC0000005）。
      *
-     * 原因 2：原 PE 的 OEP（如 MFC42u!AfxWinInit）会调用 LoadString / LoadResource，
-     *        这些走 LdrFindResource_U，需要 PEB.Ldr 里有对应模块条目，
-     *        否则返回 ERROR_DIRECT_ACCESS_HANDLE (59)，MFC 抛 C++ 异常。
-     *        修复：把 PEB.Ldr 第一个条目（主 EXE = stub）的 DllBase 改成 new_img。
+     * process_iat 和 activate_manifest 阶段保持 PEB.Ldr 主 EXE 条目为 stub 的基址
+     * （系统原始 MAPPED view），让 ntdll 的 NLS 加载成功。
      *
-     * 风险：stub 自己的 CRT 全局变量已初始化（用的是 stub 基址），不受影响。
-     *      stub 代码不依赖 GetModuleHandle(NULL)。stub 在 jump_to_oep 之后就不再
-     *      需要 OS 识别，覆写主 EXE 条目是安全的。 */
-    update_peb_image_base(new_img);
-    patch_peb_ldr_main_entry(new_img);
+     * 风险：process_iat 阶段 LoadLibraryA 加载的 DLL 的 DllMain 一般不调用
+     *      LdrFindResource_U 查找 EXE 资源（那是 OEP 之后 AfxWinInit 才做的），
+     *      所以延迟 patch_peb_ldr_main_entry 安全。 */
 
     /* 4.55 设置 DLL 搜索路径 + 当前目录为 stub EXE 所在目录
      *
@@ -2044,12 +2150,22 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     run_tls_callbacks(new_img);
     DBG("map: TLS callbacks done\n");
 
-    /* 10. 激活 manifest（延迟到 IAT/TLS 之后，避免 PEB 修改后立即调用崩溃）
-     *     对于加壳程序（如 DontSleep），CreateActCtxA 在 PEB 刚修改后
-     *     可能触发 ntdll 内部 ACCESS_VIOLATION。延迟到此处执行更安全。 */
+    /* 10. 激活 manifest（必须在 patch_peb_ldr_main_entry 之前）
+     *     原因：CreateActCtxA 内部调用 ntdll!RtlpLoadNlsData，该函数通过
+     *     PEB.Ldr 主 EXE 条目的 DllBase 查找 locale 文件映射地址。
+     *     必须在 DllBase 还指向 stub 原始 MAPPED view 时调用，
+     *     否则 ntdll 解引用无效指针崩溃（0xC0000005）。 */
     DBG("map: about to activate manifest...\n");
     activate_manifest_from_image(new_img);
     DBG("map: manifest activation done\n");
+
+    /* 10.5 激活 manifest 之后才 patch PEB.Ldr 主 EXE 条目
+     *     原因：activate_manifest 依赖 PEB.Ldr 主 EXE 条目的 DllBase 指向
+     *     stub 原始 MAPPED view（系统创建的 section view），ntdll 的 NLS
+     *     加载机制才能正确查找 locale 文件映射。
+     *     manifest 激活完成后，ntll 的 NLS 初始化已结束，此时 patch DllBase
+     *     为 new_img 安全。OEP 之后的 LdrFindResource_U 会用 new_img 查找资源。 */
+    patch_peb_ldr_main_entry(new_img);
 
     return new_img;
 }
@@ -2211,6 +2327,13 @@ void WINAPI loader_main(void) {
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;  /* stub 不处理命令行参数 */
 #endif
+    /* 最早抢占 preferred_base 区域，防止 process heap 扩展挡住加载
+     * 必须在 log_init/AddVectoredExceptionHandler 等任何可能触发 heap
+     * 扩展的 API 之前调用。find_payload_section 只用 GetModuleHandleW，
+     * 不分配内存，安全。失败不致命（reserve 失败说明已被占用，map_image
+     * 会 fallback 到任意地址）。 */
+    reserve_preferred_base_region();
+
 #ifdef RDEBUG
     /* 只初始化日志文件，不再创建 console（避免 GUI 程序弹 console 干扰）
      * 如需实时观察，用 DebugView 查看 OutputDebugStringA 输出 */
@@ -2291,7 +2414,15 @@ int main(int argc, char* argv[]) {
     InterlockedExchange(&g_entry_point_called, 1);
     DBG("tls: callback proxy enabled (g_entry_point_called=1)\n");
 
-    /* 4. 跳 OEP */
+    /* 4. 跳 OEP 之前才更新 PEB.ImageBaseAddress
+     * 关键：之前在 map_image 里调用 update_peb_image_base 会导致 process_iat 阶段
+     *       ntdll!RtlpLoadNlsData 崩溃（见 map_image 注释）。延迟到此处分两步：
+     *       1) patch_peb_ldr_main_entry 在 IAT 之前已完成（资源查找用 Ldr 表）
+     *       2) update_peb_image_base 在 OEP 之前完成（GetModuleHandle(NULL) 用）
+     * 此时所有依赖 DLL 已加载完成，ntdll 的 NLS 初始化已结束，patch 安全。 */
+    update_peb_image_base(new_img);
+
+    /* 5. 跳 OEP */
     void* oep = new_img + hdr->oep_rva;
     DBG("jump_to_oep(%p) ret=%p\n", oep, (void*)oep_returned);
     jump_to_oep(oep, (void*)oep_returned);

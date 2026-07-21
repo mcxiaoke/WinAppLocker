@@ -1,5 +1,64 @@
 # 变更记录
 
+## 2026-07-21 19:30 packer reflective DontSleep 修复 + x86 stub TLS callback 重构 + e2e 测试改进
+
+本轮聚焦 DontSleep 反射式加载崩溃、x86 inplace_password 死锁、密码校验默认模式回归三个问题。clean build 后 e2e 测试结果：**32 pass / 4 fail**（之前为 31 pass / 5 fail）。
+
+### 当前仍有 4 个失败项（需后续处理）
+
+| 模式 | 样本 | 现象 | 根因方向 |
+|------|------|------|----------|
+| `inplace_password` | `helloguix86.exe` | CRASH exit=2 | MinGW x86 stub 密码框未找到/进程退出 |
+| `inplace_password` | `hellomfcx86.exe` | CRASH exit=2 | 同上，MinGW x86 stub 密码框问题 |
+| `reflective_test` | `DontSleep.exe` | CRASH exit=-1073741819 (0xC0000005) | ntdll!RtlpLoadNlsData 崩溃，preferred_base reserve 后 IAT 阶段 LoadLibrary(MFC42u.dll) 触发 |
+| `reflective_password` | `DontSleep.exe` | ERROR_WINDOW（标题 "Error!"） | 同上，OEP 后弹出错误窗口 |
+
+### 1. 密码校验恢复默认 hash 模式（明文仅调试用）
+
+之前为调试 DontSleep 反射式密码校验，临时改用明文密码比较。现已恢复默认 hash 校验：
+
+- `packer/inplace/builder.c`: `sd->flags = STUB_FLAG_HASH`（注释标注"明文仅调试用"）
+- `packer/reflective/builder_reflective.c`: `hdr->flags = RFLAG_ENCRYPTED | RFLAG_HASH`
+- `packer/reflective/payload.h`: 新增 `wchar_t password[32]` 字段，HEADER_SIZE 152→216，明文密码同时写入（调试用，hash 模式下 stub 不读此字段）
+
+### 2. x86 inplace_password 死锁修复（TLS callback 重构）
+
+**根因**：Windows loader 在调用 TLS callback 时持有 loader lock。`stub_tls_callback` 调用 `LoadLibraryA("user32.dll")` 弹密码框，user32 加载触发其依赖 DLL 的 DllMain，DllMain 需要获取 loader lock，但 loader lock 已被 TLS callback 持有 → **死锁**（hellomingw.exe / helloucrt.exe 密码框卡死）。
+
+**修复**（`packer/inplace/stub.c`）：
+- `stub_tls_callback` 改为**空实现**，直接返回，不做任何事
+- `stub_entry` (EP) 完成所有工作：PEB walk + 密码校验 + 解密 .text + 调用原 PE 的 TLS callbacks + 跳 OEP
+- 原 PE 的 TLS callbacks 通过 `stub_data.orig_tls_callbacks` 在 `stub_entry` 中手动调用（模拟 `DLL_PROCESS_ATTACH`）
+- 密码错误对话框标题从 `"WinLock"` 改为 `"WinLock Error"`（带 Error 前缀方便测试脚本识别）
+
+### 3. Reflective DontSleep preferred_base 抢占机制（`packer/reflective/loader.c`）
+
+**背景**：DontSleep 依赖加载到原始 ImageBase (0x400000)，因 .data 段被压缩且重定位表为空（ASLR 关闭）。但 stub 进程启动后，process heap 可能扩展到 0x400000 附近，挡住 `VirtualAlloc(preferred_base)`。
+
+**修复**：在 `loader_main` 第一行（`log_init` 之前）调用新增的 `reserve_preferred_base_region()`：
+- 用 `MEM_RESERVE` 抢占 preferred_base 处 SizeOfImage 大小地址空间
+- `map_image` 中 `VirtualAlloc(preferred_base)` 失败时，先释放 reserve，再重试
+- v2 加密模式用保守的 16MB reserve（PE 头是密文读不到 SizeOfImage）
+
+### 4. Reflective DontSleep NLS 崩溃修复（PEB.Ldr 延迟 patch）
+
+**根因**：`ntdll!RtlpLoadNlsData`（被 `CreateActCtxA` 间接调用）通过 `PEB.Ldr` 主 EXE 条目的 DllBase 查找 locale 文件映射地址。如果在 `process_iat` 之前就 patch DllBase 为 new_img (0x400000)，而 0x400000 处已被 `NtUnmapViewOfSection` 卸载并 `VirtualAlloc` 重新分配（PRIVATE 内存，不再是 MAPPED view），ntdll 解引用无效指针崩溃（0xC0000005）。
+
+**修复**（`packer/reflective/loader.c`）：
+- `patch_peb_ldr_main_entry` 延迟到 `activate_manifest_from_image` **之后**调用
+- `update_peb_image_base` 延迟到 `jump_to_oep` **之前**调用
+- process_iat / activate_manifest 阶段保持 PEB.Ldr 主 EXE 条目为 stub 原始 MAPPED view，让 ntdll 的 NLS 加载成功
+
+### 5. SHA-256 优化 bug 规避（`packer/common/sha256.h`）
+
+GCC PIC 模式 `WINLOCK_FN` 宏新增 `optimize("O0")` 属性，关闭优化防止 SHA-256 哈希计算被优化器破坏（之前观察到 -O2 下 hash 不匹配）。
+
+### 6. e2e 测试脚本改进（`packer/tests/auto_e2e_test.ps1`）
+
+`Pack-Sample` 函数增加旧输出文件清理逻辑：先杀同名进程，再删除文件，避免上次测试残留进程占用 exe 文件导致 PACK_FAIL（hellomfcx86 历史问题）。
+
+---
+
 ## 2026-07-20 16:00 packer 目录重构 + x86 MSVC 迁移 + dotnet 构建链统一
 
 继 C3b 完全 PIC 化（commit `1ac443b`）之后，本轮提交（commit `eb9a523`）完成 packer 目录结构重组、x86 架构 MSVC 迁移、.NET 构建链从 MinGW 切换到 MSVC 三大改动。除 DontSleep 反射式加载修复另见专条外，其余主要改动如下。

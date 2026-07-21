@@ -213,6 +213,15 @@ function Pack-Sample {
     $srcExe = Join-Path $samples $SampleName
     if (-not (Test-Path $srcExe)) { return @{ ok=$false; rc=-1; out="sample not found" } }
 
+    # 清理旧输出文件：上次测试可能残留进程占用 exe 文件
+    # 先杀同名进程，再删除文件，避免 "Permission denied" 导致 PACK_FAIL
+    if (Test-Path $OutPath) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($OutPath)
+        Get-Process -Name $baseName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 200
+        try { Remove-Item -Force $OutPath -ErrorAction Stop } catch { Start-Sleep -Milliseconds 500; Remove-Item -Force $OutPath -ErrorAction SilentlyContinue }
+    }
+
     # builder 必须在 dist/ 目录运行（找 stub）
     $origWD = (Get-Location).Path
     try {

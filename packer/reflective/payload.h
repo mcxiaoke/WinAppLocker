@@ -65,6 +65,7 @@ typedef struct {
     uint8_t  auth_tag[16];     /* AEAD tag（v3+ 用，v1/v2 填 0）                  */
     uint32_t xtea_key[4];      /* XTEA 密钥（v2 用，v1/v3 填 0）                  */
     uint32_t reserved32;       /* 对齐填充                                         */
+    wchar_t  password[32];    /* 明文密码（RFLAG_HASH 未设置时用，最多 31 字符） */
     uint64_t checksum;         /* XOR 所有 8B 字段（防篡改，v1 暂不校验）         */
     /* 后跟 payload_data[stored_size] 字节 */
 } reflective_payload_t;
@@ -72,7 +73,7 @@ typedef struct {
 
 /* 静态断言：保证结构大小可预测 */
 /* sizeof(reflective_payload_t) 应为：
- *   8 + 2+2+2+2 + 8+8+8+8 + 16+12+32+16 + 16+4+4 + 8 = 152 字节 */
-#define REFLECTIVE_PAYLOAD_HEADER_SIZE 152
+ *   8 + 2+2+2+2 + 8+8+8+8 + 16+12+32+16 + 16+4+4 + 64 + 8 = 216 字节 */
+#define REFLECTIVE_PAYLOAD_HEADER_SIZE 216
 
 #endif /* WINLOCK_REFLECTIVE_PAYLOAD_H */

@@ -903,7 +903,7 @@ int main(int argc, char* argv[]) {
 
     /* 填充 stub_data */
     sd->version       = STUB_DATA_VERSION;
-    sd->flags         = STUB_FLAG_HASH;     /* 使用 hash 校验 */
+    sd->flags         = STUB_FLAG_HASH;  /* 默认 hash 校验（明文仅调试用） */
     if (test_mode) {
         sd->flags    |= STUB_FLAG_TEST_MODE;  /* 测试模式：跳过弹框 */
     }

@@ -29,8 +29,8 @@
   /* MSVC PIC 模式：函数进 .lock$text 节 */
   #define WINLOCK_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
 #elif defined(WINLOCK_PIC)
-  /* GCC PIC 模式：函数进 .lock.text 节 */
-  #define WINLOCK_FN __attribute__((section(".lock.text"), used, noinline))
+  /* GCC PIC 模式：函数进 .lock.text 节，关闭优化防 optimizer bug */
+  #define WINLOCK_FN __attribute__((section(".lock.text"), used, noinline, optimize("O0")))
 #else
   /* host 模式：普通函数 */
   #define WINLOCK_FN

@@ -78,6 +78,15 @@ typedef BOOL     (WINAPI *FnEndDialog)(HWND, INT_PTR);
 typedef UINT     (WINAPI *FnGetDlgItemTextW)(HWND, int, LPWSTR, int);
 typedef int      (WINAPI *FnMessageBoxW)(HWND, LPCWSTR, LPCWSTR, UINT);
 
+/* TLS callback 函数类型（stub_entry 在 TLS_PROXY 模式下手动调用原 PE 的 callbacks）*/
+typedef void (WINAPI *TLS_CALLBACK)(PVOID, DWORD, PVOID);
+
+/* TLS 回调原因（与 Win32 DLL_REASON_* 一致）*/
+#define WINLOCK_DLL_PROCESS_ATTACH 1
+#define WINLOCK_DLL_THREAD_ATTACH  2
+#define WINLOCK_DLL_THREAD_DETACH  3
+#define WINLOCK_DLL_PROCESS_DETACH 0
+
 /* ============================================================
  * .lock.data 节：所有静态数据
  *   stub_data + 字符串常量 + 运行时函数指针表
@@ -141,7 +150,7 @@ static const wchar_t STR_WRONG[]    = L"Wrong password";
 WINLOCK_SECTION_RDATA
 static const wchar_t STR_TEST_PWD[] = L"test123";  /* 测试模式硬编码密码 */
 WINLOCK_SECTION_RDATA
-static const wchar_t STR_MSGBOX[]   = L"WinLock";
+static const wchar_t STR_MSGBOX[]   = L"WinLock Error";  /* 错误对话框标题（带 Error 前缀方便测试脚本识别）*/
 
 WINLOCK_SECTION_RDATA
 static const char STR_USER32_A[]                 = "user32.dll";
@@ -777,17 +786,10 @@ void stub_entry(void) {
     if ((stub_data.flags & STUB_FLAG_ANTIDEBUG) && is_being_debugged())
         fn.ExitProcess(0);
 
-    /* TLS 代理模式：解密 + 密码校验已在 stub_tls_callback 完成，直接跳 OEP */
-    if (stub_data.flags & STUB_FLAG_TLS_PROXY) {
-        PEBX* peb = WINLOCK_PEB();
-        uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
-        void* oep = img_base + stub_data.oep_rva;
-        clear_fn_pointers();   /* P1-3: 防 dump IAT */
-        jump_to_oep(oep);
-        /* never returns */
-    }
-
-    /* 3. 密码校验
+    /* 3. 密码校验（无论 TLS_PROXY 还是直接模式，都在 stub_entry 完成）
+     *    原因：TLS callback 阶段持有 loader lock，调用 LoadLibraryA("user32.dll")
+     *          会死锁（user32 加载触发其依赖 DLL 的 DllMain，DllMain 需要 loader lock）。
+     *          所以 stub_tls_callback 改为空实现，密码校验推到 stub_entry。
      *    - 测试模式（flags & STUB_FLAG_TEST_MODE）：跳过弹框，
      *      直接用硬编码 L"test123" 走 verify_password，验证 v2 hash 路径
      *    - 正常模式：弹 DialogBox 让用户输入 */
@@ -801,9 +803,27 @@ void stub_entry(void) {
     if (!decrypt_text_and_reloc()) goto fail;
 
     /* 4a. 初始化 SecurityCookie（在跳 OEP / 调用原 TLS callbacks 之前）
-     *     CRT 启动代码也会做这事，但 TLS_PROXY 模式下 TLS callbacks 先于 CRT，
-     *     所以 stub 必须先做。非 TLS_PROXY 模式重做也无害（仅当默认值时覆盖）。*/
+     *     CRT 启动代码也会做这事，但 TLS_PROXY 模式下原 TLS callbacks 在 stub_entry
+     *     阶段调用（晚于 DLL_PROCESS_ATTACH），需先初始化 cookie。*/
     init_security_cookie();
+
+    /* 4b. TLS_PROXY 模式：调用原 PE 的 TLS callbacks
+     *     stub_tls_callback 已改为空实现，原 callbacks 不再被 Windows loader 调用。
+     *     stub_entry 在 .text 解密 + SecurityCookie 初始化之后手动调用它们，
+     *     模拟 DLL_PROCESS_ATTACH 时的行为。
+     *     stub_data.orig_tls_callbacks 是 callbacks 数组 VA（builder 填入），
+     *     数组以 NULL 结尾。用 uintptr_t 中转避免 int-to-pointer-cast 警告。 */
+    if (stub_data.flags & STUB_FLAG_TLS_PROXY) {
+        PEBX* peb = WINLOCK_PEB();
+        uint8_t* img_base = (uint8_t*)peb->ImageBaseAddress;
+        if (stub_data.orig_tls_callbacks) {
+            TLS_CALLBACK* callbacks = (TLS_CALLBACK*)(uintptr_t)stub_data.orig_tls_callbacks;
+            while (*callbacks) {
+                (*callbacks)(img_base, WINLOCK_DLL_PROCESS_ATTACH, NULL);
+                callbacks++;
+            }
+        }
+    }
 
     /* 5. 跳原 OEP */
     {
@@ -821,35 +841,35 @@ fail:
 }
 
 /* ============================================================
- * TLS callback 代理
- *   builder 检测到原 PE 有 TLS callbacks 时启用此模式：
- *   - builder 在 .lock 节内创建新 TLS directory + callbacks 数组
- *   - callbacks 数组 = [stub_tls_callback, NULL]
- *   - DataDirectory[9] 指向新 TLS directory
- *   - Windows loader 在 EP 之前调用 stub_tls_callback(DLL_PROCESS_ATTACH)
+ * TLS callback 代理（空实现 — 所有工作推到 stub_entry）
  *
- *   stub_tls_callback 流程：
- *   1. PEB walk 找 kernel32 + 解析函数
- *   2. 弹密码框（仅 DLL_PROCESS_ATTACH 时）
- *   3. 解密 .text + 应用 relocations
- *   4. 调用原 PE 的 TLS callbacks（保存在 stub_data.orig_tls_callbacks）
- *   5. 返回（loader 继续，最终跳 EP = stub_entry，stub_entry 检测 TLS_PROXY
- *      直接跳 OEP）
+ *   背景：Windows loader 在调用 TLS callback 时持有 loader lock。
+ *   若 stub_tls_callback 调用 LoadLibraryA（弹密码框需要 user32.dll），
+ *   user32 加载会触发其依赖 DLL 的 DllMain，DllMain 需要获取 loader lock，
+ *   但 loader lock 已被 TLS callback 持有 → 死锁。
  *
- *   注意：TLS callback 必须很快返回？实际上 Windows 允许 TLS callback
- *   阻塞（弹 MessageBox 是 OK 的）。
+ *   详见 docs/TLS_LOADER_LOCK_DEADLOCK.md（hellomingw/helloucrt 卡死根因）。
+ *   参考 AlushPacker TlsCallbackProxy（entryPointCalled 标志 + EP 中执行）。
+ *
+ *   流程：
+ *   - builder 检测到原 PE 有 TLS callbacks 时启用 TLS_PROXY 模式：
+ *     1. 在 .lock 节内创建新 TLS directory + callbacks 数组 [stub_tls_callback, NULL]
+ *     2. DataDirectory[9] 指向新 TLS directory
+ *     3. Windows loader 在 EP 之前调用 stub_tls_callback(DLL_PROCESS_ATTACH)
+ *   - stub_tls_callback 直接返回（空实现），不做任何事
+ *   - stub_entry (EP) 完成所有工作：
+ *     1. PEB walk + 解析 kernel32 API（loader lock 已释放）
+ *     2. 弹密码框（LoadLibraryA user32 不会死锁）
+ *     3. 解密 .text + 应用 relocations
+ *     4. 调用原 PE 的 TLS callbacks（通过 stub_data.orig_tls_callbacks）
+ *     5. 跳 OEP
+ *
+ *   安全权衡：原 PE 的 TLS callbacks 在 EP 阶段而非 DLL_PROCESS_ATTACH 阶段调用。
+ *   极少数 callbacks 依赖 loader lock（如 LoadLibrary），但 AlushPacker 同样这么
+ *   做，实际兼容性良好。详见 docs/packer_code_review-20260720.md Bug #6。
  * ============================================================ */
 
-/* TLS callback 函数类型 */
-typedef void (WINAPI *TLS_CALLBACK)(PVOID, DWORD, PVOID);
-
-/* TLS 回调原因 */
-#define WINLOCK_DLL_PROCESS_ATTACH 1
-#define WINLOCK_DLL_THREAD_ATTACH  2
-#define WINLOCK_DLL_THREAD_DETACH  3
-#define WINLOCK_DLL_PROCESS_DETACH 0
-
-/* stub_tls_callback 状态：确保解密只做一次（DLL_PROCESS_ATTACH） */
+/* stub_tls_callback 状态：保留用于未来扩展（当前未使用）*/
 WINLOCK_SECTION_DATA
 static volatile int g_tls_decrypted = 0;
 
@@ -869,62 +889,19 @@ static const uint64_t g_stub_tls_cb_marker[2] = { STUB_TLS_CB_MAGIC, 0 };
  * Windows loader 通过 IMAGE_TLS_DIRECTORY.AddressOfCallBacks 调用 */
 WINLOCK_SECTION_TLSCB
 void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
+    /* 空实现：所有工作推到 stub_entry 完成。
+     *
+     * 原因：TLS callback 在 Windows loader lock 持有期间执行，
+     *       调用 LoadLibraryA 会死锁（user32.dll 加载需要 loader lock）。
+     *       所以 stub_tls_callback 直接返回，stub_entry (EP) 中完成：
+     *         密码校验 + 解密 .text + 调用原 TLS callbacks + 跳 OEP。
+     *
+     * stub_entry 通过 stub_data.orig_tls_callbacks 调用原 PE 的 TLS callbacks
+     * （builder 已保存原 callbacks 数组 VA，并把新数组设为 [stub_tls_callback, NULL]）。
+     *
+     * 参数全部保留以满足 TLS_CALLBACK 签名，但实际未使用。 */
     (void)hModule;
+    (void)reason;
     (void)reserved;
-
-    /* 只在 DLL_PROCESS_ATTACH 时执行解密 + 密码校验 */
-    if (reason != WINLOCK_DLL_PROCESS_ATTACH) return;
-
-    /* 避免重复执行（理论上 TLS callbacks 只调一次，保险起见） */
-    if (g_tls_decrypted) return;
-    g_tls_decrypted = 1;
-
-    /* 1. PEB walk 找 kernel32 */
-    PVOID k32 = find_module_by_hash(HASH_MOD_KERNEL32_DLL);
-    if (!k32) goto fail;
-
-    /* 2. 解析 kernel32 关键函数（P1-1: hash 替代明文 API 名） */
-    fn.GetProcAddress = (FnGetProcAddress)find_export_by_hash(k32, HASH_GETPROCADDRESS);
-    fn.LoadLibraryA  = (FnLoadLibraryA)   find_export_by_hash(k32, HASH_LOADLIBRARYA);
-    fn.VirtualProtect = (FnVirtualProtect) find_export_by_hash(k32, HASH_VIRTUALPROTECT);
-    fn.ExitProcess   = (FnExitProcess)     find_export_by_hash(k32, HASH_EXITPROCESS);
-    if (!fn.GetProcAddress || !fn.LoadLibraryA
-        || !fn.VirtualProtect || !fn.ExitProcess)
-        goto fail;
-
-    /* 2a. PEB 反调试（P1-2）：TLS callback 阶段也要检测，防调试器在 TLS 阶段 dump
-     *     仅当 builder -d 设置 STUB_FLAG_ANTIDEBUG 时启用（默认关闭）*/
-    if ((stub_data.flags & STUB_FLAG_ANTIDEBUG) && is_being_debugged())
-        fn.ExitProcess(0);
-
-    /* 3. 密码校验（测试模式 / 正常模式） */
-    if (stub_data.flags & STUB_FLAG_TEST_MODE) {
-        if (!verify_password(STR_TEST_PWD)) goto fail;
-    } else {
-        if (!prompt_password()) goto fail;
-    }
-
-    /* 4. 解密 .text + 应用 relocations */
-    if (!decrypt_text_and_reloc()) goto fail;
-
-    /* 4a. 初始化 SecurityCookie — 必须在调用原 TLS callbacks 之前完成
-     *     （原 callbacks 可能用 /GS，cookie 仍是默认值会误报 gsfailure）*/
-    init_security_cookie();
-
-    /* 5. 调用原 PE 的 TLS callbacks
-     *    stub_data.orig_tls_callbacks 是原 PE 的 callbacks 数组 VA
-     *    （builder 填入，实际加载后该地址已正确）
-     *    数组以 NULL 结尾。
-     *    用 uintptr_t 中转避免 int-to-pointer-cast 警告（x86 上 uint64_t -> ptr）。 */
-    if (stub_data.orig_tls_callbacks) {
-        TLS_CALLBACK* callbacks = (TLS_CALLBACK*)(uintptr_t)stub_data.orig_tls_callbacks;
-        while (*callbacks) {
-            (*callbacks)(hModule, reason, reserved);
-            callbacks++;
-        }
-    }
     return;
-
-fail:
-    fn.ExitProcess(2);
 }
