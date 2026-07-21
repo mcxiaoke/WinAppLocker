@@ -1,5 +1,41 @@
 # 变更记录
 
+## 2026-07-21 22:45 构建系统重构第 0 步：CMake hack 消除 + malloc 检查
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 0 步（P0 前置改动），消除构建系统最大脆弱点。
+
+### 1. 消除 CMake 文件复制 hack（改动 10）
+
+**问题**：build.ps1 临时把 `CMakeLists-x64.txt` 复制为 `CMakeLists.txt`，崩溃时残留文件导致后续 `cmake .` 静默错误配置，`git status` 每次有未跟踪变动。
+
+**修复**：
+- 新建顶层 [packer/CMakeLists.txt](file:///C:/Home/Projects/applocker/packer/CMakeLists.txt)：按 `-DWINLOCK_ARCH=x64|x86` 用 `include()` 引入 `inplace/CMakeLists.inc` 和 `reflective/CMakeLists.inc`
+- 删除 `CMakeLists-x64.txt` / `CMakeLists-x86.txt`
+- [packer/build.ps1](file:///C:/Home/Projects/applocker/packer/build.ps1) 的 `Build-Arch` 函数：删除临时复制 + try/finally 清理逻辑，改用 `-DWINLOCK_ARCH=$arch` 参数
+
+**设计选择**：用 `include()` 而非 `add_subdirectory()`，避免子目录嵌套导致产物落在 `build/x64/x64/`（dist 收集失败）。
+
+### 2. malloc NULL 检查 + 文件读取大小上限（改动 11）
+
+[packer/inplace/builder.c](file:///C:/Home/Projects/applocker/packer/inplace/builder.c) 和 [packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c) 的 `read_file`：
+- 加 `ftell < 0` 检查
+- 加 512MB 文件大小上限（防 OOM）
+- malloc 失败时打印错误日志
+
+其他 calloc/realloc 调用原本就有 NULL 检查，无需修改。
+
+### 测试结果
+
+- clean build 成功：8 个产物全部正确生成，dist/ 与重构前一致
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+  - 已知失败（与本步无关）：helloguix86/hellomfcx86 inplace_password CRASH、DontSleep reflective ERROR_WINDOW
+
+### 进度跟踪
+
+[docs/build-system-refact-task.md](build-system-refact-task.md) 记录 5 步实施计划，本步为第 0 步。
+
+---
+
 ## 2026-07-21 19:30 packer reflective DontSleep 修复 + x86 stub TLS callback 重构 + e2e 测试改进
 
 本轮聚焦 DontSleep 反射式加载崩溃、x86 inplace_password 死锁、密码校验默认模式回归三个问题。clean build 后 e2e 测试结果：**32 pass / 4 fail**（之前为 31 pass / 5 fail）。

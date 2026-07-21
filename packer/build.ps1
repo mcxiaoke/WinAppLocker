@@ -28,9 +28,8 @@
 #   - builder 只输出 x64 版本（builder 不依赖架构，x86 builder 仅 32 位 OS 才需要，
 #     现代 Windows 都是 64 位，x64 builder 通过 WOW64 也能加壳 x86 PE）
 #   - stub 同时输出 x64 和 x86 版本（带 _xXX 后缀区分）
-#   - x64 和 x86 用独立 CMakeLists-x64.txt / CMakeLists-x86.txt，不掺混
-#   - CMake 必须读 CMakeLists.txt（不支持自定义文件名），
-#     临时复制 CMakeLists-xXX.txt 为 CMakeLists.txt，try/finally 保证清理
+#   - x64 和 x86 用子目录 x64/CMakeLists.txt / x86/CMakeLists.txt，
+#     顶层 CMakeLists.txt 按 -DWINLOCK_ARCH 转发到对应子目录
 
 param(
     [switch]$Debug,
@@ -79,10 +78,9 @@ function Invoke-Vcvarsall([string]$vcvarsArch) {
 
 # 辅助函数：构建一个架构
 # 参数：
-#   $arch         - 目标架构 "x64" 或 "x86"
-#   $cmakelistSrc - 源 CMakeLists 文件名
-#   $buildDir     - build 输出目录
-function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
+#   $arch     - 目标架构 "x64" 或 "x86"
+#   $buildDir - build 输出目录
+function Build-Arch([string]$arch, [string]$buildDir) {
     Write-Host ""
     Write-Host "======== 构建 $arch ========" -ForegroundColor Cyan
 
@@ -102,31 +100,21 @@ function Build-Arch([string]$arch, [string]$cmakelistSrc, [string]$buildDir) {
         New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
     }
 
-    # 3. 临时把 CMakeLists-xXX.txt 复制为 CMakeLists.txt
-    $tempCmake = Join-Path $root "CMakeLists.txt"
-    if (Test-Path $tempCmake) {
-        throw "存在意外文件 $tempCmake，请手动删除后重试"
-    }
-    Copy-Item (Join-Path $root $cmakelistSrc) $tempCmake -Force
+    # 3. CMake configure
+    #    顶层 CMakeLists.txt 按 -DWINLOCK_ARCH 转发到 x64/ 或 x86/ 子目录
+    #    x86 交叉编译：host 是 x64，target 是 Win32，通过 vcvarsall x64_x86 设置环境
+    #    不使用 -A Win32（Ninja 不支持）
+    Write-Host "==> CMake configure ($arch, Ninja)..." -ForegroundColor Cyan
+    $cmakeArgs = @("-S", $root, "-B", $buildDir, "-G", "Ninja",
+                   "-DCMAKE_BUILD_TYPE=$config", "-DWINLOCK_ARCH=$arch")
+    Write-Host "    $ cmake $($cmakeArgs -join ' ')" -ForegroundColor DarkGray
+    & cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -ne 0) { throw "cmake configure ($arch) 失败" }
 
-    try {
-        # 4. CMake configure
-        #    x86 交叉编译：host 是 x64，target 是 Win32，通过 vcvarsall x64_x86 设置环境
-        #    不使用 -A Win32（Ninja 不支持）
-        Write-Host "==> CMake configure ($arch, Ninja)..." -ForegroundColor Cyan
-        $cmakeArgs = @("-S", $root, "-B", $buildDir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=$config")
-        Write-Host "    $ cmake $($cmakeArgs -join ' ')" -ForegroundColor DarkGray
-        & cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-        if ($LASTEXITCODE -ne 0) { throw "cmake configure ($arch) 失败" }
-
-        # 5. CMake build（编译所有 target）
-        Write-Host "==> CMake build ($arch)..." -ForegroundColor Cyan
-        & cmake --build $buildDir -j
-        if ($LASTEXITCODE -ne 0) { throw "cmake build ($arch) 失败" }
-    } finally {
-        # 6. 清理临时 CMakeLists.txt（无论成功失败都要清理）
-        if (Test-Path $tempCmake) { Remove-Item $tempCmake -Force }
-    }
+    # 4. CMake build（编译所有 target）
+    Write-Host "==> CMake build ($arch)..." -ForegroundColor Cyan
+    & cmake --build $buildDir -j
+    if ($LASTEXITCODE -ne 0) { throw "cmake build ($arch) 失败" }
 
     Write-Host "==> $arch 构建完成" -ForegroundColor Green
 }
@@ -229,12 +217,12 @@ function Build-InplaceMinGW {
 
 # ---- 构建 x64 ----
 if (-not $SkipX64) {
-    Build-Arch "x64" "CMakeLists-x64.txt" (Join-Path $root "build\x64")
+    Build-Arch "x64" (Join-Path $root "build\x64")
 }
 
 # ---- 构建 x86 ----
 if (-not $SkipX86) {
-    Build-Arch "x86" "CMakeLists-x86.txt" (Join-Path $root "build\x86")
+    Build-Arch "x86" (Join-Path $root "build\x86")
 }
 
 # ---- MinGW 构建 inplace stub (x64) ----

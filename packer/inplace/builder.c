@@ -67,8 +67,23 @@ static uint8_t* read_file(const char* path, size_t* out_size) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fprintf(stderr, "[-] ftell 失败: %s\n", path);
+        fclose(f);
+        return NULL;
+    }
+    /* 文件大小上限 512MB，防 OOM（审查 A15）*/
+    if (sz > 512L * 1024 * 1024) {
+        fprintf(stderr, "[-] 文件过大（%ld bytes > 512MB 上限）: %s\n", sz, path);
+        fclose(f);
+        return NULL;
+    }
     uint8_t* buf = (uint8_t*)malloc((size_t)sz);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) {
+        fprintf(stderr, "[-] malloc 失败（%ld bytes）: %s\n", sz, path);
+        fclose(f);
+        return NULL;
+    }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
         free(buf); fclose(f); return NULL;
     }
