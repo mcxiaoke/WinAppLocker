@@ -13,7 +13,7 @@
 - [x] 第 2 步（builder 校验）：改动 5 + 6
 - [x] 第 3 步（inspect 工具 + manifest）：改动 7 + 8
 - [x] 第 4 步（测试校验）：改动 9
-- [ ] 第 5 步（清理）：改动 12
+- [x] 第 5 步（清理）：改动 12
 
 ---
 
@@ -167,6 +167,29 @@
 **开始时间**：2026-07-22 06:30
 **完成时间**：2026-07-21 22:39
 **Commit hash**：`5293402`
+
+---
+
+### ✅ 已完成 — 第 5 步：Makefile.mingw DEPRECATED（改动 12）
+
+**改动清单**：
+- 改动 12：`packer/Makefile.mingw` 顶部加 DEPRECATED 注释块（18 行），说明过时原因和替代方案
+
+**实施细节**：
+- DEPRECATED 注释列出 4 个过时原因：目录结构失效、不支持 identity 注入、不调用 patch_stub_identity.py、不生成 manifest
+- 指向 `build.ps1` 作为替代方案，给出 3 个常用命令示例
+- 保留原 Makefile 内容不动（方案要求"不花时间同步更新内容"），仅供历史参考
+- 注释里提示如需手动 MinGW 构建请参考 `build.ps1` 的 `Build-InplaceMinGW` 函数
+- 搜索确认无代码引用 Makefile.mingw（仅 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 旧设计文档提到，属历史记录无需改）
+
+**测试结果**：
+- 纯注释改动，不影响任何构建逻辑，无需 clean build + e2e
+- 确认无代码引用 Makefile.mingw（grep 全仓库无 build.ps1 / CMakeLists / 测试脚本引用）
+
+**状态**：完成
+**开始时间**：2026-07-21 22:40
+**完成时间**：2026-07-21 22:42
+**Commit hash**：（commit 后回填）
 
 ---
 

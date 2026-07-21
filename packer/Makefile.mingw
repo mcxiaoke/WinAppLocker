@@ -1,3 +1,22 @@
+# ============================================================================
+# DEPRECATED: 此 Makefile 已过时，不再维护
+#
+# 原因：
+#   - 目录结构引用已失效（stub/、builder/ 等旧路径，实际已重构为 inplace/、reflective/）
+#   - 不支持 stub 身份字段注入（stub_arch / stub_toolchain / stub_source_crc 等）
+#   - 不调用 patch_stub_identity.py，产物无 identity，builder 四重校验会拒绝
+#   - 不生成 stub_manifest.json，无构建可追溯性
+#
+# 请使用 build.ps1 构建（支持 MSVC + MinGW + 自动产物汇集 + identity 注入）：
+#     pwsh -File packer/build.ps1            # 默认 Release，构建 x64 + x86
+#     pwsh -File packer/build.ps1 -Clean     # 清理后重新构建
+#     pwsh -File packer/build.ps1 -SkipMinGW # 跳过 MinGW，用 MSVC stub
+#
+# 保留此文件仅供历史参考。如需手动 MinGW 构建，请参考 build.ps1 的
+# Build-InplaceMinGW 函数实现（含 -DSTUB_ARCH / -DSTUB_TOOLCHAIN 注入和
+# POST_BUILD patch_stub_identity.py 调用）。
+# ============================================================================
+#
 # WinLock demo - Makefile
 # x64 stub + builder 用 w64devkit GCC 编译
 # x86 stub 用 msys2 mingw32 GCC 编译（可选，仅 'make all-x86' 时需要）

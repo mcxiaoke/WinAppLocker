@@ -1,5 +1,35 @@
 # 变更记录
 
+## 2026-07-21 22:42 构建系统重构第 5 步（完成）：Makefile.mingw DEPRECATED
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 5 步（改动 12，最后一步），标记旧 Makefile 已过时。
+
+### 1. Makefile.mingw 加 DEPRECATED 注释（改动 12）
+
+[packer/Makefile.mingw](file:///C:/Home/Projects/applocker/packer/Makefile.mingw)：
+- 顶部追加 18 行 DEPRECATED 注释块，说明 4 个过时原因：
+  - 目录结构引用已失效（stub/、builder/ 等旧路径，实际已重构为 inplace/、reflective/）
+  - 不支持 stub 身份字段注入（stub_arch / stub_toolchain / stub_source_crc 等）
+  - 不调用 patch_stub_identity.py，产物无 identity，builder 四重校验会拒绝
+  - 不生成 stub_manifest.json，无构建可追溯性
+- 指向 `build.ps1` 作为替代方案，给出 3 个常用命令示例
+- 保留原 Makefile 内容不动（方案要求"不花时间同步更新内容"），仅供历史参考
+- 搜索确认无代码引用 Makefile.mingw（仅旧设计文档 `packer/docs/MSVC_PORRINT_AND_PIC_SPEC.md` 提到，属历史记录无需改）
+
+### 重构整体完成
+
+5 步全部完成，共 12 个改动：
+- 第 0 步（commit `1d73483`）：CMake hack 消除 + malloc 检查
+- 第 1 步（commit `1ecbf9a`）：身份字段 + CMake/build.ps1/patch 脚本注入
+- 第 2 步（commit `34b24f5`）：builder 四重校验 + reflective 薄封装日志
+- 第 3 步（commit `12ce97d`）：inspect_stub.py + build.ps1 manifest 生成
+- 第 4 步（commit `5293402`）：测试脚本 source_crc + 端到端 identity 校验
+- 第 5 步（本次 commit）：Makefile.mingw DEPRECATED
+
+e2e 测试始终 32 pass / 4 fail，与重构前完全一致，无新回归。
+
+---
+
 ## 2026-07-21 22:39 构建系统重构第 4 步：测试脚本 source_crc 警告 + 端到端 identity 校验
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 4 步（改动 9），让 e2e 测试自动校验 stub 新鲜度和加壳产物身份一致性。
