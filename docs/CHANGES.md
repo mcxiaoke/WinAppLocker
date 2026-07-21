@@ -1,5 +1,38 @@
 # 变更记录
 
+## 2026-07-22 06:30 构建系统重构第 3 步：inspect_stub.py + build.ps1 manifest 生成
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 3 步（改动 7+8），让构建产物可追溯、可检查。
+
+### 1. 新建 inspect_stub.py（改动 7）
+
+[packer/cmake/inspect_stub.py](file:///C:/Home/Projects/applocker/packer/cmake/inspect_stub.py)：
+- 合并 inspect_stub_bin.py 和 inspect_stub.py 两个工具，复用 patch_stub_identity.py 的常量和 `find_stub_data` 函数
+- 支持三种模式：
+  - 单文件 stub.bin：按 magic 搜索 stub_data_t，打印 identity
+  - 单文件 packed.exe：解析 PE 节表找 `.lock` 节（含 `.lock$text` 子节），从节内搜索 stub_data_t
+  - `--summary DIR`：批量列出目录下所有 `stub_*.bin` 的 identity
+- 支持 `--format=json` 输出结构化数据（manifest 生成用）
+- `--winlock-root` 未传时从脚本位置自动推断（cmake/ 上溯到 packer/）
+- PE 节表解析：手写偏移逻辑，不依赖 pefile 等第三方库
+
+### 2. build.ps1 末尾追加 manifest 生成（改动 8）
+
+[packer/build.ps1](file:///C:/Home/Projects/applocker/packer/build.ps1)：
+- 末尾追加 `inspect_stub.py --summary $distDir` 打印 stub 身份汇总表
+- 生成 `dist/stub_manifest.json`，包含 build_time / githash / 所有 stub_*.bin 的 identity 字段
+- manifest 生成包在 try/catch 里，失败只警告不致命（stub 二进制已正确构建）
+- PowerShell 单元素 += 退化陷阱：用 `@($manifest.stubs + $info)` 强制数组
+- `Out-File -Encoding utf8` 写 manifest，避免默认 UTF-16 BOM 导致 JSON 解析失败
+
+### 测试结果
+
+- 单元测试 inspect_stub.py：stub.bin / packed.exe / --summary / --format=json 四种模式全部正常
+- clean build 成功，build.ps1 末尾正确打印汇总 + 写入 `dist/stub_manifest.json`
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+
+---
+
 ## 2026-07-22 06:00 构建系统重构第 2 步：builder 四重校验 + reflective 薄封装日志
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 2 步（改动 5+6），让 builder 在加壳时严格校验 stub 身份信息，防止误用错误架构/版本的 stub。

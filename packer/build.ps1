@@ -313,6 +313,36 @@ Get-ChildItem $distDir -File | ForEach-Object {
     Write-Host ("    {0,10} bytes  {1}" -f $_.Length, $_.Name)
 }
 
+# ---- 生成 stub_manifest.json + 打印 stub 身份汇总（审查 A4）----
+# manifest 包含构建时间、githash、所有 stub_*.bin 的 identity 字段
+# 便于反查产物对应的源码版本和工具链
+try {
+    Write-Host ""
+    Write-Host "==> stub 身份信息汇总:" -ForegroundColor Green
+    & $pythonExe ${root}\cmake\inspect_stub.py --summary $distDir --winlock-root $root
+
+    Write-Host ""
+    Write-Host "==> 生成 stub_manifest.json ..." -ForegroundColor Cyan
+    $manifest = @{
+        build_time = (Get-Date -Format "o")
+        githash = (git rev-parse --short=8 HEAD 2>$null)
+        stubs = @()
+    }
+    foreach ($f in Get-ChildItem $distDir -Filter "stub_*.bin") {
+        # 用 inspect_stub.py --format=json 读身份字段
+        # --winlock-root 指向 packer/ 目录（config.h 所在）
+        $info = & $pythonExe ${root}\cmake\inspect_stub.py $f.FullName --format=json --winlock-root $root | ConvertFrom-Json
+        # 注意：PowerShell 单元素 += 会退化成标量，强制包成数组（审查问题 8）
+        $manifest.stubs = @($manifest.stubs + $info)
+    }
+    $manifestPath = Join-Path $distDir "stub_manifest.json"
+    $manifest | ConvertTo-Json -Depth 5 | Out-File -FilePath $manifestPath -Encoding utf8
+    Write-Host "    写入: $manifestPath" -ForegroundColor DarkGray
+} catch {
+    # manifest 生成失败不致命（stub 二进制已正确构建），只打印警告
+    Write-Host "    [警告] manifest 生成失败: $_" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "==> 构建完成" -ForegroundColor Green
 

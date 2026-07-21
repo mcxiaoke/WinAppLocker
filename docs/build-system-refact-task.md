@@ -11,7 +11,7 @@
 - [x] 第 0 步（前置 P0）：改动 10（CMake hack 消除）+ 改动 11（malloc 检查）
 - [x] 第 1 步（身份字段 + 注入）：改动 1 + 2 + 3 + 4
 - [x] 第 2 步（builder 校验）：改动 5 + 6
-- [ ] 第 3 步（inspect 工具 + manifest）：改动 7 + 8
+- [x] 第 3 步（inspect 工具 + manifest）：改动 7 + 8
 - [ ] 第 4 步（测试校验）：改动 9
 - [ ] 第 5 步（清理）：改动 12
 
@@ -99,6 +99,41 @@
 **开始时间**：2026-07-22 05:30
 **完成时间**：2026-07-22 06:00
 **Commit hash**：`34b24f5`
+
+---
+
+### ✅ 已完成 — 第 3 步：inspect_stub.py + build.ps1 manifest 生成
+
+**改动清单**：
+- 改动 7：新建 `packer/cmake/inspect_stub.py`，合并 inspect_stub_bin.py 和 inspect_stub.py 两个工具。复用 patch_stub_identity.py 的常量和 `find_stub_data` 函数
+- 改动 8：`packer/build.ps1` 末尾追加 stub 身份信息汇总打印 + `stub_manifest.json` 生成（MinGW fail 严格化已在 Step 1 改动 3 完成）
+
+**实施细节**：
+- `inspect_stub.py` 支持三种模式：
+  - 单文件 stub.bin 模式：按 magic 搜索 stub_data_t，打印 identity
+  - 单文件 packed.exe 模式：解析 PE 节表找 `.lock` 节（含 `.lock$text` / `.lock$data` 等子节），从节内搜索 stub_data_t
+  - `--summary DIR` 批量模式：列出目录下所有 `stub_*.bin` 的 identity
+- 支持 `--format=json` 输出结构化数据（manifest 生成用），`--winlock-root` 未传时从脚本位置自动推断（cmake/ 上溯到 packer/）
+- PE 节表解析：手写 IMAGE_DOS_HEADER / IMAGE_FILE_HEADER / IMAGE_SECTION_HEADER 偏移逻辑，不依赖 pefile 等第三方库
+- `.lock` 节匹配：name[:5]==".lock" 且 name[5] 为 \0 或 $（兼容 MSVC 的 `.lock$text` 子节）
+- `build.ps1` manifest 生成包在 try/catch 里，失败只警告不致命（stub 二进制已正确构建）
+- PowerShell `$manifest.stubs += $info` 单元素退化成标量陷阱：改为 `@($manifest.stubs + $info)` 强制数组
+- `Out-File -Encoding utf8` 写 manifest，避免 PowerShell 默认 UTF-16 BOM 导致 JSON 解析失败
+
+**测试结果**：
+- 单元测试 inspect_stub.py：
+  - stub.bin 模式：`arch=x64 toolchain=MinGW bin_ver=0x0100 build_time=1784643736 source_crc=0xe5035ac9 stub_size=8128 githash=1ecbf9a9`
+  - `--format=json` 模式：输出正确 JSON 结构
+  - `--summary` 批量模式：列出 dist/ 下两个 stub_*.bin 的 identity
+  - packed.exe 模式：能从加壳产物的 .lock 节里读到 stub_data_t（hellocli_inplace_test.exe 读到身份信息）
+  - reflective 产物：正确报错（无 .lock 节，exit=1）
+- clean build 成功，build.ps1 末尾打印 stub 身份汇总 + 写入 `dist/stub_manifest.json`
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+
+**状态**：完成
+**开始时间**：2026-07-22 06:00
+**完成时间**：2026-07-22 06:30
+**Commit hash**：（待 commit）
 
 ---
 
