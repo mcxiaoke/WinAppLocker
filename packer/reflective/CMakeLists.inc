@@ -1,12 +1,13 @@
 # ============================================================
 # reflective/CMakeLists.inc - reflective 模式（builder_reflective + loader stub）
 #
-# 由顶层 CMakeLists-x64.txt 或 CMakeLists-x86.txt include()，根据 ARCH 变量决定
-# 编译 x64 还是 x86 target。
+# 由顶层 CMakeLists.txt 用 include() 引入，按 WINLOCK_ARCH=x64|x86 决定编译
+# x64 还是 x86 target。
 #
-# 变量：
-#   ARCH    = "x64" 或 "x86"
-#   SUFFIX  = "_x64" 或 "_x86"
+# 变量（由顶层 CMakeLists.txt 设置）：
+#   ARCH              = "x64" 或 "x86"
+#   SUFFIX            = "_x64" 或 "_x86"
+#   WINLOCK_ROOT      = packer/ 目录
 #
 # 产物 target：
 #   builder_reflective        - reflective 加壳器（不分架构）
@@ -14,6 +15,10 @@
 #
 # 命名：原 loader_x64.exe / loader_x86.exe 改名为 stub_reflective_x64.exe /
 #       stub_reflective_x86.exe，与 inplace/stub_inplace_* 风格统一
+#
+# 注意：reflective stub 是普通 PE，无 stub_data_t 结构，所以不注入
+#       STUB_ARCH/STUB_TOOLCHAIN 宏，也无 POST_BUILD patch 命令。
+#       reflective 模式的 arch 校验靠 builder_reflective 检查 PE Machine 字段。
 # ============================================================
 
 # ---- builder_reflective（加壳器） ----

@@ -1,5 +1,76 @@
 # 变更记录
 
+## 2026-07-22 03:00 构建系统重构第 1 步：stub 身份字段 + CMake/build.ps1/patch 脚本注入
+
+在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 1 步（改动 1+2+3+4），让所有 inplace stub 二进制携带完整身份信息（arch/toolchain/bin_ver/build_time/source_crc/size/githash）。
+
+### 1. stub_data_t 新增身份块（改动 1）
+
+[packer/common/config.h](file:///C:/Home/Projects/applocker/packer/common/config.h)：
+- 新增 `stub_identity_t` 结构（32 字节，7 字段：stub_arch/stub_toolchain/stub_bin_ver/stub_build_time/stub_source_crc/stub_size/stub_githash[8]）
+- `stub_data_t` 末尾、`checksum` 之前插入 `identity` 字段（位置选择审查 A2：避免平移后续 64 位字段偏移，回归面最小）
+- `STUB_DATA_VERSION` bump 4→5
+- 加 `STUB_DATA_SIZEOF 320` 宏（供 Python 脚本读取，避免硬编码漂移）
+- 加 typedef 数组防漂移校验（替代 `_Static_assert`：MSVC C 模式默认标准不支持 C11 关键字）
+- 加 `STUB_ARCH_X86/X64` / `STUB_TOOLCHAIN_MSVC/MINGW` 常量
+- 加 `#ifndef STUB_BIN_VER` 守卫宏
+
+[packer/inplace/stub.c](file:///C:/Home/Projects/applocker/packer/inplace/stub.c)：
+- 顶部加 `#ifndef STUB_ARCH` / `STUB_TOOLCHAIN` 宏守卫（CMake/MinGW -D 注入兜底）
+- `stub_data` 初始化加 `.identity` 字段（编译期只填 arch/toolchain，其余为 0，由 POST_BUILD patch）
+
+### 2. CMake 编译期注入 STUB_ARCH/STUB_TOOLCHAIN（改动 2）
+
+[packer/CMakeLists.txt](file:///C:/Home/Projects/applocker/packer/CMakeLists.txt)：
+- if/elseif 分支定义 `STUB_ARCH_VAL`（x64=2, x86=1）和 `STUB_TOOLCHAIN_VAL`（MSVC=1）
+
+[packer/inplace/CMakeLists.inc](file:///C:/Home/Projects/applocker/packer/inplace/CMakeLists.inc)：
+- `target_compile_definitions` 加 `STUB_ARCH=${STUB_ARCH_VAL}` / `STUB_TOOLCHAIN=${STUB_TOOLCHAIN_VAL}`
+- POST_BUILD 加 `patch_stub_identity.py` 命令（在 `extract_lock_section.py` 之后，CMake 按声明顺序执行保证依赖正确）
+
+[packer/reflective/CMakeLists.inc](file:///C:/Home/Projects/applocker/packer/reflective/CMakeLists.inc)：
+- 不改动（reflective stub 是普通 PE，无 stub_data_t 结构；arch 校验靠 builder_reflective 检查 PE Machine 字段，第 2 步实施）
+
+### 3. build.ps1 MinGW 注入 + Python 检测 + 严格化（改动 3）
+
+[packer/build.ps1](file:///C:/Home/Projects/applocker/packer/build.ps1)：
+- 开头加 Python 检测（`$pythonExe`）
+- `Build-InplaceMinGW` 加 `-DSTUB_ARCH` / `-DSTUB_TOOLCHAIN` 编译期注入（与 CMake MSVC 路径一致）
+- POST_BUILD 调用 `patch_stub_identity.py` 写入其余 5 个字段
+- MinGW gcc 不存在时 throw 而非 continue（不再静默 fallback 到 MSVC stub，避免行为差异难以排查）
+- 覆盖 MSVC 产物时打印 SHA256 前缀（便于排查）
+- 头部注释修正：`stub_inplace_x86.bin` 标注"MinGW 构建，若可用；否则 fallback MSVC"
+
+### 4. 新建 patch_stub_identity.py（改动 4）
+
+[packer/cmake/patch_stub_identity.py](file:///C:/Home/Projects/applocker/packer/cmake/patch_stub_identity.py)：
+
+POST_BUILD 阶段注入 5 个身份字段（stub_bin_ver/stub_build_time/stub_source_crc/stub_size/stub_githash），stub_arch/stub_toolchain 由编译期 -D 注入，脚本只校验。
+
+关键设计：
+- **三重校验定位**：8 字节对齐搜索 magic + version + arch 范围（不校验 stub_size，因为脚本本身要写入）
+- **幂等**：patch 前先清零 stub_size 字段，支持重复运行
+- **偏移从 config.h 解析**：避免硬编码漂移
+- **行尾归一化**：CRC 计算前统一 CRLF→LF
+- **CRC 覆盖所有 #include 依赖**：stub.c / stub_asm_${ARCH}.asm / config.h / sha256.h / peb_walk.h / xtea.h / winlock_compat.h
+- **githash**：`git rev-parse --short=8 HEAD`，无 git 或不在仓库时全 0
+
+### 测试结果
+
+- clean build 成功，身份字段全部正确注入：
+  - MSVC x64 stub_inplace_x64.bin: 24592 bytes, arch=x64 toolchain=MSVC source_crc=0xe5035ac9 githash=1d73483f
+  - MSVC x86 stub_inplace_x86.bin: 16400 bytes, arch=x86 toolchain=MSVC source_crc=0x4f28d90d githash=1d73483f
+  - MinGW x64 stub_inplace_x64.bin: 8128 bytes（覆盖 MSVC 产物）, arch=x64 toolchain=MinGW source_crc=0xe5035ac9
+  - MinGW x86 stub_inplace_x86.bin: 7888 bytes（覆盖 MSVC 产物）, arch=x86 toolchain=MinGW source_crc=0x4f28d90d
+- e2e 测试：32 pass / 4 fail（与重构前完全一致，未引入新回归）
+  - 已知失败（与本步无关）：helloguix86/hellomfcx86 inplace_password CRASH exit=2、DontSleep reflective CRASH exit=-1073741819
+
+### 进度跟踪
+
+[docs/build-system-refact-task.md](build-system-refact-task.md) 记录 5 步实施计划，本步为第 1 步。
+
+---
+
 ## 2026-07-21 22:45 构建系统重构第 0 步：CMake hack 消除 + malloc 检查
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 0 步（P0 前置改动），消除构建系统最大脆弱点。

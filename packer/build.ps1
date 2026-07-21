@@ -18,18 +18,21 @@
 #   builder_inplace.exe          - inplace 加壳器（x64，运行时按输入 PE 选 stub）
 #   stub_inplace_x64.bin          - inplace x64 stub（MinGW 构建，TLS callback 完整）
 #   stub_inplace_x64.exe          - inplace x64 stub exe（MinGW 构建，builder 读 .reloc 用）
-#   stub_inplace_x86.bin          - inplace x86 stub（MSVC 构建）
-#   stub_inplace_x86.exe          - inplace x86 stub exe（MSVC 构建）
+#   stub_inplace_x86.bin          - inplace x86 stub（MinGW 构建，若可用；否则 fallback MSVC）
+#   stub_inplace_x86.exe          - inplace x86 stub exe（同上）
 #   builder_reflective.exe        - reflective 加壳器（x64）
 #   stub_reflective_x64.exe       - reflective x64 stub
 #   stub_reflective_x86.exe       - reflective x86 stub
 #
 # 设计：
-#   - builder 只输出 x64 版本（builder 不依赖架构，x86 builder 仅 32 位 OS 才需要，
+#   - builder 只输出 x64 版本（builder 不依赖架构，运行时按输入 PE 选 stub，
 #     现代 Windows 都是 64 位，x64 builder 通过 WOW64 也能加壳 x86 PE）
 #   - stub 同时输出 x64 和 x86 版本（带 _xXX 后缀区分）
-#   - x64 和 x86 用子目录 x64/CMakeLists.txt / x86/CMakeLists.txt，
-#     顶层 CMakeLists.txt 按 -DWINLOCK_ARCH 转发到对应子目录
+#   - 顶层 CMakeLists.txt 按 -DWINLOCK_ARCH=x64|x86 用 include() 引入
+#     inplace/CMakeLists.inc 和 reflective/CMakeLists.inc（不创建子目录）
+#   - MinGW 失败必须 fail（不再静默 fallback 到 MSVC stub，避免行为差异难以排查）
+#   - 所有 stub 二进制（inplace）都通过 patch_stub_identity.py 注入身份字段
+#     （arch/toolchain/bin_ver/build_time/source_crc/size/githash），便于反查
 
 param(
     [switch]$Debug,
@@ -48,6 +51,12 @@ try {
 $config = if ($Debug) { "Debug" } else { "Release" }
 Write-Host "==> WinLock packer 构建（MSVC x64 + x86, Ninja）" -ForegroundColor Cyan
 Write-Host "    配置: $config"
+
+# ---- Python 检测（patch_stub_identity.py 等脚本依赖）----
+$pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $pythonExe) { $pythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
+if (-not $pythonExe) { throw "Python 不在 PATH，无法运行 patch_stub_identity.py 等 POST_BUILD 脚本" }
+Write-Host "    Python: $pythonExe" -ForegroundColor DarkGray
 
 # ---- vcvarsall.bat 路径 ----
 $vcvarsall = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat"
@@ -122,6 +131,11 @@ function Build-Arch([string]$arch, [string]$buildDir) {
 # 辅助函数：MinGW 构建 inplace stub (x64 + x86)
 # 使用 MSYS64 工具链（mingw64/mingw32），输出到 build/mingw/，
 # 产物覆盖 MSVC 的 stub_inplace_xXX.bin/.exe
+#
+# 身份字段注入策略（与 CMake MSVC 路径一致）：
+#   - 编译期：-DSTUB_ARCH / -DSTUB_TOOLCHAIN（与 CMake -D 等价）
+#   - POST_BUILD：调用 patch_stub_identity.py 写入其余 5 个字段
+#   - MinGW 失败必须 throw（不再 continue 静默 fallback 到 MSVC stub）
 function Build-InplaceMinGW {
     Write-Host ""
 
@@ -154,12 +168,15 @@ function Build-InplaceMinGW {
         "-Wl,--gc-sections", "-Wl,--build-id=none"
     )
 
-    # 架构定义: name, mingw_bin, extra_cflags, msvc_build_dir
+    # 架构定义: name, mingw_bin, extra_cflags, msvc_build_dir, stub_arch_val
+    # STUB_ARCH_VAL: x86=1, x64=2（与 config.h STUB_ARCH_X86/X64 一致）
+    # STUB_TOOLCHAIN_VAL: MinGW=2（与 config.h STUB_TOOLCHAIN_MINGW 一致）
+    $stubToolchainVal = 2   # STUB_TOOLCHAIN_MINGW
     $archs = @(
         @{ Name="x64"; MingwBin="$msys\mingw64\bin"; ImageBase="0x10000";
-           ExtraCflags=@("-mno-red-zone", "-mno-sse", "-mno-sse2"); MsvcDir="build\x64" },
+           ExtraCflags=@("-mno-red-zone", "-mno-sse", "-mno-sse2"); MsvcDir="build\x64"; StubArchVal=2 },
         @{ Name="x86"; MingwBin="$msys\mingw32\bin"; ImageBase="0x10000";
-           ExtraCflags=@(); MsvcDir="build\x86" }
+           ExtraCflags=@(); MsvcDir="build\x86"; StubArchVal=1 }
     )
 
     foreach ($arch in $archs) {
@@ -167,9 +184,9 @@ function Build-InplaceMinGW {
         $gcc = Join-Path $arch.MingwBin "gcc.exe"
         $objcopy = Join-Path $arch.MingwBin "objcopy.exe"
 
+        # MinGW gcc 不存在时必须 throw（审查问题 2：不再静默 continue 跳过）
         if (-not (Test-Path $gcc)) {
-            Write-Host "    [警告] MinGW $archName gcc 不存在: $gcc，跳过" -ForegroundColor Yellow
-            continue
+            throw "MinGW $archName gcc 不存在: $gcc（必须安装 MinGW 才能构建 inplace stub，不允许静默 fallback 到 MSVC）"
         }
 
         Write-Host "======== MinGW 构建 inplace stub ($archName) ========" -ForegroundColor Cyan
@@ -181,8 +198,15 @@ function Build-InplaceMinGW {
         $exeFile = Join-Path $buildDir "stub_inplace_$archName.exe"
         $binFile = Join-Path $buildDir "stub_inplace_$archName.bin"
 
+        # 注入编译期身份字段（STUB_ARCH / STUB_TOOLCHAIN），与 CMake MSVC 路径一致
+        # 其余 5 个字段（bin_ver/build_time/source_crc/size/githash）由 POST_BUILD patch
+        $identityCflags = @(
+            "-DSTUB_ARCH=$($arch.StubArchVal)",
+            "-DSTUB_TOOLCHAIN=$stubToolchainVal"
+        )
+
         # 编译
-        $cflags = $commonCflags + $arch.ExtraCflags
+        $cflags = $commonCflags + $arch.ExtraCflags + $identityCflags
         Write-Host "    编译 $stubC ..."
         & $gcc @cflags -c $stubC -o $objFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         if ($LASTEXITCODE -ne 0) { throw "MinGW $archName 编译失败" }
@@ -203,11 +227,19 @@ function Build-InplaceMinGW {
         Write-Host "    stub_inplace_$($archName).bin: $binSize bytes" -ForegroundColor DarkGray
         Write-Host "    stub_inplace_$($archName).exe: $exeSize bytes" -ForegroundColor DarkGray
 
-        # 覆盖 MSVC 产物
+        # POST_BUILD patch 身份字段（与 CMake MSVC 路径一致）
+        Write-Host "    patch stub identity ..."
+        & $pythonExe ${root}\cmake\patch_stub_identity.py $binFile $archName MinGW $root 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) { throw "MinGW $archName patch_stub_identity 失败" }
+
+        # 覆盖 MSVC 产物（打印 SHA256 便于排查）
+        $binHash = (Get-FileHash $binFile -Algorithm SHA256).Hash
         $msvcDir = Join-Path $root $arch.MsvcDir
         if (Test-Path $msvcDir) {
             Copy-Item $binFile (Join-Path $msvcDir "stub_inplace_$($archName).bin") -Force
             Copy-Item $exeFile (Join-Path $msvcDir "stub_inplace_$($archName).exe") -Force
+            Write-Host ("    覆盖: stub_inplace_{0}.bin {1} bytes SHA256={2}..." -f `
+                $archName, $binSize, $binHash.Substring(0,16)) -ForegroundColor Cyan
             Write-Host "    已覆盖 MSVC $($arch.MsvcDir)/ 中的 inplace stub 产物" -ForegroundColor DarkGray
         }
 

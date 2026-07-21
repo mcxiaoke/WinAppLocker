@@ -30,6 +30,14 @@ static __inline__ void __winlock_sfence(void) { WINLOCK_SFENCE(); }
 #include <windows.h>
 #include "../common/config.h"
 
+/* ---- stub 身份字段：编译期注入兜底（CMake/MinGW -D 未注入时给默认 0）---- */
+#ifndef STUB_ARCH
+#define STUB_ARCH 0
+#endif
+#ifndef STUB_TOOLCHAIN
+#define STUB_TOOLCHAIN 0
+#endif
+
 /* ============================================================
  * MSVC /NODEFAULTLIB 下提供 memset/memcpy 本地实现
  *
@@ -116,6 +124,15 @@ volatile stub_data_t stub_data = {
     .reserved32    = 0,
     .orig_tls_callbacks = 0,
     .security_cookie_rva = 0,    /* builder 填充（v4）*/
+    .identity      = {
+        .stub_arch      = STUB_ARCH,        /* CMake/MinGW -D 注入，未注入则为 0 */
+        .stub_toolchain = STUB_TOOLCHAIN,   /* CMake/MinGW -D 注入，未注入则为 0 */
+        .stub_bin_ver   = STUB_BIN_VER,     /* config.h 定义，POST_BUILD 可覆盖 */
+        .stub_build_time = 0,               /* POST_BUILD patch */
+        .stub_source_crc = 0,               /* POST_BUILD patch */
+        .stub_size      = 0,                /* POST_BUILD patch */
+        .stub_githash   = { 0 },            /* POST_BUILD patch */
+    },
     .checksum      = 0,
 };
 

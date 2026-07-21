@@ -40,6 +40,20 @@
  */
 #define STUB_DATA_MAGIC 0x214B434F4C4E4957ULL
 
+/* ---- stub 身份标识常量（v5 新增）----
+ * 编译期注入（CMake/MinGW -D）：stub_arch、stub_toolchain
+ * POST_BUILD patch：stub_bin_ver、stub_build_time、stub_source_crc、stub_size、stub_githash
+ */
+#define STUB_ARCH_X86        1u
+#define STUB_ARCH_X64        2u
+#define STUB_TOOLCHAIN_MSVC  1u
+#define STUB_TOOLCHAIN_MINGW 2u
+
+/* stub 二进制版本，手动 bump：每次 stub 行为有变化时 +1 */
+#ifndef STUB_BIN_VER
+#define STUB_BIN_VER 0x0100u
+#endif
+
 /* ---- stub_entry 入口魔数（builder 搜索此值定位 stub_entry）
  * "ENTRYSTB" -> 0x45 0x4E 0x54 0x52 0x59 0x53 0x54 0x42
  * 小端 uint64: 0x42545359 52544E45
@@ -104,7 +118,7 @@
  *         builder -d 时设置；默认关闭，避免开发调试受阻
  *         检查 PEB.BeingDebugged / NtGlobalFlag & 0x70 / KdDebuggerEnabled
  */
-#define STUB_DATA_VERSION 4
+#define STUB_DATA_VERSION 5
 #define STUB_DEFAULT_MAX_RETRIES 3
 
 /* flags 位掩码 */
@@ -114,10 +128,27 @@
 #define STUB_FLAG_ASLR         0x0008  /* ASLR 启用，需重新应用 relocations */
 #define STUB_FLAG_ANTIDEBUG    0x0010  /* 启用 PEB 反调试（builder -d）*/
 
+/* ---- stub 身份块（v5 新增，32 字节，8 字节对齐）----
+ * 所有字段统一 stub_ 前缀；patch_stub_identity.py 在 POST_BUILD 阶段写入。
+ * stub_arch / stub_toolchain 由 CMake/MinGW -D 编译期注入，
+ * 其余 5 个字段由 patch_stub_identity.py 在 POST_BUILD patch。
+ */
+#pragma pack(push, 8)
+typedef struct {
+    uint32_t stub_arch;        /* 1=x86, 2=x64（编译期注入）*/
+    uint32_t stub_toolchain;   /* 1=MSVC, 2=MinGW（编译期注入）*/
+    uint32_t stub_bin_ver;     /* stub 二进制版本（POST_BUILD patch）*/
+    uint32_t stub_build_time;  /* Unix 时间戳（POST_BUILD patch）*/
+    uint32_t stub_source_crc;  /* 源码 CRC32（POST_BUILD patch）*/
+    uint32_t stub_size;        /* stub.bin 文件大小（POST_BUILD patch）*/
+    uint8_t  stub_githash[8];  /* git commit short hash ASCII（POST_BUILD patch，无 git 全 0）*/
+} stub_identity_t;
+#pragma pack(pop)
+
 #pragma pack(push, 8)
 typedef struct {
     uint64_t magic;            /* STUB_DATA_MAGIC，builder 据此定位         */
-    uint16_t version;         /* 结构版本号 (v4 = 4)                        */
+    uint16_t version;         /* 结构版本号 (v5 = 5)                        */
     uint16_t flags;           /* bit0: hash; bit1: test; bit2: tls proxy; bit3: aslr */
     uint16_t max_retries;     /* 密码错误最大重试次数                       */
     uint16_t reserved16;
@@ -141,9 +172,26 @@ typedef struct {
      *   - stub 在解密 .text 后用 img_base + rva 计算 cookie 地址
      *   - 0 表示无 LOAD_CONFIG 或无 SecurityCookie 字段，跳过初始化 */
     uint64_t security_cookie_rva; /* LOAD_CONFIG.SecurityCookie 的 RVA（0 = 无）*/
+    /* v5 新增：身份块（32 字节，放末尾、checksum 之前）
+     *   - 编译期只填 stub_arch / stub_toolchain（CMake/MinGW -D 注入）
+     *   - 其余字段初始化为 0，由 patch_stub_identity.py 在 POST_BUILD patch
+     *   - identity 字段会自动并入 checksum 的 8 字节 XOR 链 */
+    stub_identity_t identity;
     uint64_t checksum;       /* XOR 所有 64-bit 字段（防篡改）             */
 } stub_data_t;
 #pragma pack(pop)
+
+/* stub_data_t 的 sizeof，手动维护（供 Python 脚本读取，避免硬编码漂移）
+ * 当前 version=5，sizeof=320；每次结构变化时同步更新此宏和 STUB_DATA_VERSION */
+#define STUB_DATA_SIZEOF 320
+
+/* 编译期捕获 STUB_DATA_SIZEOF 与实际 sizeof 不一致
+ * 用 typedef 数组技巧而非 _Static_assert：MSVC C 模式默认标准（C89/MS 扩展）
+ * 不支持 C11 的 _Static_assert 关键字，且 stub.c 用 /Zl 不引用 CRT 无法用
+ * static_assert 宏。typedef 数组在所有编译器（MSVC/GCC/Clang）都有效，
+ * 当条件为 false 时数组大小为 -1 触发编译错误。*/
+typedef char _static_assert_stub_data_sizeof[
+    (sizeof(stub_data_t) == STUB_DATA_SIZEOF) ? 1 : -1];
 
 /* builder 和 stub 都需要 extern 声明 stub_data（stub 中定义） */
 #ifdef WINLOCK_STUB

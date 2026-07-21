@@ -53,9 +53,18 @@ add_compile_definitions(
 # ---- 按 WINLOCK_ARCH 引入对应配置（include 不创建子目录，产物直接落在 -B 指定目录）----
 # 子目录的 CMakeLists.inc 用变量 ARCH 表示架构（x64 或 x86），
 # 用变量 SUFFIX 表示文件名后缀（_x64 或 _x86）
+#
+# STUB_ARCH_VAL / STUB_TOOLCHAIN_VAL：
+#   - 编译期注入到 stub.c 的 STUB_ARCH / STUB_TOOLCHAIN 宏
+#   - 值与 common/config.h 的 STUB_ARCH_X86/X64 / STUB_TOOLCHAIN_MSVC 常量一致
+#   - 注意：CMake -D 注入的是数值（1/2），stub.c 顶部的 #ifndef 守卫避免重定义冲突
+#   - 其余身份字段（stub_bin_ver/build_time/source_crc/size/githash）由
+#     cmake/patch_stub_identity.py 在 POST_BUILD 阶段写入
 if(WINLOCK_ARCH STREQUAL "x64")
     set(ARCH "x64")
     set(SUFFIX "_x64")
+    set(STUB_ARCH_VAL 2)        # STUB_ARCH_X64
+    set(STUB_TOOLCHAIN_VAL 1)   # STUB_TOOLCHAIN_MSVC
     add_compile_definitions(_WIN64)
     include(${WINLOCK_ROOT}/inplace/CMakeLists.inc)
     include(${WINLOCK_ROOT}/reflective/CMakeLists.inc)
@@ -66,6 +75,8 @@ if(WINLOCK_ARCH STREQUAL "x64")
 elseif(WINLOCK_ARCH STREQUAL "x86")
     set(ARCH "x86")
     set(SUFFIX "_x86")
+    set(STUB_ARCH_VAL 1)        # STUB_ARCH_X86
+    set(STUB_TOOLCHAIN_VAL 1)   # STUB_TOOLCHAIN_MSVC
     include(${WINLOCK_ROOT}/inplace/CMakeLists.inc)
     include(${WINLOCK_ROOT}/reflective/CMakeLists.inc)
     message(STATUS "=== winlock_packer x86 CMake configuration complete ===")

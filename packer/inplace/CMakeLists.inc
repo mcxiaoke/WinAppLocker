@@ -1,12 +1,15 @@
 # ============================================================
 # inplace/CMakeLists.inc - inplace 模式（builder + stub）
 #
-# 由顶层 CMakeLists-x64.txt 或 CMakeLists-x86.txt include()，根据 ARCH 变量决定
-# 编译 x64 还是 x86 target。一次只编译一个架构的 stub。
+# 由顶层 CMakeLists.txt 用 include() 引入，按 WINLOCK_ARCH=x64|x86 决定编译
+# x64 还是 x86 target。一次只编译一个架构的 stub。
 #
-# 变量：
-#   ARCH    = "x64" 或 "x86"
-#   SUFFIX  = "_x64" 或 "_x86"
+# 变量（由顶层 CMakeLists.txt 设置）：
+#   ARCH              = "x64" 或 "x86"
+#   SUFFIX            = "_x64" 或 "_x86"
+#   STUB_ARCH_VAL     = 1 (x86) 或 2 (x64)，注入 STUB_ARCH 宏
+#   STUB_TOOLCHAIN_VAL = 1 (MSVC)，注入 STUB_TOOLCHAIN 宏
+#   WINLOCK_ROOT      = packer/ 目录
 #
 # 产物 target：
 #   builder_inplace           - 加壳器（不分架构，与输入 PE 解耦）
@@ -17,6 +20,7 @@
 #   2. stub target 名带 ${ARCH} 后缀（stub_inplace_x64 / stub_inplace_x86）
 #   3. stub PIC 选项与 reflective/loader PIC 选项保持一致
 #   4. x86 stub 额外 /FIXED:NO 保留 .reloc 节 + 复制 stub exe 给 builder 读
+#   5. POST_BUILD 顺序：extract .lock 节 -> patch_stub_identity.py 注入身份字段
 # ============================================================
 
 # ---- builder_inplace（加壳器） ----
@@ -39,6 +43,8 @@ add_executable(stub_inplace_${ARCH} WIN32
 target_compile_definitions(stub_inplace_${ARCH} PRIVATE
     WINLOCK_STUB
     WINLOCK_PIC
+    STUB_ARCH=${STUB_ARCH_VAL}
+    STUB_TOOLCHAIN=${STUB_TOOLCHAIN_VAL}
 )
 
 # 编译选项：
@@ -99,6 +105,19 @@ add_custom_command(TARGET stub_inplace_${ARCH} POST_BUILD
             $<TARGET_FILE:stub_inplace_${ARCH}>
             ${CMAKE_CURRENT_BINARY_DIR}/stub_inplace_${ARCH}.bin
     COMMENT "Extracting .lock sections -> stub_inplace_${ARCH}.bin"
+    VERBATIM
+)
+
+# POST_BUILD patch stub 身份字段（stub_bin_ver/stub_build_time/stub_source_crc/
+# stub_size/stub_githash）。stub_arch/stub_toolchain 已由 -D 编译期注入，脚本只校验。
+# 必须在 extract_lock_section.py 之后执行（patch 读 stub.bin），CMake POST_BUILD 按
+# 声明顺序执行，所以这里顺序正确。dev 路径（cmake --build）和 dist 路径都会执行。
+add_custom_command(TARGET stub_inplace_${ARCH} POST_BUILD
+    COMMAND ${Python3_EXECUTABLE}
+            ${WINLOCK_ROOT}/cmake/patch_stub_identity.py
+            ${CMAKE_CURRENT_BINARY_DIR}/stub_inplace_${ARCH}.bin
+            ${ARCH} MSVC ${WINLOCK_ROOT}
+    COMMENT "Patching stub identity -> stub_inplace_${ARCH}.bin"
     VERBATIM
 )
 
