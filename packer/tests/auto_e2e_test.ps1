@@ -3,15 +3,20 @@
 # 用法：powershell -File auto_e2e_test.ps1
 #       powershell -File auto_e2e_test.ps1 -SkipReflective  # 只测 inplace
 #       powershell -File auto_e2e_test.ps1 -SkipInplace     # 只测 reflective
+#       powershell -File auto_e2e_test.ps1 -IncludeTestMode # 同时测 -t 模式（默认跳过）
 #       powershell -File auto_e2e_test.ps1 -SkipPassword    # 只测 -t 模式
-#       powershell -File auto_e2e_test.ps1 -SkipTestMode    # 只测 -p 模式
+#       powershell -File auto_e2e_test.ps1 -ExternalSamples C:\path\to\bigapps
+#                                                         # 追加外部样本目录
 
 param(
     [switch]$SkipInplace,
     [switch]$SkipReflective,
-    [switch]$SkipTestMode,
+    # 默认跳过 test 模式（-t）：自动输入密码已稳定，password 模式覆盖更全
+    # 显式用 -IncludeTestMode 开启 test 模式测试
+    [switch]$IncludeTestMode,
     [switch]$SkipPassword,
-    [int]$GuiTimeoutSec = 12
+    [int]$GuiTimeoutSec = 12,
+    [string]$ExternalSamples = ""  # 外部样本目录（如 temp\bigapps），自动扫描子目录中的 .exe
 )
 
 $ErrorActionPreference = "Continue"
@@ -224,6 +229,52 @@ $testSamples = @(
     @{ Name="DontSleep.exe";    Type="GUI"; TestExpect="window";       PwdExpect="window" }
 )
 
+# ---- 追加外部样本（-ExternalSamples）----
+# 扫描指定目录下每个子目录中的主 .exe（每个子目录视为一个应用）
+# 外部样本默认 Type=GUI，TestExpect/PwdExpect="window"（只要窗口出现即可）
+# 通过 SamplePath 指定完整路径（不依赖 $samples 目录）
+# 外部样本因有 DLL/资源依赖，加壳产物必须放在原 exe 同目录（IsExternal=$true）
+if ($ExternalSamples -and (Test-Path $ExternalSamples)) {
+    Write-Host "==== 扫描外部样本目录: $ExternalSamples ====" -ForegroundColor Cyan
+    # 用 -ExternalSamples 时跳过内置 samples（避免重复测试，聚焦外部样本）
+    $testSamples = @()
+    Get-ChildItem -Path $ExternalSamples -Directory | ForEach-Object {
+        $appDir = $_.FullName
+        $appName = $_.Name
+        # 找目录下的 .exe（排除明显的辅助 exe 如 vlc-cache-gen.exe, KCrashReporter 等）
+        $exes = Get-ChildItem -Path $appDir -Filter "*.exe" -File -ErrorAction SilentlyContinue
+        if ($exes.Count -eq 0) { return }
+        # 过滤辅助 exe 和测试产物：
+        #   辅助 exe：cache/crash/report/updater/uninstall/helper/setup/texconv/exiftool/twain/gup
+        #   测试产物：_refl/_inplace/_password 后缀（之前的加壳产物）
+        #   关联工具：Associate（如 XnViewMP 的文件关联设置工具）
+        $mainExes = $exes | Where-Object {
+            $n = $_.BaseName.ToLower()
+            -not ($n -match 'cache|crash|report|updater|uninstall|helper|setup|texconv|exiftool|twain|gup') -and
+            -not ($n -match '_refl$|_inplace$|_password$|_test$') -and
+            -not ($n -match '^associate')
+        }
+        # 优先选择与目录名匹配的 exe（如 vlc-x64 目录 -> vlc.exe）
+        # 其次选第一个过滤后的 exe
+        $targetExe = $mainExes | Where-Object {
+            $_.BaseName -match $appName -or $appName -match $_.BaseName
+        } | Select-Object -First 1
+        if (-not $targetExe) { $targetExe = $mainExes | Select-Object -First 1 }
+        if (-not $targetExe) { $targetExe = $exes | Select-Object -First 1 }
+        if ($targetExe) {
+            $testSamples += @{
+                Name       = "$appName/$($targetExe.Name)"
+                Type       = "GUI"
+                TestExpect = "window"
+                PwdExpect  = "window"
+                SamplePath = $targetExe.FullName  # 完整路径，Pack-Sample 优先用此字段
+                IsExternal = $true                 # 外部样本：加壳产物放原目录
+            }
+            Write-Host "  + $appName -> $($targetExe.Name)" -ForegroundColor DarkGray
+        }
+    }
+}
+
 $results = @()
 
 function Pack-Sample {
@@ -232,9 +283,15 @@ function Pack-Sample {
         [string]$SampleName,
         [string]$OutPath,
         [string]$Password,  # $null 表示 -t 测试模式
-        [switch]$TestMode
+        [switch]$TestMode,
+        [string]$SamplePath = ""  # 外部样本完整路径（优先于 $samples/$SampleName）
     )
-    $srcExe = Join-Path $samples $SampleName
+    # 外部样本用 SamplePath，内置样本用 $samples/$SampleName
+    if ($SamplePath) {
+        $srcExe = $SamplePath
+    } else {
+        $srcExe = Join-Path $samples $SampleName
+    }
     if (-not (Test-Path $srcExe)) { return @{ ok=$false; rc=-1; out="sample not found" } }
 
     # 清理旧输出文件：上次测试可能残留进程占用 exe 文件
@@ -327,8 +384,17 @@ function Test-One {
 
     $sampleName = $Sample.Name
     $tag = "${Mode}_${PasswordMode}"
-    $outName = $sampleName -replace '\.exe$', "_${tag}.exe"
-    $outPath = Join-Path $work $outName
+    # 外部样本 Name 可能含斜杠（如 "vlc-x64/vlc.exe"），清理成文件名安全的字符串
+    $safeName = $sampleName -replace '[\\/]', '_'
+    $outName = $safeName -replace '\.exe$', "_${tag}.exe"
+    # 外部样本：加壳产物放原 exe 同目录（访问 DLL/资源依赖）
+    # 内置样本：统一放 $work 目录
+    if ($Sample.IsExternal -and $Sample.SamplePath) {
+        $srcDir = Split-Path -Parent $Sample.SamplePath
+        $outPath = Join-Path $srcDir $outName
+    } else {
+        $outPath = Join-Path $work $outName
+    }
     # 注意：不能用 $pwd，它是 PowerShell 自动变量（当前工作目录）
     $testPwd = "hello123"
 
@@ -347,7 +413,7 @@ function Test-One {
     # 1. 加壳
     Write-Host "[1/3] 加壳 ($Mode, $PasswordMode)..."
     $isTest = ($PasswordMode -eq "test")
-    $pack = Pack-Sample -Mode $Mode -SampleName $sampleName -OutPath $outPath -Password $testPwd -TestMode:$isTest
+    $pack = Pack-Sample -Mode $Mode -SampleName $sampleName -OutPath $outPath -Password $testPwd -TestMode:$isTest -SamplePath $Sample.SamplePath
     if (-not $pack.ok) {
         Write-Host "[FAIL] 加壳失败 (rc=$($pack.rc))" -ForegroundColor Red
         return @{ tag=$tag; sample=$sampleName; result="PACK_FAIL"; detail="rc=$($pack.rc)" }
@@ -443,13 +509,21 @@ function Test-One {
                 }
                 $wins = [AutoE2E]::VisibleWindowsOfPID([uint32]$rootPid, $PwdDialogTitle)
                 if ($wins.Count -gt 0) {
+                    # 完整打印所有可见窗口标题，方便调试
+                    foreach ($w in $wins) {
+                        Write-Host ("      窗口: {0}" -f $w) -ForegroundColor DarkGray
+                    }
                     $winInfo = $wins[0]
-                    Write-Host ("      窗口已出现: {0}" -f $winInfo) -ForegroundColor DarkGray
-                    if ($winInfo -notmatch 'error') {
-                        $found = $true
+                    # 错误窗口关键字匹配（中英文）：
+                    #   error/fault/fail/crash/exception/abort（英文）
+                    #   错误/失败/崩溃/异常（中文）
+                    #   could not be started（.NET 框架错误对话框）
+                    # 不区分大小写
+                    if ($winInfo -match 'error|fault|fail|crash|exception|abort|could not|错误|失败|崩溃|异常') {
+                        $errTitle = $true
                         break
                     } else {
-                        $errTitle = $true
+                        $found = $true
                         break
                     }
                 }
@@ -485,7 +559,9 @@ if (-not $SkipInplace) { $modes += "inplace" }
 if (-not $SkipReflective) { $modes += "reflective" }
 
 $pwdModes = @()
-if (-not $SkipTestMode) { $pwdModes += "test" }
+# 默认跳过 test 模式（自动输入密码已稳定，password 模式覆盖更全）
+# 显式 -IncludeTestMode 才测 test 模式
+if ($IncludeTestMode) { $pwdModes += "test" }
 if (-not $SkipPassword) { $pwdModes += "password" }
 
 foreach ($mode in $modes) {

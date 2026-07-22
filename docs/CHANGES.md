@@ -1,5 +1,47 @@
 # 变更记录
 
+## 2026-07-22 20:30 e2e 测试改进：默认跳过 test 模式 + 支持外部样本
+
+### 改进
+
+[packer/tests/auto_e2e_test.ps1](file:///C:/Home/Projects/applocker/packer/tests/auto_e2e_test.ps1)：
+
+1. **默认跳过 test 模式**：`-SkipTestMode` 改为 `-IncludeTestMode`
+   - 原因：自动输入密码已稳定，password 模式覆盖更全
+   - 默认只测 password 模式，测试数从 36 降到 18，加快速度
+   - 显式 `-IncludeTestMode` 可恢复 test 模式测试
+
+2. **新增 `-ExternalSamples` 参数**：支持外部样本目录
+   - 自动扫描子目录中的主 exe（过滤辅助 exe 和测试产物）
+   - 外部样本加壳产物放原 exe 同目录（访问 DLL/资源依赖）
+   - 用 `-ExternalSamples` 时自动跳过内置 samples
+   - 智能选择主 exe：优先选与目录名匹配的 exe
+
+3. **窗口错误匹配增强**：
+   - 加中文关键字：错误/失败/崩溃/异常
+   - 加英文关键字：fault/abort/could not
+   - 完整打印所有可见窗口标题（方便调试）
+
+### bigapps 测试结果（temp/bigapps，8 个应用）
+
+| 应用 | inplace | reflective |
+|------|---------|------------|
+| CC-Switch | PASS | CRASH (0xC0000409) |
+| CCleaner | CRASH (exit=0，主进程退出子进程留窗口) | CRASH (0xC0000409) |
+| notepad++ | PASS | CRASH (0xC0000409, COMCTL32 按序号导入失败) |
+| ShanaEncoder | PACK_FAIL (.NET 不支持) | ERROR_WINDOW (.NET 框架报错) |
+| SQLiteStudio | PASS | PASS |
+| vlc-x64 | PASS | PASS |
+| vlc-x86 | PASS | PASS |
+| XnViewMP | PASS | PASS |
+
+reflective 的 0xC0000409 崩溃：日志显示 COMCTL32 按序号导入失败（err=182，
+actctx 激活在 IAT 解析之后），notepad++ CRT 初始化调用 NULL 指针导致 AV。
+这是 reflective loader 的已知复杂场景问题，待后续改进 actctx 时机。
+
+inplace CCleaner exit=0：CCleaner 主进程启动子进程后正常退出，e2e 误判为
+CRASH。需改进 e2e 对子进程窗口的检测逻辑。
+
 ## 2026-07-22 19:20 修复所有编译警告（clean build 零警告）
 
 清理 MSVC + MinGW 的全部编译警告，clean build 现在零警告。
