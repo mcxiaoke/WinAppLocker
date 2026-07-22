@@ -1,5 +1,36 @@
 # 变更记录
 
+## 2026-07-22 23:50 reflective CC-Switch TLS directory 修复
+
+### 修复
+
+**CC-Switch（Rust/Tauri）reflective 模式输入密码后 0xC0000409 崩溃**
+
+根因：reflective stub 用 `/NODEFAULTLIB /ENTRY:loader_main` 编译，没有 CRT，
+因此链接器看不到 `_tls_used` 符号，stub PE **完全没有 TLS directory**（DataDirectory[9] RVA=0）。
+后果：
+- `.CRT$XLB` 节里的 `tls_callback_proxy`（已注册）**永远不会被 ntdll 调用**
+- 新线程创建时 `TLP[0]` 指向 stub 的 8 字节 TLS 块
+- 目标 PE 的线程入口函数（Rust std::thread）读取 `TLP[0]+480` 偏移，越界读到垃圾数据
+- Rust std::thread 检测到非零值，触发 `__fastfail(7)` → `int 29h` → 0xC0000409
+
+修复（在 [packer/reflective/loader.c](file:///C:/Home/Projects/applocker/packer/reflective/loader.c)）：
+- 手动定义 `_tls_used`（`IMAGE_TLS_DIRECTORY`）结构并初始化所有字段
+  （`AddressOfIndex`、`AddressOfCallBacks` 指向 `g_tls_cb_array`）
+- 用 `#pragma comment(linker, "/INCLUDE:_tls_used")` 强制保留（x86 cdecl 装饰为 `__tls_used`）
+- 配合 [packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c)
+  的方案 A：扩展 stub 的 TLS `SizeOfZeroFill` 到目标 PE 的 TLS 大小
+
+配套修改（[packer/common/winlock_compat.h](file:///C:/Home/Projects/applocker/packer/common/winlock_compat.h)）：
+- 新增 `WINLOCK_SECTION_CRT_XLA/XLZ` 宏（callback 数组边界 NULL）
+- 新增 `WINLOCK_SECTION_TLS_DIR` 宏（`_tls_used` 节区）
+
+### 验证
+
+- 标准 e2e（inplace + reflective，password 模式）：**18/18 PASS**
+- CC-Switch（bigapps）reflective 模式：**PASS**（窗口 "CC Switch" 正常显示）
+- loader 日志确认 TLS callback proxy 被正确调用（reason=2 THREAD_ATTACH / reason=3 THREAD_DETACH）
+
 ## 2026-07-22 22:00 reflective 0xC0000409 修复 + .NET reject + e2e 日志
 
 ### 修复

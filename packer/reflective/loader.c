@@ -1546,6 +1546,50 @@ static void NTAPI tls_callback_proxy(PVOID hModule, DWORD reason, PVOID ctx) {
 WINLOCK_SECTION_CRT_XLB
 static const PIMAGE_TLS_CALLBACK g_tls_cb_ptr = tls_callback_proxy;
 
+/* ---- 手动定义 TLS directory（/NODEFAULTLIB 下无 CRT 的 _tls_used）----
+ *
+ * 问题：stub 用 /NODEFAULTLIB 编译，没有 CRT 定义的 _tls_used 符号，
+ *   链接器不生成 TLS directory（DataDirectory[9]=0），.CRT$XLB 里的
+ *   g_tls_cb_ptr 不会被 ntdll 调用。新线程创建时 TLS callback proxy 不
+ *   被调用，目标 PE 的 TLS 数据块不会被分配，Rust std::thread 等检查
+ *   TLS 标志的代码崩溃（__fastfail(7) / 0xC0000409）。
+ *
+ * 修复：手动定义 _tls_used（IMAGE_TLS_DIRECTORY）+ TLS callback 数组。
+ *   - _tls_used：IMAGE_TLS_DIRECTORY 结构，link.exe 看到它后设置 DataDirectory[9]
+ *   - g_tls_cb_array：callback 数组 {tls_callback_proxy, NULL}
+ *   - g_tls_index：TlsIndex 变量（stub 用 index 0）
+ *   - StartAddressOfRawData/EndAddressOfRawData = 0（stub 无 TLS 数据模板）
+ *   - SizeOfZeroFill：builder_reflective.c 会扩展到目标 PE 的 TLS 大小
+ *
+ * 方案 A（builder 扩展 SizeOfZeroFill）：OS 为新线程分配足够大的 TLS 块
+ * 方案 B（TLS callback proxy）：proxy 为新线程分配目标 PE 的 TLS 模板数据
+ * 两者互为保险，任一生效即可避免越界。
+ */
+static DWORD g_tls_index = 0;                         /* stub 的 TLS index（=0）*/
+static const PIMAGE_TLS_CALLBACK g_tls_cb_array[] = { /* callback 数组 */
+    tls_callback_proxy,
+    NULL
+};
+
+WINLOCK_SECTION_TLS_DIR
+IMAGE_TLS_DIRECTORY_X _tls_used = {
+    0,                                                /* StartAddressOfRawData（stub 无 TLS 数据）*/
+    0,                                                /* EndAddressOfRawData */
+    (ULONG_PTR)&g_tls_index,                          /* AddressOfIndex */
+    (ULONG_PTR)g_tls_cb_array,                        /* AddressOfCallBacks */
+    0,                                                /* SizeOfZeroFill（builder 扩展）*/
+    0                                                 /* Characteristics */
+};
+
+#ifdef _MSC_VER
+/* 强制链接器保留 _tls_used（x64 符号名 _tls_used，x86 cdecl 装饰为 __tls_used）*/
+#ifdef _WIN64
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#else
+#pragma comment(linker, "/INCLUDE:__tls_used")
+#endif
+#endif
+
 static int init_tls_data(uint8_t* img, uint64_t preferred_base) {
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
     IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(img + dos->e_lfanew);

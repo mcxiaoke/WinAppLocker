@@ -18,6 +18,11 @@
   #define WINLOCK_SECTION_TLSCBM  __pragma(const_seg(".lock$tlscbm")) __declspec(align(16))
   #define WINLOCK_SECTION_TLSCB   __pragma(code_seg(".lock$tlscb")) __declspec(noinline)
   #define WINLOCK_SECTION_CRT_XLB __pragma(section(".CRT$XLB", read)) __declspec(allocate(".CRT$XLB"))
+  /* TLS callback 数组边界（XLA=起始 NULL, XLZ=结束 NULL），让链接器合并 .CRT$XLA<XLB<XLZ */
+  #define WINLOCK_SECTION_CRT_XLA __pragma(section(".CRT$XLA", read)) __declspec(allocate(".CRT$XLA"))
+  #define WINLOCK_SECTION_CRT_XLZ __pragma(section(".CRT$XLZ", read)) __declspec(allocate(".CRT$XLZ"))
+  /* TLS directory 结构节（_tls_used 放这里，链接器据此设置 DataDirectory[9]） */
+  #define WINLOCK_SECTION_TLS_DIR __pragma(section(".rdata$T", read)) __declspec(allocate(".rdata$T"))
   #define WINLOCK_UNREACHABLE()   __assume(0)
   #define WINLOCK_NOINLINE        __declspec(noinline)
   #define WINLOCK_USED            /* MSVC 不需要 used 属性 */
@@ -34,6 +39,11 @@
   #define WINLOCK_SECTION_TLSCBM  __attribute__((section(".lock.tlscbm"), used, aligned(16)))
   #define WINLOCK_SECTION_TLSCB   __attribute__((section(".lock.tlscb"), used, noinline))
   #define WINLOCK_SECTION_CRT_XLB __attribute__((section(".CRT$XLB"), used))
+  /* TLS callback 数组边界（XLA=起始 NULL, XLZ=结束 NULL），让链接器合并 .CRT$XLA<XLB<XLZ */
+  #define WINLOCK_SECTION_CRT_XLA __attribute__((section(".CRT$XLA"), used))
+  #define WINLOCK_SECTION_CRT_XLZ __attribute__((section(".CRT$XLZ"), used))
+  /* TLS directory 结构节（_tls_used 放这里，链接器据此设置 DataDirectory[9]） */
+  #define WINLOCK_SECTION_TLS_DIR __attribute__((section(".rdata$T"), used))
   #define WINLOCK_UNREACHABLE()   __builtin_unreachable()
   #define WINLOCK_NOINLINE        __attribute__((noinline))
   #define WINLOCK_USED            __attribute__((used))

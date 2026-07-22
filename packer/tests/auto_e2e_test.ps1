@@ -250,13 +250,13 @@ if ($ExternalSamples -and (Test-Path $ExternalSamples)) {
         $exes = Get-ChildItem -Path $appDir -Filter "*.exe" -File -ErrorAction SilentlyContinue
         if ($exes.Count -eq 0) { return }
         # 过滤辅助 exe 和测试产物：
-        #   辅助 exe：cache/crash/report/updater/uninstall/helper/setup/texconv/exiftool/twain/gup
-        #   测试产物：_refl/_inplace/_password 后缀（之前的加壳产物）
+        #   辅助 exe：tmp|cache/crash/report/updater/uninstall/helper/setup/texconv/exiftool/twain/gup
+        #   测试产物：_locked/_refl/_inplace/_password 后缀（之前的加壳产物）
         #   关联工具：Associate（如 XnViewMP 的文件关联设置工具）
         $mainExes = $exes | Where-Object {
             $n = $_.BaseName.ToLower()
-            -not ($n -match 'cache|crash|report|updater|uninstall|helper|setup|texconv|exiftool|twain|gup') -and
-            -not ($n -match '_refl$|_inplace$|_password$|_test$') -and
+            -not ($n -match 'tmp|cache|crash|report|updater|uninstall|helper|setup|texconv|exiftool|twain|gup') -and
+            -not ($n -match '_locked$|_refl$|_inplace$|_password$|_test$') -and
             -not ($n -match '^associate')
         }
         # 优先选择与目录名匹配的 exe（如 vlc-x64 目录 -> vlc.exe）
@@ -502,6 +502,7 @@ function Test-One {
                 }
             }
 
+            Start-Sleep -Milliseconds 1000
             # 等待主窗口出现：500ms 一次轮询，比 1s 更快
             # 用 AutoE2E.VisibleWindowsOfPID 直接查可见顶级窗口（排除密码框）
             $deadline = (Get-Date).AddSeconds($GuiTimeoutSec)
