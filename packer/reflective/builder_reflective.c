@@ -336,15 +336,30 @@ int main(int argc, char* argv[]) {
     /* 密码确定逻辑（v2: 强制加密，必须指定密码或 test 模式）：
      *   - test_mode 优先：固定 "test123"，忽略 -p
      *   - 否则用 -p 指定的密码
-     *   - 都没指定：报错退出（不再支持 v1 明文模式）*/
+     *   - 都没指定：报错退出（不再支持 v1 明文模式）
+     * CP_UTF8：与 stub 端 utf16le_to_utf8 一致，避免非 ASCII 密码 hash 不匹配 */
     wchar_t password[64];
     if (test_mode) {
-        MultiByteToWideChar(CP_ACP, 0, "test123", -1, password, 63);
+        /* S2: 测试模式使用硬编码密码 'test123'，仅适合 CI/自动化。
+         * 交互式调用时提示用户确认，避免误用于生产环境。
+         * 非交互式（stdin 非 TTY，如脚本调用）跳过确认。 */
+        if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
+            printf("[!] WARNING: Test mode uses hardcoded password 'test123'.\n");
+            printf("[!]          NOT secure for production. Continue? [y/N] ");
+            fflush(stdout);
+            char buf[16];
+            if (!fgets(buf, sizeof(buf), stdin)) return 1;
+            if (buf[0] != 'y' && buf[0] != 'Y') {
+                printf("[-] Aborted by user.\n");
+                return 1;
+            }
+        }
+        MultiByteToWideChar(CP_UTF8, 0, "test123", -1, password, 63);
         password[63] = 0;
         pwd_arg = NULL;  /* test_mode 忽略 -p */
         printf("[+] TEST MODE: using hardcoded 'test123' (no dialog)\n");
     } else if (pwd_arg) {
-        int n = MultiByteToWideChar(CP_ACP, 0, pwd_arg, -1, password, 63);
+        int n = MultiByteToWideChar(CP_UTF8, 0, pwd_arg, -1, password, 63);
         if (n <= 0) {
             printf("[-] Invalid password (conversion failed)\n");
             return 1;
@@ -353,7 +368,7 @@ int main(int argc, char* argv[]) {
         printf("[+] Password mode: payload will be XTEA-encrypted\n");
     } else {
         /* v2: 无密码时用默认密码（不报错，保持易用性）*/
-        MultiByteToWideChar(CP_ACP, 0, "hello123", -1, password, 63);
+        MultiByteToWideChar(CP_UTF8, 0, "hello123", -1, password, 63);
         password[63] = 0;
         printf("[+] No password specified, using default 'hello123'\n");
     }

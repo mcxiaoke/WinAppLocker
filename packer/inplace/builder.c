@@ -580,14 +580,29 @@ int main(int argc, char* argv[]) {
         out_path = auto_out_path;
     }
 
-    /* 密码：测试模式固定为 "test123"，否则用 -p 或默认值 */
+    /* 密码：测试模式固定为 "test123"，否则用 -p 或默认值
+     * CP_UTF8：与 stub 端 utf16le_to_utf8 一致，避免非 ASCII 密码 hash 不匹配 */
     wchar_t password[64];
     if (test_mode) {
-        MultiByteToWideChar(CP_ACP, 0, "test123", -1, password, 63);
+        /* S2: 测试模式使用硬编码密码 'test123'，仅适合 CI/自动化。
+         * 交互式调用时提示用户确认，避免误用于生产环境。
+         * 非交互式（stdin 非 TTY，如脚本调用）跳过确认。 */
+        if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
+            printf("[!] WARNING: Test mode uses hardcoded password 'test123'.\n");
+            printf("[!]          NOT secure for production. Continue? [y/N] ");
+            fflush(stdout);
+            char buf[16];
+            if (!fgets(buf, sizeof(buf), stdin)) return 1;
+            if (buf[0] != 'y' && buf[0] != 'Y') {
+                printf("[-] Aborted by user.\n");
+                return 1;
+            }
+        }
+        MultiByteToWideChar(CP_UTF8, 0, "test123", -1, password, 63);
         password[63] = 0;
         pwd_arg = NULL;  /* 测试模式忽略 -p */
     } else if (pwd_arg) {
-        int n = MultiByteToWideChar(CP_ACP, 0, pwd_arg, -1, password, 63);
+        int n = MultiByteToWideChar(CP_UTF8, 0, pwd_arg, -1, password, 63);
         if (n <= 0) {
             printf("[-] Invalid password (conversion failed)\n");
             return 1;

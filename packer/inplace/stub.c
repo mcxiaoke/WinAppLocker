@@ -916,10 +916,6 @@ fail_raw:
  *   做，实际兼容性良好。详见 docs/packer_code_review-20260720.md Bug #6。
  * ============================================================ */
 
-/* stub_tls_callback 状态：保留用于未来扩展（当前未使用）*/
-WINLOCK_SECTION_DATA
-static volatile int g_tls_decrypted = 0;
-
 /* ============================================================
  * stub_tls_callback + g_stub_tls_cb_marker 的定义（MinGW 路径）
  *

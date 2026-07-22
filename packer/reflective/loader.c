@@ -588,16 +588,17 @@ static void reserve_preferred_base_region(void) {
 
     /* 3. 用 payload 头里的字段读 preferred_base 和 SizeOfImage
      *    v2 强制加密：payload_data 是密文，PE 头无法直接读取，
-     *    builder 已把 ImageBase / SizeOfImage 写入 payload 头。 */
+     *    builder 已把 ImageBase / SizeOfImage 写入 payload 头。
+     *    直接信任 hdr->image_base（已有 size_of_image 合理性校验兜底）。 */
     uint64_t preferred_base = hdr->image_base;
     SIZE_T size_of_image = hdr->size_of_image;
     /* 如果 size_of_image 无效（防御性），用保守值 */
     if (size_of_image == 0 || size_of_image > 64 * 1024 * 1024) {
         size_of_image = 2 * 1024 * 1024;  /* 2MB，覆盖大多数 PE */
     }
-    /* 如果 image_base 不是常见值，跳过（避免浪费地址空间） */
-    if (preferred_base != 0x400000 && preferred_base != 0x10000
-        && preferred_base != 0x140000000 && preferred_base != 0x180000000) {
+    /* image_base 合法性校验：必须在用户态合法区间，且 4KB 对齐
+     * 不再硬编码几个魔法值白名单，直接信任 builder 写入的值 */
+    if (preferred_base < 0x10000 || preferred_base > 0x7FFFFFFFFFFF0000ULL) {
         return;
     }
 
@@ -1779,43 +1780,6 @@ static void patch_peb_ldr_main_entry(void* new_img) {
     entry->SizeOfImage = nt->OptionalHeader.SizeOfImage;
     /* TimeDateStamp / HashLinks 等字段在 +0x80 之后，对 LdrFindResource_U
      * 不是必须的，跳过（AlushPacker 也只更新上述 4 个字段就够用） */
-
-    /* ---- 诊断：测试 patch 后 FindResource 能否找到 DontSleep 的 "AAAA_UNICODE.TMP" 资源 ----
-     * DontSleep 的 "language file string archive" 是 PE 资源中的 PNG 类型 + 名为
-     * "AAAA_UNICODE.TMP" 的项（伪装成 PNG，实际是文本档）。
-     * 如果 patch 后 FindResource 失败，说明 PEB.Ldr patch 不完整或资源目录有问题。
-     * 注意：这里调用的是 kernel32!FindResourceW，内部走 LdrFindResource_U，
-     *      与 DontSleep 实际用的 API 一致，所以测试结果有代表性。 */
-    {
-        HRSRC hr = FindResourceW((HMODULE)new_img, L"AAAA_UNICODE.TMP", L"PNG");
-        if (hr) {
-            DWORD sz = SizeofResource((HMODULE)new_img, hr);
-            HGLOBAL hg = LoadResource((HMODULE)new_img, hr);
-            DBG("peb: diag FindResource(AAAA_UNICODE.TMP, PNG) OK: size=%lu, handle=%p\n",
-                (unsigned long)sz, (void*)hg);
-            if (hg) {
-                void* p = LockResource(hg);
-                DBG("peb: diag   ptr=%p, head=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                    p,
-                    ((uint8_t*)p)[0], ((uint8_t*)p)[1], ((uint8_t*)p)[2], ((uint8_t*)p)[3],
-                    ((uint8_t*)p)[4], ((uint8_t*)p)[5], ((uint8_t*)p)[6], ((uint8_t*)p)[7]);
-            }
-        } else {
-            DWORD err = GetLastError();
-            DBG("peb: diag FindResource(AAAA_UNICODE.TMP, PNG) FAILED: err=%lu\n",
-                (unsigned long)err);
-            /* 也测下标准 RT_STRING (id=6) */
-            HRSRC hr2 = FindResourceW((HMODULE)new_img, MAKEINTRESOURCEW(6), MAKEINTRESOURCEW(6));
-            DWORD err2 = GetLastError();
-            DBG("peb: diag FindResource(RT_STRING=6, id=6) %s err=%lu\n",
-                hr2 ? "OK" : "FAILED", (unsigned long)err2);
-            /* 测下 RT_MANIFEST (id=24) */
-            HRSRC hr3 = FindResourceW((HMODULE)new_img, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24));
-            DWORD err3 = GetLastError();
-            DBG("peb: diag FindResource(RT_MANIFEST=24, id=1) %s err=%lu\n",
-                hr3 ? "OK" : "FAILED", (unsigned long)err3);
-        }
-    }
 }
 
 /* ---- 从内存 PE 提取 RT_MANIFEST 资源并创建 activation context ----
