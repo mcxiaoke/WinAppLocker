@@ -384,6 +384,25 @@ int main(int argc, char* argv[]) {
            info.size_of_image, info.entry_rva,
            info.subsystem, subsys_str);
 
+    /* 检测 .NET CLR（DataDirectory[14] = IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR）
+     * .NET 托管 PE 无法用 reflective loader 加载（CLR 需要系统加载器初始化） */
+    {
+        IMAGE_NT_HEADERS64* nt_hdr = (IMAGE_NT_HEADERS64*)(in_pe + ((IMAGE_DOS_HEADER*)in_pe)->e_lfanew);
+        IMAGE_DATA_DIRECTORY* clr_dir;
+        if (info.machine == IMAGE_FILE_MACHINE_I386) {
+            clr_dir = &((IMAGE_NT_HEADERS32*)nt_hdr)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
+        } else {
+            clr_dir = &nt_hdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
+        }
+        if (clr_dir->VirtualAddress != 0 && clr_dir->Size != 0) {
+            printf("[-] .NET CLR detected (COM_DESCRIPTOR VA=0x%x Size=0x%x)\n",
+                   clr_dir->VirtualAddress, clr_dir->Size);
+            printf("    .NET managed PE cannot be packed by reflective loader (CLR needs system loader init)\n");
+            free(in_pe);
+            return 1;
+        }
+    }
+
     /* 3. 决定 stub 路径
      *    用户没指定时按输入 PE 架构选默认 stub */
     if (!user_specified_stub) {

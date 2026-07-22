@@ -28,6 +28,11 @@ $work = "$packerRoot\temp\auto_e2e_result"
 $inplaceBuilder = "$dist\builder_inplace.exe"
 $reflectiveBuilder = "$dist\builder_reflective.exe"
 
+# 日志文件：同时输出到控制台和日志文件（Start-Transcript 捕获所有 Write-Host 输出）
+$logFile = "$work\auto_e2e_test.log"
+if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
+Start-Transcript -Path $logFile -Force | Out-Null
+
 # 密码对话框标题（inplace 和 reflective 通用）
 $PwdDialogTitle = "WinLock - Password Required"
 
@@ -255,9 +260,9 @@ if ($ExternalSamples -and (Test-Path $ExternalSamples)) {
             -not ($n -match '^associate')
         }
         # 优先选择与目录名匹配的 exe（如 vlc-x64 目录 -> vlc.exe）
-        # 其次选第一个过滤后的 exe
+        # 用 -like 通配符匹配，避免正则量词错误（如 notepad++ 的 + 号）
         $targetExe = $mainExes | Where-Object {
-            $_.BaseName -match $appName -or $appName -match $_.BaseName
+            $_.BaseName -like "*$appName*" -or $appName -like "*$($_.BaseName)*"
         } | Select-Object -First 1
         if (-not $targetExe) { $targetExe = $mainExes | Select-Object -First 1 }
         if (-not $targetExe) { $targetExe = $exes | Select-Object -First 1 }
@@ -590,4 +595,6 @@ $skip = @($results | Where-Object { $_.result -eq "SKIP" }).Count
 $fail = @($results | Where-Object { $_.result -ne "PASS" -and $_.result -ne "SKIP" }).Count
 Write-Host ""
 Write-Host ("TOTAL: {0} pass / {1} fail / {2} skip / {3} total" -f $pass, $fail, $skip, $results.Count) -ForegroundColor $(if ($fail -eq 0) {"Green"} else {"Red"})
+Write-Host "日志文件: $logFile" -ForegroundColor DarkGray
+Stop-Transcript | Out-Null
 exit $fail

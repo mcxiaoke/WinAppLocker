@@ -2214,9 +2214,19 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     }
 
     /* 4.6 激活原 PE 的 manifest（解决 comctl32 v6 等 SxS 依赖）
-     * 移到 IAT 和 TLS 之后执行，避免在 PEB 刚修改后立即调用 CreateActCtxA
-     * 导致某些加壳程序（DontSleep）在 ntdll 内部崩溃。
-     * 对于大多数程序，comctl32 函数名在 v5/v6 中一致，延迟激活不影响 IAT 解析。 */
+     *
+     * 必须在 IAT 解析之前激活：COMCTL32 有 v5/v6 两个版本，按序号导入时
+     * v5 和 v6 的序号映射不同。notepad++/CCleaner 等 manifest 指定 comctl32 v6，
+     * 如果 actctx 在 IAT 之后才激活，LoadLibraryA("COMCTL32.dll") 加载的是 v5，
+     * 按序号导入（如 #381 #345）会失败（err=182 ERROR_INVALID_ORDINAL），
+     * IAT 条目被设为 NULL，CRT 初始化调用 NULL 指针 → 0xC0000409。
+     *
+     * 安全性：此时 PEB.Ldr 主 EXE 条目仍指向 stub 原始 MAPPED view（patch 在
+     * step 10.5），CreateActCtxA 内部的 ntdll!RtlpLoadNlsData 能正确查找
+     * locale 文件映射地址。 */
+    DBG("map: about to activate manifest (before IAT)...\n");
+    activate_manifest_from_image(new_img);
+    DBG("map: manifest activation done\n");
 
     /* 5. 处理 IAT */
     DBG("map: about to process_iat...\n");
@@ -2252,25 +2262,13 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
      * 导致动态 IAT 解析被跳过（FastCopy/Bandizip 的 call NULL 问题） */
     init_tls_data(new_img, preferred_base);
 
-    /* 9. 调用 TLS callbacks（actctx 已在 4.6 激活，TLS 数据已初始化） */
+    /* 9. 调用 TLS callbacks（actctx 已在 step 4.6 激活，TLS 数据已初始化） */
     DBG("map: about to run TLS callbacks...\n");
     run_tls_callbacks(new_img);
     DBG("map: TLS callbacks done\n");
 
-    /* 10. 激活 manifest（必须在 patch_peb_ldr_main_entry 之前）
-     *     原因：CreateActCtxA 内部调用 ntdll!RtlpLoadNlsData，该函数通过
-     *     PEB.Ldr 主 EXE 条目的 DllBase 查找 locale 文件映射地址。
-     *     必须在 DllBase 还指向 stub 原始 MAPPED view 时调用，
-     *     否则 ntdll 解引用无效指针崩溃（0xC0000005）。 */
-    DBG("map: about to activate manifest...\n");
-    activate_manifest_from_image(new_img);
-    DBG("map: manifest activation done\n");
-
-    /* 10.5 激活 manifest 之后才 patch PEB.Ldr 主 EXE 条目
-     *     原因：activate_manifest 依赖 PEB.Ldr 主 EXE 条目的 DllBase 指向
-     *     stub 原始 MAPPED view（系统创建的 section view），ntdll 的 NLS
-     *     加载机制才能正确查找 locale 文件映射。
-     *     manifest 激活完成后，ntll 的 NLS 初始化已结束，此时 patch DllBase
+    /* 10. patch PEB.Ldr 主 EXE 条目（actctx 已在 step 4.6 激活，NLS 初始化已结束）
+     *     manifest 激活完成后，ntdll 的 NLS 初始化已结束，此时 patch DllBase
      *     为 new_img 安全。OEP 之后的 LdrFindResource_U 会用 new_img 查找资源。 */
     patch_peb_ldr_main_entry(new_img);
 

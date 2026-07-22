@@ -1,5 +1,50 @@
 # 变更记录
 
+## 2026-07-22 22:00 reflective 0xC0000409 修复 + .NET reject + e2e 日志
+
+### 修复
+
+[packer/reflective/loader.c](file:///C:/Home/Projects/applocker/packer/reflective/loader.c)：
+**修复 notepad++/CCleaner 等 reflective 0xC0000409 崩溃**
+
+将 `activate_manifest_from_image()` 从 step 10（IAT 之后）移到 step 4.6（IAT 之前）：
+- COMCTL32 有 v5/v6 两个版本，按序号导入时序号映射不同
+- notepad++/CCleaner 等 manifest 指定 comctl32 v6
+- 若 actctx 在 IAT 之后才激活，`LoadLibraryA("COMCTL32.dll")` 加载的是 v5
+- 按序号导入（如 #381 #345）失败（err=182 ERROR_INVALID_ORDINAL），IAT 条目被设为 NULL
+- CRT 初始化调用 NULL 指针 → 0xC0000409
+
+安全性：此时 PEB.Ldr 主 EXE 条目仍指向 stub 原始 MAPPED view（patch 在 step 10），
+`CreateActCtxA` 内部的 `ntdll!RtlpLoadNlsData` 能正确查找 locale 文件映射地址。
+
+### 改进
+
+1. [packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c)：
+   **检测 .NET CLR 并 reject**
+   - 检查 `IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR`（DataDirectory[14]）
+   - 非零表示 .NET 托管 PE，打印错误并退出（return 1）
+   - 原因：.NET 托管 PE 无法用 reflective loader 加载（CLR 需要系统加载器初始化）
+
+2. [packer/tests/auto_e2e_test.ps1](file:///C:/Home/Projects/applocker/packer/tests/auto_e2e_test.ps1)：
+   **日志文件 + regex 修复**
+   - 用 `Start-Transcript`/`Stop-Transcript` 捕获所有输出到 `auto_e2e_test.log`
+   - 外部样本匹配从 `-match`（正则）改为 `-like`（通配符），避免 `notepad++` 的 `+` 号触发 "Nested quantifier" 错误
+
+### bigapps 最新测试结果（actctx 修复后）
+
+| 应用 | inplace | reflective |
+|------|---------|------------|
+| CC-Switch | PASS | CRASH (0xC0000005，应用自身代码问题) |
+| CCleaner | CRASH (exit=0，UAC 弹窗) | CRASH (0xC0000409/0xe06d7363，缺 CCleanerDU.dll/libwaapi.dll) |
+| notepad++ | PASS | **PASS**（actctx 修复生效） |
+| ShanaEncoder | PACK_FAIL (.NET reject) | PACK_FAIL (.NET reject) |
+| SQLiteStudio | PASS | PASS |
+| vlc-x64 | PASS | PASS |
+| vlc-x86 | PASS | PASS |
+| XnViewMP | PASS | PASS |
+
+剩余崩溃为应用特定问题（反调试/完整性检查/DLL 依赖），非 reflective loader 通用问题。
+
 ## 2026-07-22 20:30 e2e 测试改进：默认跳过 test 模式 + 支持外部样本
 
 ### 改进
