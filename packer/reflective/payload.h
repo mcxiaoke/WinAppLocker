@@ -64,7 +64,7 @@ typedef struct {
     uint8_t  pwd_hash[32];     /* KDF(password, salt) 校验用（v2+ 用，v1 填 0）   */
     uint8_t  auth_tag[16];     /* AEAD tag（v3+ 用，v1/v2 填 0）                  */
     uint32_t xtea_key[4];      /* XTEA 密钥（v2 用，v1/v3 填 0）                  */
-    uint32_t reserved32;       /* 对齐填充                                         */
+    uint32_t size_of_image;    /* 原 PE SizeOfImage（v2 加密模式 reserve 用）      */
     wchar_t  password[32];    /* 明文密码（RFLAG_HASH 未设置时用，最多 31 字符） */
     uint64_t checksum;         /* XOR 所有 8B 字段（防篡改，v1 暂不校验）         */
     /* 后跟 payload_data[stored_size] 字节 */

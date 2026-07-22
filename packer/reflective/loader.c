@@ -539,6 +539,9 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
  *       失败不致命：可能 preferred_base 已被占用，map_image 会 fallback。 */
 static void* g_reserved_base = NULL;       /* reserve 的基址，NULL 表示未 reserve */
 static SIZE_T g_reserved_size = 0;         /* reserve 的大小 */
+static int    g_reserve_attempted = 0;     /* 是否尝试过 reserve（诊断用）*/
+static int    g_reserve_result = 0;        /* reserve 结果：1=成功 0=失败（诊断用）*/
+static DWORD  g_reserve_err = 0;           /* reserve 失败时的 GetLastError（诊断用）*/
 
 static void reserve_preferred_base_region(void) {
     /* 1. 找到 .payload 节（不分配内存，安全） */
@@ -562,15 +565,14 @@ static void reserve_preferred_base_region(void) {
     uint64_t preferred_base;
     SIZE_T size_of_image;
     if (hdr->version == REFLECTIVE_PAYLOAD_VERSION_V2 && (hdr->flags & RFLAG_ENCRYPTED)) {
-        /* v2 加密模式：用 payload 头里的字段（builder 写入） */
+        /* v2 加密模式：用 payload 头里的字段（builder 写入）
+         * PE 头是密文无法读取，但 builder 已把 SizeOfImage 写入 payload 头 */
         preferred_base = hdr->image_base;
-        /* SizeOfImage 不在 payload 头里，只能从 PE 头读。
-         * 但 PE 头是密文，读不了。这种情况下不 reserve，让 map_image 处理。
-         * （v2 加密模式的 DontSleep 会走 decrypt -> map_image 流程，
-         *  decrypt 后 PE 头变明文，map_image 能读 SizeOfImage，
-         *  但此时 heap 可能已经扩展了。）
-         * 为了支持 v2 加密模式，我们用一个保守大小（16MB）reserve。 */
-        size_of_image = 16 * 1024 * 1024;  /* 16MB，覆盖大多数 PE */
+        size_of_image = hdr->size_of_image;
+        /* 如果 size_of_image 无效（老版 builder 没写），用保守值 */
+        if (size_of_image == 0 || size_of_image > 64 * 1024 * 1024) {
+            size_of_image = 2 * 1024 * 1024;  /* 2MB，覆盖大多数 PE */
+        }
         /* 如果 image_base 不是常见值，跳过（避免浪费地址空间） */
         if (preferred_base != 0x400000 && preferred_base != 0x10000
             && preferred_base != 0x140000000 && preferred_base != 0x180000000) {
@@ -591,6 +593,10 @@ static void reserve_preferred_base_region(void) {
     g_reserved_base = VirtualAlloc((void*)preferred_base, size_of_image,
                                     MEM_RESERVE, PAGE_NOACCESS);
     g_reserved_size = size_of_image;
+    /* 早期诊断（log_init 之前，存到全局变量，map_image 时输出）*/
+    g_reserve_attempted = 1;
+    g_reserve_result = (g_reserved_base != NULL) ? 1 : 0;
+    g_reserve_err = (g_reserved_base == NULL) ? GetLastError() : 0;
     /* 失败不致命：可能 preferred_base 已被占用，map_image 会 fallback */
 }
 
@@ -1187,8 +1193,8 @@ static int fallback_relocations(uint8_t* img, uint64_t old_base, uint64_t new_ba
             }
 #endif
         }
-        DBG("reloc: fallback scanned %*.8s VA=0x%lx size=0x%zx, fixed %d refs\n",
-            8, sec[i].Name, (unsigned long)sec[i].VirtualAddress, (size_t)size, sec_count);
+        DBG("reloc: fallback scanned %.8s VA=0x%lx size=0x%zx, fixed %d refs\n",
+            sec[i].Name, (unsigned long)sec[i].VirtualAddress, (size_t)size, sec_count);
     }
 #undef FALLBACK_SCAN_UNIT
 #ifdef WINLOCK_KEEP_CRT
@@ -1944,6 +1950,9 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
     DBG("map: SizeOfImage=0x%zx preferred_base=0x%llx OEP=0x%lx\n",
         (size_t)size_of_image, (unsigned long long)preferred_base,
         (unsigned long)nt->OptionalHeader.AddressOfEntryPoint);
+    DBG("map: reserve_attempted=%d result=%d err=%lu g_reserved_base=%p g_reserved_size=0x%zx\n",
+        g_reserve_attempted, g_reserve_result, (unsigned long)g_reserve_err,
+        g_reserved_base, (size_t)g_reserved_size);
 
     /* 1. 优先尝试 preferred_base，失败用任意地址
      *    如果加载在非 preferred 地址，需要应用 relocations */
@@ -1993,38 +2002,135 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
             /* 如果 preferred_base 处有 MAPPED 文件映射，尝试卸载后重试
              * 某些加壳程序（如 DontSleep）依赖加载到原始 ImageBase (0x400000)，
              * 因为 .data 段被压缩（vsize>>rsize）且重定位表为空（ASLR 关闭），
-             * 内层解压 stub 会把 ImageBase 当硬编码常量用，偏移就会算错 */
+             * 内层解压 stub 会把 ImageBase 当硬编码常量用，偏移就会算错
+             *
+             * ⚠️ 系统NLS 文件保护（DontSleep reflective 崩溃修复）：
+             * ntdll 在 LdrpInitializeProcess 阶段把 locale.nls 映射到 0x400000
+             * （固定地址）。ntdll 内部 cached 了这个地址作为 NLS 数据指针。
+             * 如果调用 NtUnmapViewOfSection(0x400000) 卸载 locale.nls 映射，
+             * 后续 LoadLibrary/CreateActCtx 触发的 NLS 查找会解引用 0x400000
+             * 处的 cached pointer，但此时 0x400000 已经被 VirtualAlloc 重新
+             * 分配为 DontSleep PE 数据，ntdll 读到错误的 NLS 数据 → AV (0xC0000005)。
+             *
+             * 修复：检测 preferred_base 处的 MAPPED view 是系统 NLS 文件时，
+             *      跳过 NtUnmapViewOfSection，放弃 preferred_base，
+             *      加载到其他地址 + fallback_relocations 修复绝对地址引用。
+             */
             if (VirtualQuery((void*)preferred_base, &mbi, sizeof(mbi)) &&
                 mbi.Type == 0x40000 /* MEM_MAPPED */) {
-                DBG("map: preferred_base 0x%p occupied by MAPPED view, "
-                    "trying NtUnmapViewOfSection\n", (void*)preferred_base);
 
-                /* 动态获取 NtUnmapViewOfSection（ntdll 导出，无需额外链接） */
-                typedef LONG NTSTATUS;
-                typedef NTSTATUS (NTAPI *pNtUnmapViewOfSection)(HANDLE, PVOID);
+                /* 用 GetMappedFileNameA 检查 MAPPED view 对应的文件名
+                 * 动态加载避免头文件依赖（kernel32 导出，Win7+）
+                 *
+                 * ⚠️ Windows 10/11 中 kernel32.dll 导出的是 K32GetMappedFileNameA
+                 *    （带 K32 前缀），GetMappedFileNameA 是 psapi.dll 的 forwarder，
+                 *    GetProcAddress 不解析 forwarder，所以必须先尝试 K32 前缀版本。
+                 *    老版本 Windows (Win7) 可能只有 GetMappedFileNameA 在 psapi.dll 中，
+                 *    所以 fallback 到 GetMappedFileNameA 和 psapi.dll。 */
+                char mapped_name[MAX_PATH];
+                mapped_name[0] = 0;
+                HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+                typedef DWORD (WINAPI *pGetMappedFileNameA)(HANDLE, LPVOID, LPSTR, DWORD);
+                pGetMappedFileNameA fnGetMappedName = NULL;
 
-                HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-                pNtUnmapViewOfSection fnUnmap = (pNtUnmapViewOfSection)
-                    GetProcAddress(hNtdll, "NtUnmapViewOfSection");
+                /* 优先尝试 K32 前缀版本（Win10/11 kernel32.dll 直接导出） */
+                if (hK32) {
+                    fnGetMappedName = (pGetMappedFileNameA)
+                        GetProcAddress(hK32, "K32GetMappedFileNameA");
+                    if (!fnGetMappedName) {
+                        /* fallback：老版本 kernel32 可能用不带前缀的名字
+                         * （但这是 forwarder，GetProcAddress 通常返回 NULL） */
+                        fnGetMappedName = (pGetMappedFileNameA)
+                            GetProcAddress(hK32, "GetMappedFileNameA");
+                    }
+                }
+                /* 最终 fallback：从 psapi.dll 加载（Win7 等老系统） */
+                if (!fnGetMappedName) {
+                    HMODULE hPsapi = GetModuleHandleA("psapi.dll");
+                    if (!hPsapi) {
+                        hPsapi = LoadLibraryA("psapi.dll");
+                    }
+                    if (hPsapi) {
+                        fnGetMappedName = (pGetMappedFileNameA)
+                            GetProcAddress(hPsapi, "GetMappedFileNameA");
+                    }
+                }
 
-                if (fnUnmap) {
-                    NTSTATUS st = fnUnmap(GetCurrentProcess(), (PVOID)preferred_base);
-                    DBG("map: NtUnmapViewOfSection(0x%p) = 0x%lx\n",
-                        (void*)preferred_base, (unsigned long)st);
-                    if (st == 0 /* STATUS_SUCCESS */) {
-                        /* 卸载成功，重试分配 */
-                        new_img = (uint8_t*)VirtualAlloc((void*)preferred_base, size_of_image,
-                                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                        if (new_img) {
-                            DBG("map: retry VirtualAlloc(preferred) succeeded at %p\n",
-                                (void*)new_img);
-                        } else {
-                            DBG("map: retry VirtualAlloc(preferred) still failed (err=%lu)\n",
-                                GetLastError());
+                int is_nls = 0;
+                if (fnGetMappedName) {
+                    SetLastError(0);
+                    DWORD namelen = fnGetMappedName(GetCurrentProcess(),
+                                                     (LPVOID)preferred_base,
+                                                     mapped_name, MAX_PATH);
+                    DWORD gme = GetLastError();
+                    DBG("map: GetMappedFileNameA returned namelen=%lu err=%lu\n",
+                        (unsigned long)namelen, (unsigned long)gme);
+                    if (namelen > 0 && namelen < MAX_PATH) {
+                        mapped_name[namelen] = 0;
+                        DBG("map: mapped_name='%s'\n", mapped_name);
+                        /* 检查是否以 ".nls" 结尾（不区分大小写）
+                         * 系统NLS 文件：locale.nls, sortdefault.nls 等 */
+                        if (namelen >= 4) {
+                            char e0 = mapped_name[namelen-4];
+                            char e1 = mapped_name[namelen-3];
+                            char e2 = mapped_name[namelen-2];
+                            char e3 = mapped_name[namelen-1];
+                            if (e0 >= 'A' && e0 <= 'Z') e0 += 32;
+                            if (e1 >= 'A' && e1 <= 'Z') e1 += 32;
+                            if (e2 >= 'A' && e2 <= 'Z') e2 += 32;
+                            if (e3 >= 'A' && e3 <= 'Z') e3 += 32;
+                            if (e0 == '.' && e1 == 'n' && e2 == 'l' && e3 == 's') {
+                                is_nls = 1;
+                            }
                         }
+                        DBG("map: preferred_base 0x%p mapped to %s%s\n",
+                            (void*)preferred_base, mapped_name,
+                            is_nls ? " (NLS file, skip unmap)" : "");
                     }
                 } else {
-                    DBG("map: GetProcAddress(NtUnmapViewOfSection) failed\n");
+                    DBG("map: GetMappedFileNameA not found in kernel32.dll or psapi.dll "
+                        "(hK32=%p)\n", (void*)hK32);
+                }
+
+                if (is_nls) {
+                    /* 系统 NLS 文件，不能卸载（ntdll cached 了该地址）
+                     * 放弃 preferred_base，让 VirtualAlloc(NULL) 选其他地址
+                     * 后续 apply_relocations 会调用 fallback_relocations
+                     * 修复绝对地址引用（针对无 reloc 表的 PE） */
+                    DBG("map: preferred_base 0x%p is system NLS file, skip "
+                        "NtUnmapViewOfSection (will load to other address + "
+                        "fallback reloc)\n", (void*)preferred_base);
+                } else {
+                    DBG("map: preferred_base 0x%p occupied by MAPPED view, "
+                        "trying NtUnmapViewOfSection\n", (void*)preferred_base);
+
+                    /* 动态获取 NtUnmapViewOfSection（ntdll 导出，无需额外链接） */
+                    typedef LONG NTSTATUS;
+                    typedef NTSTATUS (NTAPI *pNtUnmapViewOfSection)(HANDLE, PVOID);
+
+                    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+                    pNtUnmapViewOfSection fnUnmap = (pNtUnmapViewOfSection)
+                        GetProcAddress(hNtdll, "NtUnmapViewOfSection");
+
+                    if (fnUnmap) {
+                        NTSTATUS st = fnUnmap(GetCurrentProcess(), (PVOID)preferred_base);
+                        DBG("map: NtUnmapViewOfSection(0x%p) = 0x%lx\n",
+                            (void*)preferred_base, (unsigned long)st);
+                        if (st == 0 /* STATUS_SUCCESS */) {
+                            /* 卸载成功，重试分配 */
+                            new_img = (uint8_t*)VirtualAlloc((void*)preferred_base, size_of_image,
+                                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                            if (new_img) {
+                                DBG("map: retry VirtualAlloc(preferred) succeeded at %p\n",
+                                    (void*)new_img);
+                            } else {
+                                DBG("map: retry VirtualAlloc(preferred) still failed (err=%lu)\n",
+                                    GetLastError());
+                            }
+                        }
+                    } else {
+                        DBG("map: GetProcAddress(NtUnmapViewOfSection) failed\n");
+                    }
                 }
             }
         }

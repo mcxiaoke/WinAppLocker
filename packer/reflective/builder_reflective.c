@@ -422,7 +422,7 @@ int main(int argc, char* argv[]) {
     hdr->stored_size   = (uint64_t)in_size;  /* XTEA 不改变大小 */
     hdr->oep_rva       = (uint64_t)info.entry_rva;
     hdr->image_base    = info.image_base;
-    hdr->reserved32    = 0;
+    hdr->size_of_image = info.size_of_image;
     hdr->checksum      = 0;          /* 暂不校验 */
 
     /* 先把原 PE 字节拷贝到 payload_data 区域（v2 时会被原地加密覆盖）*/
@@ -837,6 +837,56 @@ int main(int argc, char* argv[]) {
         printf("[-] Failed to write final output: %s\n", out_path);
         free(out); free(stub); free(payload); free(in_pe);
         return 1;
+    }
+
+    /* 19. 附加原 PE 的 .rsrc 节原始字节 + overlay 到输出文件末尾
+     *    某些程序运行时 _wfopen 打开自身 EXE，搜索嵌入的标记字符串提取数据
+     *    （如 DontSleep 的语言包在 .rsrc 节内，Inno Setup 自解压数据在 overlay）。
+     *    反射加载后 GetModuleFileNameW 返回 stub 路径，stub 中没有原 PE 的
+     *    .rsrc 自定义资源和 overlay。把原 PE 的 .rsrc 节原始字节和 overlay
+     *    附加到 stub 末尾，_wfopen 搜索文件字节流时能在 overlay 里找到。
+     *    PE 加载器忽略 overlay，不影响 stub 运行。 */
+    {
+        IMAGE_DOS_HEADER* i_dos = (IMAGE_DOS_HEADER*)in_pe;
+        IMAGE_NT_HEADERS32* i_nt32 = (IMAGE_NT_HEADERS32*)(in_pe + i_dos->e_lfanew);
+        IMAGE_NT_HEADERS64* i_nt64 = (IMAGE_NT_HEADERS64*)(in_pe + i_dos->e_lfanew);
+        IMAGE_SECTION_HEADER* i_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(i_nt64)
+                                                  : IMAGE_FIRST_SECTION(i_nt32);
+        WORD i_n_sec = stub_is_x64 ? i_nt64->FileHeader.NumberOfSections
+                                   : i_nt32->FileHeader.NumberOfSections;
+        /* 找原 PE 的 .rsrc 节 */
+        DWORD rsrc_raw_off = 0, rsrc_raw_size = 0;
+        for (WORD i = 0; i < i_n_sec; i++) {
+            if (memcmp(i_sec[i].Name, ".rsrc", 5) == 0) {
+                rsrc_raw_off = i_sec[i].PointerToRawData;
+                rsrc_raw_size = i_sec[i].SizeOfRawData;
+                break;
+            }
+        }
+        /* 计算原 PE 的 overlay（最后一个节之后的数据） */
+        DWORD max_raw_end = 0;
+        for (WORD i = 0; i < i_n_sec; i++) {
+            DWORD re = i_sec[i].PointerToRawData + i_sec[i].SizeOfRawData;
+            if (re > max_raw_end) max_raw_end = re;
+        }
+
+        FILE* fp = fopen(out_path, "ab");
+        if (fp) {
+            size_t w_rsrc = 0, w_overlay = 0;
+            /* 附加 .rsrc 节原始字节（包含语言包等自定义资源） */
+            if (rsrc_raw_size > 0 && rsrc_raw_off + rsrc_raw_size <= in_size) {
+                w_rsrc = fwrite(in_pe + rsrc_raw_off, 1, rsrc_raw_size, fp);
+            }
+            /* 附加 overlay（最后一个节之后的附加数据，如自解压/签名） */
+            if (in_size > max_raw_end) {
+                w_overlay = fwrite(in_pe + max_raw_end, 1, in_size - max_raw_end, fp);
+            }
+            fclose(fp);
+            if (w_rsrc > 0 || w_overlay > 0) {
+                printf("[+] Appended original .rsrc (%zu bytes) + overlay (%zu bytes) "
+                       "as file overlay\n", w_rsrc, w_overlay);
+            }
+        }
     }
 
     printf("[+] Wrote output: %s (%zu bytes)\n", out_path, new_out_size);

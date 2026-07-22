@@ -289,11 +289,28 @@ static PVOID find_export(PVOID mod, const char* name) {
 /* XTEA 解密实现已抽取到 common/xtea.h */
 #include "../common/xtea.h"
 
-/* ---- 对话框模板构造工具 ---- */
+/* ---- 对话框模板构造工具 ----
+ *
+ * 重要：必须用 put_dword/put_word 逐字段写入，不能用 DLGTEMPLATE / DLGITEMTEMPLATE
+ * 结构体指针直接赋值。
+ *
+ * 原因：MinGW x86 -O2 会把连续 8 字节字段赋值（style+dwExtendedStyle / x+y+cx+cy）
+ * 合并成一条 movq 指令，常量被放到 .rdata 常量池。stub.ld 的 /DISCARD/ 丢弃 .rdata，
+ * 运行时 movq 从无效地址读到垃圾值 → DialogBoxIndirectParamW 返回 -1。
+ *
+ * 逐字段写入（每次 4 字节或 2 字节）让编译器生成立即数 mov，不引用常量池。
+ * 详见 docs/CHANGES.md 中 bugfix 分支的 fix(build_dialog) 记录。
+ */
 WINLOCK_SECTION_TEXT
 static uint8_t* put_word(uint8_t* p, uint16_t w) {
     *(uint16_t*)p = w;
     return p + 2;
+}
+
+WINLOCK_SECTION_TEXT
+static uint8_t* put_dword(uint8_t* p, uint32_t dw) {
+    *(uint32_t*)p = dw;
+    return p + 4;
 }
 
 WINLOCK_SECTION_TEXT
@@ -312,66 +329,72 @@ static uint8_t* align_dword(uint8_t* p, uint8_t* start) {
     return start + ((off + 3) & ~(uintptr_t)3);
 }
 
-/* 在栈缓冲区上构建密码对话框 DLGTEMPLATE */
+/* 在栈缓冲区上构建密码对话框 DLGTEMPLATE
+ * 全部用 put_dword/put_word 逐字段写入，避免 GCC -O2 把常量合并到 .rdata 常量池。
+ * sizeof(DLGTEMPLATE/DLGITEMTEMPLATE) 在不同编译器/对齐下可能为 18 或 20，
+ * 逐字段写入也消除了对 sizeof 的依赖。 */
 WINLOCK_SECTION_TEXT
+WINLOCK_OPTIMIZE_OFF
 static size_t build_dialog(uint8_t* buf) {
     uint8_t* start = buf;
     uint8_t* p = buf;
 
-    DLGTEMPLATE* tmpl = (DLGTEMPLATE*)p;
-    tmpl->style = WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
-                | DS_CENTER | DS_MODALFRAME;
-    tmpl->dwExtendedStyle = 0;
-    tmpl->cdit = 3;
-    tmpl->x = 0; tmpl->y = 0; tmpl->cx = 200; tmpl->cy = 60;
-    p += sizeof(DLGTEMPLATE);
-    p = put_word(p, 0);                       /* no menu    */
-    p = put_word(p, 0);                       /* default class */
-    p = put_wstr(p, STR_TITLE);               /* title      */
+    /* DLGTEMPLATE (18 字节: DWORD style, DWORD ext, WORD cdit, 4xSHORT xy/cx/cy) */
+    p = put_dword(p, WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+                     | DS_CENTER | DS_MODALFRAME);  /* style */
+    p = put_dword(p, 0);                            /* dwExtendedStyle */
+    p = put_word(p, 3);                             /* cdit */
+    p = put_word(p, 0);                             /* x */
+    p = put_word(p, 0);                             /* y */
+    p = put_word(p, 200);                           /* cx */
+    p = put_word(p, 60);                            /* cy */
+    p = put_word(p, 0);                             /* no menu    */
+    p = put_word(p, 0);                             /* default class */
+    p = put_wstr(p, STR_TITLE);                     /* title      */
 
-    /* EDIT (password input) */
+    /* EDIT (password input) — DLGITEMTEMPLATE 必须 DWORD 对齐 */
     p = align_dword(p, start);
-    {
-        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
-        item->style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
-                    | ES_AUTOHSCROLL | ES_PASSWORD;
-        item->dwExtendedStyle = 0;
-        item->x = 10; item->y = 10; item->cx = 180; item->cy = 14;
-        item->id = IDC_PWD_EDIT;
-        p += sizeof(DLGITEMTEMPLATE);
-        p = put_word(p, 0xFFFF);
-        p = put_word(p, 0x0081);              /* Edit atom   */
-        p = put_word(p, 0);                   /* no text      */
-        p = put_word(p, 0);                   /* no cd        */
-    }
+    p = put_dword(p, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
+                     | ES_AUTOHSCROLL | ES_PASSWORD);  /* style */
+    p = put_dword(p, 0);                            /* dwExtendedStyle */
+    p = put_word(p, 10);                            /* x */
+    p = put_word(p, 10);                            /* y */
+    p = put_word(p, 180);                           /* cx */
+    p = put_word(p, 14);                            /* cy */
+    p = put_word(p, IDC_PWD_EDIT);                  /* id */
+    p = put_word(p, 0xFFFF);                        /* class marker */
+    p = put_word(p, 0x0081);                        /* Edit atom   */
+    p = put_word(p, 0);                             /* no text      */
+    p = put_word(p, 0);                             /* no cd        */
+
     /* OK button */
     p = align_dword(p, start);
-    {
-        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
-        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON;
-        item->dwExtendedStyle = 0;
-        item->x = 60;  item->y = 32; item->cx = 50; item->cy = 14;
-        item->id = IDOK;
-        p += sizeof(DLGITEMTEMPLATE);
-        p = put_word(p, 0xFFFF);
-        p = put_word(p, 0x0080);              /* Button atom  */
-        p = put_wstr(p, STR_OK);
-        p = put_word(p, 0);
-    }
+    p = put_dword(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON); /* style */
+    p = put_dword(p, 0);                            /* dwExtendedStyle */
+    p = put_word(p, 60);                            /* x */
+    p = put_word(p, 32);                            /* y */
+    p = put_word(p, 50);                            /* cx */
+    p = put_word(p, 14);                            /* cy */
+    p = put_word(p, IDOK);                          /* id */
+    p = put_word(p, 0xFFFF);                        /* class marker */
+    p = put_word(p, 0x0080);                        /* Button atom  */
+    p = put_wstr(p, STR_OK);
+    p = put_word(p, 0);                             /* cd */
+
     /* Cancel button */
     p = align_dword(p, start);
-    {
-        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
-        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-        item->dwExtendedStyle = 0;
-        item->x = 120; item->y = 32; item->cx = 50; item->cy = 14;
-        item->id = IDCANCEL;
-        p += sizeof(DLGITEMTEMPLATE);
-        p = put_word(p, 0xFFFF);
-        p = put_word(p, 0x0080);
-        p = put_wstr(p, STR_CANCEL);
-        p = put_word(p, 0);
-    }
+    p = put_dword(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP); /* style */
+    p = put_dword(p, 0);                            /* dwExtendedStyle */
+    p = put_word(p, 120);                           /* x */
+    p = put_word(p, 32);                            /* y */
+    p = put_word(p, 50);                            /* cx */
+    p = put_word(p, 14);                            /* cy */
+    p = put_word(p, IDCANCEL);                      /* id */
+    p = put_word(p, 0xFFFF);                        /* class marker */
+    p = put_word(p, 0x0080);                        /* Button atom  */
+    p = put_wstr(p, STR_CANCEL);
+    p = put_word(p, 0);                             /* cd */
+
     return (size_t)(p - start);
 }
 

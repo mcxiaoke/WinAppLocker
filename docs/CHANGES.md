@@ -1,5 +1,57 @@
 # 变更记录
 
+## 2026-07-22 17:30 reflective loader 修复 DontSleep Error 窗口（.rsrc + overlay 附加方案）
+
+在 `packer-bugfix` 分支上修复 e2e 测试 `reflective_password DontSleep.exe ERROR_WINDOW`。
+
+### 根因（IDA Pro MCP 反编译确认）
+
+DontSleep 启动时通过以下流程读取嵌入的语言数据：
+1. `GetModuleFileNameW(hmod, ...)` 获取自身 EXE 路径
+2. `_wfopen(path, "rb")` 打开自身 EXE 文件
+3. 搜索标记字符串 `SDSGDGSDHREETETBCNMJUKR`（位于 `.rsrc` 节内）提取嵌入的语言包
+
+反射加载后，`GetModuleFileNameW` 返回 stub 路径，而 stub 中不包含原 PE 的
+`.rsrc` 自定义资源 → _wfopen 虽能打开但找不到标记 → 返回 NULL → 显示
+"Error! Loading language file string archive"。  
+
+### 修复方案（.rsrc + overlay 附加）
+
+[packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c)：
+- 在写最终输出后（第 19 步），附加原 PE 的 `.rsrc` 节原始字节 + overlay 到 stub 末尾
+  - `.rsrc` 节：包含语言包等自定义资源（DontSleep 的标记字符串在此节内）
+  - overlay：包含最后一个节之后的附加数据（如自解压、签名等）
+  - PE 加载器忽略 overlay，不影响 stub 运行
+  - _wfopen 搜索文件字节流时能在 overlay 里找到标记字符串  
+  
+### 方案演进说明
+
+最初实现的是"临时文件 + PEB.Ldr FullDllName patch"方案（把原 PE 写到
+`%TEMP%\winlock_<PID>.exe`，更新 PEB.Ldr 主 EXE 条目的 FullDllName）。
+用户指出这变成了"临时文件模式"，不够优雅。改为当前方案：直接把原 PE 的
+`.rsrc` 节 + overlay 附加到 stub 文件末尾，无临时文件、无 PEB patch。
+
+[packer/reflective/loader.c](file:///C:/Home/Projects/applocker/packer/reflective/loader.c)：
+- 删除之前的 `patch_peb_ldr_fulldllname` 函数和调用（临时文件方案的代码）
+
+### 验证
+
+- Clean build 成功（`build.ps1`）
+- e2e 测试 36/36 全部通过：
+  - `reflective_test DontSleep.exe PASS`
+  - `reflective_password DontSleep.exe PASS`
+- builder 日志确认附加成功：
+  ```
+  [+] Appended original .rsrc (130048 bytes) + overlay (10552 bytes) as file overlay
+  ```
+- 运行后窗口标题正确：`Don't Sleep 9.96 - OS:10.0 19045 x64`
+- stub 文件大小：597504 → 736056 字节（增加 140552 字节 = .rsrc 130048 + overlay 10552）
+
+### 通用性
+
+本方案不仅覆盖 DontSleep（标记在 .rsrc），也覆盖任何"读自身 EXE overlay 数据"
+的程序（如 Inno Setup 自解压）。未来如果遇到标记在其它节的程序，可扩展附加范围。
+
 ## 2026-07-21 22:42 构建系统重构第 5 步（完成）：Makefile.mingw DEPRECATED
 
 在 `packer-build-system-refact` 分支上按 [BUILD_SYSTEM_IMPROVEMENT_PLAN.md](BUILD_SYSTEM_IMPROVEMENT_PLAN.md) 实施第 5 步（改动 12，最后一步），标记旧 Makefile 已过时。
