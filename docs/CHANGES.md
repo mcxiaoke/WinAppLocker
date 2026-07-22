@@ -1,5 +1,19 @@
 # 变更记录
 
+## 2026-07-23 00:10 README 重写：重点介绍开发调试测试流程
+
+### 文档
+
+[README.md](file:///C:/Home/Projects/applocker/README.md) 重写：
+- 代码结构部分简化（dotnet 主项目 + packer WinLock 模块两层）
+- 新增「开发流程」章节：完整构建（dotnet/build.ps1）+ WinLock 独立构建（packer/build.ps1）
+  + 常用构建参数表
+- 新增「测试流程」章节：WinLock e2e（auto_e2e_test.ps1）+ dotnet e2e（auto_test.ps1）
+  + 外部 bigapps 测试 + stub 新鲜度校验，强调「每次改动后必跑 auto e2e test」
+- 新增「调试技巧」章节：loader 日志、WinDbg 附加、IDA Pro MCP、PE 诊断工具、
+  常见崩溃代码表（0xC0000005/0xC0000409/0xC0000142/0xE06D7363）、调试注意事项
+- 三种加壳方案对比表补充 reflective 模式
+
 ## 2026-07-22 23:50 reflective CC-Switch TLS directory 修复
 
 ### 修复
