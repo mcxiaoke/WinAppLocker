@@ -6,4 +6,8 @@
     <Project Path="stub.test\WinAppLocker.Stub.Test.csproj" />
     <Project Path="packer\WinAppLocker.Packer.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests\WinAppLocker.Shared.Tests\WinAppLocker.Shared.Tests.csproj" />
+    <Project Path="tests\WinAppLocker.Packer.Tests\WinAppLocker.Packer.Tests.csproj" />
+  </Folder>
 </Solution>
