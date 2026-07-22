@@ -4,8 +4,8 @@
 # 职责：
 #   1. 记录 vcvars64.bat 路径（文档/调试用，VS 生成器自动检测 MSVC）
 #   2. 查找 w64devkit / msys2 mingw32 的 binutils（objcopy / nm）
-#      这些工具与编译器无关，后续阶段 stub 提取 .lock 节仍需要
-#   3. 查找 Python3（用于 cmake/extract_lock_section.py 提取 .lock 节）
+#      这些工具与编译器无关，后续阶段 stub 提取 .text2 节仍需要
+#   3. 查找 Python3（用于 cmake/extract_lock_section.py 提取 .text2 节）
 #
 # 设计原则：
 #   - 路径作为 CACHE 变量，用户可用 -DW64DEVKIT_BIN=... 覆盖
@@ -25,10 +25,10 @@ if(NOT EXISTS "${WINLOCK_VCVARS64}")
                     "  If using Visual Studio generator, this warning can be ignored.")
 endif()
 
-# ---- 查找 Python3（用于 cmake/extract_lock_section.py 提取多 .lock 节） ----
-# MSVC link.exe 不合并不同特性的 .lock$X 子节（LNK4078），
-# 导致 objcopy -j .lock 输出包含中间 padding（25KB 而非 5KB）。
-# 用 Python 脚本按 VA 顺序拼接所有 .lock 节的 raw data（无 padding）。
+# ---- 查找 Python3（用于 cmake/extract_lock_section.py 提取多 .text2 节） ----
+# MSVC link.exe 不合并不同特性的 .text2$X 子节（LNK4078），
+# 导致 objcopy -j .text2 输出包含中间 padding（25KB 而非 5KB）。
+# 用 Python 脚本按 VA 顺序拼接所有 .text2 节的 raw data（无 padding）。
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR "Python3 not found. Required for extract_lock_section.py")
@@ -41,12 +41,12 @@ set(MSYS_MINGW32_BIN "C:/Home/Develop/msys64/mingw32/bin"
     CACHE PATH "msys2 mingw32 bin directory (x86 objcopy/nm)")
 
 # ---- 查找 x64 binutils（必需） ----
-# stub 阶段用 objcopy -O binary -j .lock 提取 stub.bin，nm 查符号偏移
+# stub 阶段用 objcopy -O binary -j .text2 提取 stub.bin，nm 查符号偏移
 find_program(OBJCOPY_X64
     NAMES objcopy
     PATHS ${W64DEVKIT_BIN}
     NO_DEFAULT_PATH
-    DOC "x64 objcopy (from w64devkit) for stub .lock extraction")
+    DOC "x64 objcopy (from w64devkit) for stub .text2 extraction")
 if(NOT OBJCOPY_X64)
     find_program(OBJCOPY_X64 NAMES objcopy DOC "x64 objcopy (fallback search)")
 endif()

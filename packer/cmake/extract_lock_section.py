@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-extract_lock_section.py - 从 PE 文件提取所有 .lock 节并按 RVA 顺序输出
+extract_lock_section.py - 从 PE 文件提取所有 .text2 节并按 RVA 顺序输出
 
-替代 objcopy -O binary -j .lock，解决 MSVC link.exe 不合并不同特性的 .lock$X
+替代 objcopy -O binary -j .text2，解决 MSVC link.exe 不合并不同特性的 .text2$X
 子节导致 objcopy 输出包含中间 padding 的问题。
 
 行为：
-  1. 解析 PE 文件，找到所有名为 ".lock" 的节（按 VA 升序）
-  2. 计算每节在 bin 中的偏移 = (节 RVA - 第一个 .lock 节 RVA)
+  1. 解析 PE 文件，找到所有名为 ".text2" 的节（按 VA 升序）
+  2. 计算每节在 bin 中的偏移 = (节 RVA - 第一个 .text2 节 RVA)
      节间填充 0 字节匹配 PE 内存 RVA 布局
   3. 输出到指定 bin 文件
 
 为什么按 RVA 偏移填充：
-  MSVC link.exe 把不同特性的 .lock$X 子节分到多个独立的 .lock 节，
+  MSVC link.exe 把不同特性的 .text2$X 子节分到多个独立的 .text2 节，
   每节有独立的 RVA（跳跃很大，如 0x1000/0x6000/0x7000）。
   stub_entry 中的 RIP-relative 引用是基于 PE RVA 计算的，
   必须保持 bin 中的偏移与 PE RVA 偏移一致，否则跨节引用会错位崩溃。
 
-  GCC stub.ld 用 SUBALIGN(16) 把所有 .lock.* 合并到一个连续节，
+  GCC stub.ld 用 SUBALIGN(16) 把所有 .text2.* 合并到一个连续节，
   bin 中偏移天然等于 PE RVA 偏移，不存在此问题。
 
   MSVC bin 体积会膨胀（约 25KB vs GCC 5KB），但功能正确性优先。
@@ -31,7 +31,7 @@ import pathlib
 
 
 def extract_lock_sections(pe_path: str, out_path: str) -> int:
-    """提取 PE 文件中所有 .lock 节，按 RVA 偏移布局输出。
+    """提取 PE 文件中所有 .text2 节，按 RVA 偏移布局输出。
     返回输出字节数。"""
     data = pathlib.Path(pe_path).read_bytes()
 
@@ -73,16 +73,16 @@ def extract_lock_sections(pe_path: str, out_path: str) -> int:
             "raw_ptr": raw_ptr,
         })
 
-    # 找所有名为 .lock 的节，按 VA 升序
+    # 找所有名为 .text2 的节，按 VA 升序
     lock_secs = sorted(
-        [s for s in sections if s["name"] == ".lock"],
+        [s for s in sections if s["name"] == ".text2"],
         key=lambda s: s["vaddr"],
     )
 
     if not lock_secs:
-        raise ValueError(f"no .lock section in {pe_path}")
+        raise ValueError(f"no .text2 section in {pe_path}")
 
-    # 基准 RVA（第一个 .lock 节）
+    # 基准 RVA（第一个 .text2 节）
     base_rva = lock_secs[0]["vaddr"]
     # bin 总大小 = 最后一节 RVA + vsize - 第一节 RVA
     last = lock_secs[-1]
@@ -98,12 +98,12 @@ def extract_lock_sections(pe_path: str, out_path: str) -> int:
         size = min(s["vsize"], s["raw_size"])
         if s["raw_ptr"] + size > len(data):
             raise ValueError(
-                f"section .lock@{s['vaddr']:#x} raw range out of file"
+                f"section .text2@{s['vaddr']:#x} raw range out of file"
             )
         out[offset_in_bin:offset_in_bin + size] = \
             data[s["raw_ptr"]:s["raw_ptr"] + size]
         print(
-            f"  .lock VA=0x{s['vaddr']:08X} vsize=0x{s['vsize']:X} "
+            f"  .text2 VA=0x{s['vaddr']:08X} vsize=0x{s['vsize']:X} "
             f"raw=0x{s['raw_size']:X} -> bin[0x{offset_in_bin:X}:0x{offset_in_bin + size:X}] "
             f"({size} bytes)",
             file=sys.stderr,

@@ -3,13 +3,13 @@
 
 用法：
   python inspect_stub.py <stub.bin>                       # 读 stub.bin
-  python inspect_stub.py <packed.exe>                     # 读加壳产物（自动找 .lock 节）
+  python inspect_stub.py <packed.exe>                     # 读加壳产物（自动找 .text2 节）
   python inspect_stub.py <input> --format=json            # 输出 JSON（manifest 生成用）
   python inspect_stub.py --summary <dir> [--winlock-root] # 批量打印目录下所有 stub.bin
 
 功能（审查 A1 + A4 + A13）：
   - 读 stub.bin → 按 magic 搜索 stub_data_t，打印 identity
-  - 读加壳产物 exe → 解析 PE 节表找 .lock 节，解析 stub_data_t，打印 identity
+  - 读加壳产物 exe → 解析 PE 节表找 .text2 节，解析 stub_data_t，打印 identity
   - 支持 --format=json 输出结构化数据（manifest 生成用）
   - --winlock-root 未传时从脚本位置自动推断（cmake/ 上溯到 packer/）
 
@@ -89,14 +89,14 @@ SECTION_RAW_SIZE_OFF = 16  # SizeOfRawData
 
 
 def find_lock_section(pe_data):
-    """解析 PE 节表，找 .lock 节的 (raw_offset, raw_size)
+    """解析 PE 节表，找 .text2 节的 (raw_offset, raw_size)
     返回 (offset, size)，找不到返回 (-1, 0)
 
-    MSVC link.exe 不合并不同特性的 .lock$X 子节（LNK4078 警告），
-    导致 PE 中可能有多个独立的 .lock 节（.lock$text / .lock$data 等）。
-    builder.c 也是取所有 .lock 节的并集 [min_rva, max_rva+vsize)，
-    但 raw offset 不连续，这里只取第一个 .lock 节的 raw 范围（stub_data_t
-    在 .lock$text 的开头，第一个 .lock 节就能找到）。
+    MSVC link.exe 不合并不同特性的 .text2$X 子节（LNK4078 警告），
+    导致 PE 中可能有多个独立的 .text2 节（.text2$text / .text2$data 等）。
+    builder.c 也是取所有 .text2 节的并集 [min_rva, max_rva+vsize)，
+    但 raw offset 不连续，这里只取第一个 .text2 节的 raw 范围（stub_data_t
+    在 .text2$text 的开头，第一个 .text2 节就能找到）。
     """
     if len(pe_data) < DOS_E_LFANEW_OFF + 4:
         return -1, 0
@@ -116,15 +116,15 @@ def find_lock_section(pe_data):
     if sec_table_off + n_sections * SECTION_HEADER_SIZE > len(pe_data):
         return -1, 0
 
-    # 遍历所有节，找 .lock 节（节名前 5 字节 == ".lock"）
-    # builder.c 取并集，这里只取第一个（stub_data_t 在第一个 .lock 节里）
+    # 遍历所有节，找 .text2 节（节名前 6 字节 == ".text2"）
+    # builder.c 取并集，这里只取第一个（stub_data_t 在第一个 .text2 节里）
     for i in range(n_sections):
         off = sec_table_off + i * SECTION_HEADER_SIZE
         name = pe_data[off:off + 8]
-        # 节名是 8 字节，不足补 \0，比较前 5 字节即可
-        if name[:5] == b".lock" and (len(name) == 5 or name[5] == 0 or name[5:8] == b"\0\0\0"):
-            # 排除 ".lockz" 等巧合（第 6 字节必须是 \0 或 .lock$ 子节分隔符）
-            if name[5:6] != b"\0" and name[5:6] != b"$":
+        # 节名是 8 字节，不足补 \0，比较前 6 字节即可
+        if name[:6] == b".text2" and (len(name) == 6 or name[6] == 0 or name[6:8] == b"\0\0"):
+            # 排除 ".text2z" 等巧合（第 7 字节必须是 \0 或 .text2$ 子节分隔符）
+            if name[6:7] != b"\0" and name[6:7] != b"$":
                 continue
             raw_off = struct.unpack_from("<I", pe_data, off + SECTION_RAW_OFF)[0]
             raw_size = struct.unpack_from("<I", pe_data, off + SECTION_RAW_SIZE_OFF)[0]
@@ -134,12 +134,12 @@ def find_lock_section(pe_data):
 
 
 def find_stub_data_in_pe(pe_data, stub_data_version, stub_data_size):
-    """从加壳产物 PE 的 .lock 节中找 stub_data_t
+    """从加壳产物 PE 的 .text2 节中找 stub_data_t
     返回 (offset_in_pe, stub_data_size)；找不到返回 (-1, 0)"""
     lock_off, lock_size = find_lock_section(pe_data)
     if lock_off < 0:
         return -1, 0
-    # 在 .lock 节范围内搜索（find_stub_data 会做三重校验）
+    # 在 .text2 节范围内搜索（find_stub_data 会做三重校验）
     lock_data = pe_data[lock_off:lock_off + lock_size]
     try:
         rel_off, _ = find_stub_data(lock_data, stub_data_version, stub_data_size)
@@ -201,10 +201,10 @@ def main():
 
     # 判断输入类型：PE 文件（MZ 魔数）还是 stub.bin
     if data[:2] == b"MZ":
-        # PE 文件：解析节表找 .lock 节
+        # PE 文件：解析节表找 .text2 节
         off, sz = find_stub_data_in_pe(data, stub_data_version, stub_data_size)
         if off < 0:
-            print(f"[ERR] 在 PE 的 .lock 节中找不到 stub_data_t: {args.input}",
+            print(f"[ERR] 在 PE 的 .text2 节中找不到 stub_data_t: {args.input}",
                   file=sys.stderr)
             sys.exit(1)
     else:

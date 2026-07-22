@@ -1,8 +1,8 @@
 /*
  * winlock/config.h - 共享配置（builder 与 stub 共用）
  *
- * WinLock demo: 新增 .lock 节 + stub 门禁壳
- * - builder 加密 .text 节，新增 .lock 节，写入 PIC stub
+ * WinLock demo: 新增 .text2 节 + stub 门禁壳
+ * - builder 加密 .text 节，新增 .text2 节，写入 PIC stub
  * - Windows loader 正常加载（处理 reloc/IAT/TLS/SEH/CFG/CRT）
  * - stub 在 EP 执行：弹密码框 -> 校验 -> 解密 .text -> 跳 OEP
  *
@@ -14,8 +14,10 @@
 
 #include <stdint.h>
 
-/* ---- 节名（≤8字节，注意：objcopy 保留字 '.' 开头合法） ---- */
-#define WINLOCK_SECTION_NAME  ".lock\0\0\0"
+/* ---- 节名（≤8字节，伪装为看起来正常的额外代码节）
+ *   原名 ".lock" 是 packer 强特征，改为 ".text2" 降低启发式可疑度。
+ *   末尾 \0 填充到 8 字节（IMAGE_SECTION_HEADER.Name 固定 8 字节）。 */
+#define WINLOCK_SECTION_NAME  ".text2\0\0"
 
 /* ---- 默认密码（宽字符） ---- */
 #ifndef WINLOCK_DEFAULT_PASSWORD
@@ -76,7 +78,7 @@
 /* ---- API / 模块名 DJB15 hash 常量（P1-1，借鉴 peldr） ----
  * 算法：h = 1993; for c in s: c = tolower(c); h = ((h<<4) - h) + c; h &= 0xFFFFFFFF
  * 大小写不敏感；用 tools/gen_api_hash.py 重新生成
- * 目的：避免在 .lock.rdata 中存明文 API 名（防 strings 抓取） */
+ * 目的：避免在 .text2.rdata 中存明文 API 名（防 strings 抓取） */
 #define WINLOCK_HASH_SEED 1993U
 #define HASH_GETPROCADDRESS          0xAACF4941U
 #define HASH_LOADLIBRARYA            0x124FBF05U
@@ -93,12 +95,13 @@
  * 注意：所有 RVA 字段都是相对虚拟地址，stub 运行时加 PEB.ImageBaseAddress
  *
  * v2 新增：
- *   - version: 2
  *   - salt[16] + pwd_hash[32]: SHA-256(password_utf8 + salt) 存 hash
  *     stub 计算 SHA-256(用户输入的密码转 UTF-8 + salt) 比对
  *   - max_retries: 最大重试次数
  *   - checksum: 简单 XOR 校验和（防 stub_data 被篡改）
- *   - password[] 保留（兼容 v1，flags.bit0=1 时忽略）
+ *
+ * v6 变更：删除 password[64] 明文字段，强制 SHA-256 hash 校验
+ *   （不再支持 v1 明文模式，简化结构 + 减小体积 128 字节）
  *
  * v4 新增：
  *   - security_cookie_rva: LOAD_CONFIG.SecurityCookie 的 RVA（0 = 无）
@@ -107,7 +110,6 @@
  *      借鉴 peldr 用 KUSER_SHARED_DATA.InterruptTime 作熵源，无 API 依赖）
  *
  * flags 位定义：
- *   bit0: 1=用 hash 校验, 0=用明文 password
  *   bit1: 1=测试模式（跳过弹框，直接用硬编码 L"test123" 走 verify_password）
  *         用于 CI/自动化测试，验证 stub 完整流程无需 GUI 自动化
  *   bit2: 1=TLS callback 代理模式（stub_entry 跳过解密，由 stub_tls_callback 完成）
@@ -118,11 +120,10 @@
  *         builder -d 时设置；默认关闭，避免开发调试受阻
  *         检查 PEB.BeingDebugged / NtGlobalFlag & 0x70 / KdDebuggerEnabled
  */
-#define STUB_DATA_VERSION 5
+#define STUB_DATA_VERSION 6
 #define STUB_DEFAULT_MAX_RETRIES 3
 
-/* flags 位掩码 */
-#define STUB_FLAG_HASH         0x0001  /* 用 SHA-256 hash 校验（否则明文 password） */
+/* flags 位掩码（v6: 删除 STUB_FLAG_HASH，强制 hash 校验） */
 #define STUB_FLAG_TEST_MODE    0x0002  /* 测试模式：跳过弹框，用硬编码密码 */
 #define STUB_FLAG_TLS_PROXY    0x0004  /* TLS callback 代理模式 */
 #define STUB_FLAG_ASLR         0x0008  /* ASLR 启用，需重新应用 relocations */
@@ -160,7 +161,6 @@ typedef struct {
     uint32_t xtea_key[4];    /* XTEA 密钥（随机生成）                       */
     uint8_t  salt[16];       /* PBKDF2 / SHA-256 salt（随机生成）           */
     uint8_t  pwd_hash[32];   /* SHA-256(password_utf8 + salt)              */
-    wchar_t  password[64];   /* 明文密码（v1 兼容，flags.bit0=0 时使用）   */
     /* v3 新增：重定位与 TLS 代理 */
     uint64_t image_base;     /* 原 PE OptionalHeader.ImageBase（preferred）*/
     uint64_t reloc_rva;      /* .reloc 节 RVA（0 = 无重定位表）            */
@@ -182,8 +182,9 @@ typedef struct {
 #pragma pack(pop)
 
 /* stub_data_t 的 sizeof，手动维护（供 Python 脚本读取，避免硬编码漂移）
- * 当前 version=5，sizeof=320；每次结构变化时同步更新此宏和 STUB_DATA_VERSION */
-#define STUB_DATA_SIZEOF 320
+ * 当前 version=6，sizeof=192（v5=320，v6 删除 password[64] 减 128 字节）；
+ * 每次结构变化时同步更新此宏和 STUB_DATA_VERSION */
+#define STUB_DATA_SIZEOF 192
 
 /* 编译期捕获 STUB_DATA_SIZEOF 与实际 sizeof 不一致
  * 用 typedef 数组技巧而非 _Static_assert：MSVC C 模式默认标准（C89/MS 扩展）

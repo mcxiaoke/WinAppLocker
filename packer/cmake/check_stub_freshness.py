@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """check_stub_freshness.py - 校验 dist/ 里的 stub 是否与当前源码一致
 
-用法：python check_stub_freshness.py --stub-dir <dir> --winlock-root <dir>
-  --stub-dir:    dist/ 目录路径（含 stub_inplace_x64.bin 等）
+用法：python check_stub_freshness.py --stub-dir <dir> --winlock-root <dir> [--strict]
+  --stub-dir:     dist/ 目录路径（含 stub_inplace_x64.bin 等）
   --winlock-root: packer/ 目录路径
+  --strict:       CRC 不匹配时返回非 0（CI 用），默认 warn-only
 
 逻辑：
   1. 用 patch_stub_identity.find_stub_data 读 stub.bin 的 stub_source_crc 字段
   2. 用 patch_stub_identity.compute_source_crc 重算当前源码的 CRC32
-  3. 对比，不一致则警告（warn-only，不 fail）
+  3. 对比，不一致则警告；--strict 模式下额外返回非 0 退出码
 
-退出码：始终返回 0（warn-only 模式，不阻断 e2e 测试）
+退出码：
+  0 = 全部匹配（或 warn-only 模式下始终返回 0）
+  1 = --strict 模式下检测到 CRC 不匹配
 """
 import sys
 import os
@@ -43,11 +46,13 @@ def read_stub_source_crc(stub_bin_path, stub_data_version, stub_data_size):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="校验 dist/ stub 是否与当前源码一致（warn-only）")
+        description="校验 dist/ stub 是否与当前源码一致")
     parser.add_argument("--stub-dir", required=True,
                         help="dist/ 目录路径")
     parser.add_argument("--winlock-root", required=True,
                         help="packer/ 目录路径（找 config.h 和源码）")
+    parser.add_argument("--strict", action="store_true",
+                        help="CRC 不匹配时返回非 0（CI 用），默认 warn-only")
     args = parser.parse_args()
 
     # parse_config_h 返回 (version, bin_ver, sizeof)
@@ -58,6 +63,8 @@ def main():
         ("stub_inplace_x64.bin", "x64"),
         ("stub_inplace_x86.bin", "x86"),
     ]
+
+    mismatch_count = 0
 
     for bin_name, arch in stub_files:
         bin_path = os.path.join(args.stub_dir, bin_name)
@@ -75,6 +82,7 @@ def main():
         src_crc = compute_source_crc(args.winlock_root, arch)
 
         if src_crc != stub_crc:
+            mismatch_count += 1
             print(f"[stub] WARN: source CRC mismatch! {bin_name} "
                   f"stub=0x{stub_crc:08x} src=0x{src_crc:08x} "
                   f"githash={githash} — stub is stale, rebuild recommended",
@@ -83,7 +91,9 @@ def main():
             print(f"[stub] OK: {bin_name} source_crc=0x{stub_crc:08x} "
                   f"githash={githash} matches current source")
 
-    # warn-only 模式：始终返回 0，不阻断 e2e 测试
+    # --strict 模式：CRC 不匹配时返回 1，让 CI 能 fail
+    if args.strict and mismatch_count > 0:
+        sys.exit(1)
     sys.exit(0)
 
 

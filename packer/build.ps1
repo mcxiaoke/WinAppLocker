@@ -1,24 +1,25 @@
-# WinLock packer 构建脚本（inplace stub 用 MinGW，其余用 MSVC x64 + x86）
+# WinLock packer 构建脚本（inplace stub 默认用 MSVC，可选 -UseMinGW 切回 MinGW）
 #
 # 用法：
-#   .\build.ps1               # 默认 Release，构建 x64 + x86
+#   .\build.ps1               # 默认 Release，构建 x64 + x86（MSVC inplace stub）
 #   .\build.ps1 -Debug        # Debug 配置（注意：PIC stub 的 /GS- 与 /RTC1 冲突，
 #                            #  Debug 下 stub target 会失败，仅 builder 可编）
 #   .\build.ps1 -Clean        # 清理 build/ 和 dist/ 后重新构建
 #   .\build.ps1 -SkipX64      # 跳过 x64 构建，只构建 x86
 #   .\build.ps1 -SkipX86      # 跳过 x86 构建，只构建 x64
-#   .\build.ps1 -SkipMinGW    # 跳过 MinGW 构建 inplace stub（用 MSVC 版本）
+#   .\build.ps1 -UseMinGW     # 额外用 MinGW 构建 inplace stub 覆盖 MSVC 产物
+#                             # （MinGW 体积更小 7.5KB vs 24.5KB，但 MSVC 已完全可用）
 #
 # 流程：
-#   1. MSVC vcvarsall → cmake build（builder + reflective stub + inplace stub 备份）
-#   2. MinGW 构建 inplace stub（x64），覆盖 MSVC 产物
+#   1. MSVC vcvarsall → cmake build（builder + reflective stub + inplace stub）
+#   2. （可选）MinGW 构建 inplace stub，覆盖 MSVC 产物
 #   3. 汇集产物到 dist/（平级，不带子目录）
 #
 # 产物（dist/）：
 #   builder_inplace.exe          - inplace 加壳器（x64，运行时按输入 PE 选 stub）
-#   stub_inplace_x64.bin          - inplace x64 stub（MinGW 构建，TLS callback 完整）
-#   stub_inplace_x64.exe          - inplace x64 stub exe（MinGW 构建，builder 读 .reloc 用）
-#   stub_inplace_x86.bin          - inplace x86 stub（MinGW 构建，若可用；否则 fallback MSVC）
+#   stub_inplace_x64.bin          - inplace x64 stub（默认 MSVC；-UseMinGW 时用 MinGW）
+#   stub_inplace_x64.exe          - inplace x64 stub exe（builder 读 .reloc 用）
+#   stub_inplace_x86.bin          - inplace x86 stub（同上）
 #   stub_inplace_x86.exe          - inplace x86 stub exe（同上）
 #   builder_reflective.exe        - reflective 加壳器（x64）
 #   stub_reflective_x64.exe       - reflective x64 stub
@@ -30,7 +31,8 @@
 #   - stub 同时输出 x64 和 x86 版本（带 _xXX 后缀区分）
 #   - 顶层 CMakeLists.txt 按 -DWINLOCK_ARCH=x64|x86 用 include() 引入
 #     inplace/CMakeLists.inc 和 reflective/CMakeLists.inc（不创建子目录）
-#   - MinGW 失败必须 fail（不再静默 fallback 到 MSVC stub，避免行为差异难以排查）
+#   - 默认全 MSVC 工具链：消除 MinGW 链接器特征，统一构建路径
+#   - -UseMinGW 失败必须 fail（不再静默 fallback 到 MSVC stub，避免行为差异难以排查）
 #   - 所有 stub 二进制（inplace）都通过 patch_stub_identity.py 注入身份字段
 #     （arch/toolchain/bin_ver/build_time/source_crc/size/githash），便于反查
 
@@ -40,7 +42,7 @@ param(
     [switch]$Clean,
     [switch]$SkipX64,
     [switch]$SkipX86,
-    [switch]$SkipMinGW
+    [switch]$UseMinGW
 )
 
 $ErrorActionPreference = "Stop"
@@ -217,9 +219,9 @@ function Build-InplaceMinGW {
         & $gcc @cflags @ldflags $objFile -o $exeFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         if ($LASTEXITCODE -ne 0) { throw "MinGW $archName 链接失败" }
 
-        # 提取 .lock 节为 bin
-        Write-Host "    提取 .lock 节 -> $binFile ..."
-        & $objcopy -O binary -j .lock $exeFile $binFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        # 提取 .text2 节为 bin
+        Write-Host "    提取 .text2 节 -> $binFile ..."
+        & $objcopy -O binary -j .text2 $exeFile $binFile 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         if ($LASTEXITCODE -ne 0) { throw "MinGW $archName objcopy 失败" }
 
         $binSize = (Get-Item $binFile).Length
@@ -257,11 +259,15 @@ if (-not $SkipX86) {
     Build-Arch "x86" (Join-Path $root "build\x86")
 }
 
-# ---- MinGW 构建 inplace stub (x64) ----
-# MSVC 的 /OPT:REF 会移除 TLS callback 代码（.lock$tlscb 节），
-# MinGW 用 __attribute__((used)) + KEEP() 天然保留，且产物体积更小（7.5KB vs 24.5KB）
-if (-not $SkipMinGW) {
+# ---- MinGW 构建 inplace stub (x64 + x86) ----
+# 默认禁用：MSVC 路径已完全可用（TLS callback 通过 stub_asm_*.asm + /INCLUDE 强制保留），
+# 统一用 MSVC 工具链消除 MinGW 链接器特征。需要 MinGW 产物时显式 -UseMinGW。
+if ($UseMinGW) {
     Build-InplaceMinGW
+} else {
+    Write-Host ""
+    Write-Host "==> 跳过 MinGW 构建（默认行为，inplace stub 用 MSVC 产物）" -ForegroundColor DarkGray
+    Write-Host "    如需 MinGW 产物（更小 7.5KB）：.\build.ps1 -UseMinGW" -ForegroundColor DarkGray
 }
 
 # ---- 汇集产物到 dist/ ----

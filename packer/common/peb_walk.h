@@ -3,7 +3,7 @@
  *
  * 从 stub.c 和 loader.c 抽取的共享 PEB 遍历代码。
  *
- * 使用方式（两段式包含，保证 stub 函数在 .lock.text 节中的顺序不变）：
+ * 使用方式（两段式包含，保证 stub 函数在 .text2.text 节中的顺序不变）：
  *
  *   // 第一次包含：仅类型定义（放在文件顶部，供 find_module 等早期函数使用）
  *   #include "peb_walk.h"
@@ -124,15 +124,15 @@ typedef struct _LDR_DATA_TABLE_ENTRY_X {
  * ============================================================ */
 #ifdef PEB_WALK_IMPLEMENT
 
-/* PIC stub 模式：函数进 .lock.text 节；host 模式：普通 static inline
+/* PIC stub 模式：函数进 .text2.text 节；host 模式：普通 static inline
  * 节名约定（见 winlock_compat.h）：
- *   - MSVC: .lock$text（用 #pragma code_seg，/MERGE 进 .lock）
- *   - GCC:  .lock.text（stub.ld KEEP 保留） */
+ *   - MSVC: .text2$text（用 #pragma code_seg，/MERGE 进 .text2）
+ *   - GCC:  .text2.text（stub.ld KEEP 保留） */
 #ifdef WINLOCK_PIC
   #ifdef _MSC_VER
-    #define WINLOCK_PEBWALK_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
+    #define WINLOCK_PEBWALK_FN __pragma(code_seg(".text2$text")) __declspec(noinline)
   #else
-    #define WINLOCK_PEBWALK_FN __attribute__((section(".lock.text"), used, noinline))
+    #define WINLOCK_PEBWALK_FN __attribute__((section(".text2.text"), used, noinline))
   #endif
 #else
   #define WINLOCK_PEBWALK_FN

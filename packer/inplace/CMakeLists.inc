@@ -13,21 +13,21 @@
 #
 # 产物 target：
 #   builder_inplace           - 加壳器（不分架构，与输入 PE 解耦）
-#   stub_inplace_${ARCH}      - stub（PIC，.lock 节提取）
+#   stub_inplace_${ARCH}      - stub（PIC，.text2 节提取）
 #
 # 设计要点：
 #   1. builder_inplace 总是编译（每个架构都各自编一份）
 #   2. stub target 名带 ${ARCH} 后缀（stub_inplace_x64 / stub_inplace_x86）
 #   3. stub PIC 选项与 reflective/loader PIC 选项保持一致
 #   4. x86 stub 额外 /FIXED:NO 保留 .reloc 节 + 复制 stub exe 给 builder 读
-#   5. POST_BUILD 顺序：extract .lock 节 -> patch_stub_identity.py 注入身份字段
+#   5. POST_BUILD 顺序：extract .text2 节 -> patch_stub_identity.py 注入身份字段
 # ============================================================
 
 # ---- builder_inplace（加壳器） ----
 add_executable(builder_inplace
     ${WINLOCK_ROOT}/inplace/builder.c
 )
-target_link_libraries(builder_inplace PRIVATE advapi32)
+target_link_libraries(builder_inplace PRIVATE advapi32 imagehlp)
 target_compile_options(builder_inplace PRIVATE
     $<$<COMPILE_LANGUAGE:C>:/O2>
     $<$<COMPILE_LANGUAGE:C>:/W3>
@@ -74,7 +74,7 @@ target_compile_options(stub_inplace_${ARCH} PRIVATE
 #     原因：stub_tls_callback 由 stub_asm_${ARCH}.asm 提供，未被 stub.c 直接引用
 #     （Windows loader 通过 TLS callbacks 数组调用，存地址不存符号），
 #     /OPT:REF 会移除未引用符号，导致 stub.bin 缺失 stub_tls_callback 代码。
-#     /INCLUDE 强制保留该符号及其所在 .lock$tlscb 节（含 g_stub_tls_cb_marker）。
+#     /INCLUDE 强制保留该符号及其所在 .text2$tlscb 节（含 g_stub_tls_cb_marker）。
 #     x86 stdcall decoration: _stub_tls_callback@12（3 个 DWORD 参数 = 12 字节）
 #
 # x86 额外 /FIXED:NO：
@@ -105,14 +105,14 @@ else()
     )
 endif()
 
-# 提取 .lock 节为 stub_inplace_${ARCH}.bin（用 Python 脚本替代 objcopy，
-# 因为 MSVC link.exe 不合并不同特性的 .lock$X 子节）
+# 提取 .text2 节为 stub_inplace_${ARCH}.bin（用 Python 脚本替代 objcopy，
+# 因为 MSVC link.exe 不合并不同特性的 .text2$X 子节）
 add_custom_command(TARGET stub_inplace_${ARCH} POST_BUILD
     COMMAND ${Python3_EXECUTABLE}
             ${WINLOCK_ROOT}/cmake/extract_lock_section.py
             $<TARGET_FILE:stub_inplace_${ARCH}>
             ${CMAKE_CURRENT_BINARY_DIR}/stub_inplace_${ARCH}.bin
-    COMMENT "Extracting .lock sections -> stub_inplace_${ARCH}.bin"
+    COMMENT "Extracting .text2 sections -> stub_inplace_${ARCH}.bin"
     VERBATIM
 )
 

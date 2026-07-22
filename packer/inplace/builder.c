@@ -3,12 +3,12 @@
  *
  * v3 增强：
  *   - 支持 TLS callbacks：stub_tls_callback 代理模式
- *     builder 在 .lock 末尾追加 [stub_tls_callback_VA, NULL] callbacks 数组，
+ *     builder 在 .text2 末尾追加 [stub_tls_callback_VA, NULL] callbacks 数组，
  *     修改原 PE TLS directory 的 AddressOfCallBacks 指向新数组。
  *     stub_tls_callback 在 loader 调用原 callbacks 之前解密 .text。
  *   - 支持 ASLR：保留 DYNAMIC_BASE，stub 解密 .text 后重新应用 relocations
  *     （仅 patch .text 范围，避免对 .rdata 等节双重 reloc）。
- *   - TLS_PROXY 模式禁用 ASLR（简化：避免 .lock 内 VA 引用与 reloc 冲突）。
+ *   - TLS_PROXY 模式禁用 ASLR（简化：避免 .text2 内 VA 引用与 reloc 冲突）。
  *
  * 修复与增强（v2 遗留）：
  *   - overlay 数据保留（避免堆崩溃）
@@ -27,10 +27,10 @@
  *   6. XTEA 加密 .text 前 enc_size 字节
  *   7. 读 stub.bin，搜索 STUB_DATA_MAGIC 与 STUB_TLS_CB_MAGIC
  *   8. 填充 stub_data：v3 字段（image_base/reloc_rva/reloc_size/orig_tls_callbacks）
- *   9. 计算 .lock 节位置（保留 overlay），追加 callbacks 数组（若 TLS_PROXY）
+ *   9. 计算 .text2 节位置（保留 overlay），追加 callbacks 数组（若 TLS_PROXY）
  *   10. 剥离 Authenticode 签名，清零 Bound Imports
- *   11. 新增 .lock 节，写入 stub.bin + callbacks 数组
- *   12. 修改 AddressOfEntryPoint 指向 .lock
+ *   11. 新增 .text2 节，写入 stub.bin + callbacks 数组
+ *   12. 修改 AddressOfEntryPoint 指向 .text2
  *   13. 更新 SizeOfImage / NumberOfSections
  *   14. ASLR 处理：
  *       - TLS_PROXY 模式：禁用 ASLR
@@ -45,6 +45,8 @@
 #include <stdint.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <imagehlp.h>                  /* CheckSumMappedFile */
+#pragma comment(lib, "imagehlp.lib")
 #include "../common/config.h"
 
 /* ---- 调试日志开关 ----
@@ -196,8 +198,8 @@ static size_t find_stub_tls_cb_offset(const uint8_t* stub, size_t stub_size) {
  * 参数：
  *   exe_data        - stub_xXX.exe 完整文件数据
  *   exe_size        - exe 文件大小
- *   out_lock_rva    - 输出：stub .lock 节的 RVA
- *   out_lock_size   - 输出：stub .lock 节的 VirtualSize
+ *   out_lock_rva    - 输出：stub .text2 节的 RVA
+ *   out_lock_size   - 输出：stub .text2 节的 VirtualSize
  *   out_reloc_off   - 输出：.reloc 节在 exe 文件中的 raw offset
  *   out_reloc_size  - 输出：.reloc 节的 raw size
  *   out_image_base  - 输出：stub 编译时 ImageBase
@@ -234,12 +236,12 @@ static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
                 + sizeof(IMAGE_FILE_HEADER) + s_nt32->FileHeader.SizeOfOptionalHeader);
     }
 
-    /* 遍历所有节，找 .lock 节的最小 RVA 和总跨度，以及 .reloc 节位置。
-     * 注意：MSVC link.exe 不合并不同特性的 .lock$X 子节（LNK4078 警告），
-     * 导致 PE 中有多个独立的 .lock 节（.lock$text / .lock$data / .lock$rdata）。
-     * 必须取所有 .lock 节的并集 [min_rva, max_rva+vsize)，才能覆盖整个 .lock 区域。
+    /* 遍历所有节，找 .text2 节的最小 RVA 和总跨度，以及 .reloc 节位置。
+     * 注意：MSVC link.exe 不合并不同特性的 .text2$X 子节（LNK4078 警告），
+     * 导致 PE 中有多个独立的 .text2 节（.text2$text / .text2$data / .text2$rdata）。
+     * 必须取所有 .text2 节的并集 [min_rva, max_rva+vsize)，才能覆盖整个 .text2 区域。
      *
-     * 旧 bug：循环没 break，lock_rva 被覆盖为最后一个 .lock 节的 VA（如 .lock$tlscbm），
+     * 旧 bug：循环没 break，lock_rva 被覆盖为最后一个 .text2 节的 VA（如 .text2$tlscbm），
      * 导致 patch_stub_relocations 用错误范围过滤，0 个条目被 patch，
      * x86 stub 运行时绝对地址全部错位（delta 巨大）-> AV 0xC0000005。 */
     uint32_t lock_rva = 0, lock_size = 0;
@@ -249,7 +251,7 @@ static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
     for (WORD i = 0; i < n_sec; i++) {
         char name[9] = {0};
         memcpy(name, s_sec[i].Name, 8);
-        if (strcmp(name, ".lock") == 0) {
+        if (strcmp(name, ".text2") == 0) {
             uint32_t va = s_sec[i].VirtualAddress;
             uint32_t vs = s_sec[i].Misc.VirtualSize ? s_sec[i].Misc.VirtualSize
                                                      : s_sec[i].SizeOfRawData;
@@ -275,12 +277,12 @@ static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
 
 /* ---- 辅助：预 patch stub.bin 的绝对地址到目标加载位置（x86） ----
  *
- * x86 stub 编译时用绝对地址引用 .lock 内的静态数据（如 STR_KERNEL32 的 VA）。
+ * x86 stub 编译时用绝对地址引用 .text2 内的静态数据（如 STR_KERNEL32 的 VA）。
  * 编译时绝对地址 = stub_image_base + stub_lock_rva + offset_in_lock。
  * 目标绝对地址 = target_image_base + target_lock_rva + offset_in_lock。
  * delta = (target_image_base + target_lock_rva) - (stub_image_base + stub_lock_rva)。
  *
- * 遍历 stub 的 .reloc 表，对每个在 .lock 范围内的 patch 位置加上 delta。
+ * 遍历 stub 的 .reloc 表，对每个在 .text2 范围内的 patch 位置加上 delta。
  * patch 后 stub.bin 在目标位置加载时，所有绝对地址都指向正确位置。
  *
  * 前提：目标 PE 必须禁用 ASLR（加载到固定 ImageBase），否则 stub 绝对地址
@@ -288,13 +290,13 @@ static int extract_stub_reloc_info(const uint8_t* exe_data, size_t exe_size,
  *
  * 参数：
  *   stub_buf          - stub.bin 数据（可写，通常已拷贝到 out 缓冲区）
- *   stub_size         - stub.bin 大小（.lock 节大小）
+ *   stub_size         - stub.bin 大小（.text2 节大小）
  *   reloc_data        - stub 的 .reloc 节数据
  *   reloc_size        - .reloc 节大小
  *   stub_image_base   - stub 编译时 ImageBase
- *   stub_lock_rva      - stub .lock 节在 stub exe 中的 RVA
+ *   stub_lock_rva      - stub .text2 节在 stub exe 中的 RVA
  *   target_image_base - 目标 PE 的 ImageBase
- *   target_lock_rva   - 新 .lock 节在目标 PE 中的 RVA
+ *   target_lock_rva   - 新 .text2 节在目标 PE 中的 RVA
  *
  * 返回：patch 的条目数，-1 表示错误。 */
 static int patch_stub_relocations(uint8_t* stub_buf, size_t stub_size,
@@ -328,7 +330,7 @@ static int patch_stub_relocations(uint8_t* stub_buf, size_t stub_size,
             WORD offset = entries[i] & 0xFFF;
             DWORD patch_rva = block_rva + offset;
 
-            /* 只 patch .lock 范围内的条目
+            /* 只 patch .text2 范围内的条目
              * （其他节如 .rdata 被 /DISCARD/ 了，不应有 reloc 条目）*/
             if (patch_rva < stub_lock_rva
                 || patch_rva >= stub_lock_rva + stub_size) {
@@ -914,8 +916,8 @@ int main(int argc, char* argv[]) {
 
     /* 7b. x86: 额外读 stub_inplace_x86.exe 获取 .reloc 节
      *   x86 stub 用绝对地址引用静态数据（非 PIC），必须预 patch 到目标位置。
-     *   stub_inplace_x86.bin 是 extract_lock_section.py 导出的 .lock raw bytes，
-     *   没有 .reloc 节，所以需要从 stub_inplace_x86.exe 读取 .reloc 节 + .lock 节 RVA + ImageBase。
+     *   stub_inplace_x86.bin 是 extract_lock_section.py 导出的 .text2 raw bytes，
+     *   没有 .reloc 节，所以需要从 stub_inplace_x86.exe 读取 .reloc 节 + .text2 节 RVA + ImageBase。
      *   x64 stub 用 RIP-relative 是 PIC，不需要 .reloc，跳过此步。 */
     uint8_t* stub_exe = NULL;
     size_t stub_exe_size = 0;
@@ -955,7 +957,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         stub_reloc_data = stub_exe + reloc_off;
-        DBG("[*] stub_inplace_x86.exe: ImageBase=0x%llX, .lock RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
+        DBG("[*] stub_inplace_x86.exe: ImageBase=0x%llX, .text2 RVA=0x%lX (size 0x%lX), .reloc=0x%zX bytes\n",
                (unsigned long long)stub_image_base,
                (unsigned long)stub_lock_rva, (unsigned long)stub_lock_size,
                stub_reloc_size);
@@ -994,7 +996,7 @@ int main(int argc, char* argv[]) {
 
     /* 填充 stub_data */
     sd->version       = STUB_DATA_VERSION;
-    sd->flags         = STUB_FLAG_HASH;  /* 默认 hash 校验（明文仅调试用） */
+    sd->flags         = 0;  /* v6: 强制 hash 校验，无需 STUB_FLAG_HASH */
     if (test_mode) {
         sd->flags    |= STUB_FLAG_TEST_MODE;  /* 测试模式：跳过弹框 */
     }
@@ -1022,8 +1024,6 @@ int main(int argc, char* argv[]) {
     sd->xtea_key[3]   = key[3];
     memcpy(sd->salt, salt, 16);
     memcpy(sd->pwd_hash, pwd_hash, 32);
-    wcsncpy(sd->password, password, 63);  /* 保留明文兼容（生产应清零） */
-    sd->password[63] = 0;
     /* v3 字段：重定位信息（始终填充，stub 根据 STUB_FLAG_ASLR 决定是否使用）*/
     sd->image_base = OH_IMG_BASE();
     {
@@ -1093,24 +1093,23 @@ int main(int argc, char* argv[]) {
     size_t qi;
     for (qi = 0; qi < sd_qwords; qi++) cs ^= p[qi];
     sd->checksum = cs;
-    DBG("[*] Password set to: '%ls' (stored as SHA-256 hash)\n", sd->password);
-    DBG("[*] stub_data flags=0x%04X (HASH=%d TEST=%d TLS_PROXY=%d ASLR=%d ANTIDEBUG=%d)\n",
+    DBG("[*] Password stored as SHA-256 hash (salt+pwd_hash)\n");
+    DBG("[*] stub_data flags=0x%04X (TEST=%d TLS_PROXY=%d ASLR=%d ANTIDEBUG=%d)\n",
            sd->flags,
-           (sd->flags & STUB_FLAG_HASH)        ? 1 : 0,
            (sd->flags & STUB_FLAG_TEST_MODE)  ? 1 : 0,
            (sd->flags & STUB_FLAG_TLS_PROXY)  ? 1 : 0,
            (sd->flags & STUB_FLAG_ASLR)        ? 1 : 0,
            (sd->flags & STUB_FLAG_ANTIDEBUG)  ? 1 : 0);
 
-    /* 9. 计算新 .lock 节位置（保留 overlay）
-     *   .lock 节内容 = stub.bin + (TLS_PROXY 模式时追加 callbacks 数组)
+    /* 9. 计算新 .text2 节位置（保留 overlay）
+     *   .text2 节内容 = stub.bin + (TLS_PROXY 模式时追加 callbacks 数组)
      *   callbacks 数组 = [stub_tls_callback_VA, NULL]
      *   stub_tls_callback_VA = ImageBase + new_va + stub_tls_cb_offset
      *   callbacks_array_VA   = ImageBase + new_va + cb_array_offset_in_lock */
     DWORD file_align = OH(FileAlignment);
     DWORD sec_align = OH(SectionAlignment);
 
-    /* callbacks 数组在 .lock 中的偏移（按架构对齐：x86 4 字节，x64 8 字节）*/
+    /* callbacks 数组在 .text2 中的偏移（按架构对齐：x86 4 字节，x64 8 字节）*/
     size_t cb_align = TLS_CB_ELEM_SIZE();
     size_t cb_array_offset_in_lock = (stub_size + cb_align - 1) & ~(cb_align - 1);
     /* callbacks 数组大小：[stub_tls_callback_VA, NULL] = 2 * elem_size 字节
@@ -1141,20 +1140,20 @@ int main(int argc, char* argv[]) {
         DBG("[*] stub_tls_callback VA = 0x%llX (ImageBase + 0x%lX + 0x%zX)\n",
                (unsigned long long)stub_tls_cb_va,
                (unsigned long)new_va, stub_tls_cb_offset);
-        DBG("[*] new callbacks array VA = 0x%llX (offset in .lock = 0x%zX)\n",
+        DBG("[*] new callbacks array VA = 0x%llX (offset in .text2 = 0x%zX)\n",
                (unsigned long long)new_cb_array_va, cb_array_offset_in_lock);
     }
 
-    DBG("[*] New .lock section: RVA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX\n",
+    DBG("[*] New .text2 section: RVA=0x%lX VSize=0x%lX RawOff=0x%lX RawSize=0x%lX\n",
            (unsigned long)new_va, (unsigned long)new_vsize,
            (unsigned long)new_raw_off, (unsigned long)new_raw_size);
     if (tls_info.has_callbacks) {
-        DBG("[*]   .lock content: stub.bin(0x%zX) + callbacks_array(0x%zX) = 0x%zX\n",
+        DBG("[*]   .text2 content: stub.bin(0x%zX) + callbacks_array(0x%zX) = 0x%zX\n",
                stub_size, cb_array_size, total_lock_size);
     }
 
     /* 10. 准备输出缓冲区
-     *   [原 PE 数据 + overlay] + [padding] + [.lock 节] + [padding] */
+     *   [原 PE 数据 + overlay] + [padding] + [.text2 节] + [padding] */
     size_t out_size = new_raw_off + new_raw_size;
     uint8_t* out = (uint8_t*)calloc(out_size, 1);
     if (!out) {
@@ -1198,7 +1197,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* 13. 添加新 .lock 节头 */
+    /* 13. 添加新 .text2 节头
+     *   节属性用 ERC（Execute+Read，无 W）消除静态 W+X packer 特征。
+     *   stub_entry 运行时通过 PEB walk 解析 VirtualProtect 后，
+     *   调 VirtualProtect 临时把 fn 表所在页改为 RWX，写入函数指针后再改回 ERC。
+     *   这样静态分析看 .text2 节无 W 属性，运行时 stub 仍能写 fn 表。 */
     IMAGE_SECTION_HEADER* new_sec = &sec[n_sec];
     memset(new_sec, 0, sizeof(*new_sec));
     memcpy(new_sec->Name, WINLOCK_SECTION_NAME, 8);
@@ -1208,8 +1211,7 @@ int main(int argc, char* argv[]) {
     new_sec->PointerToRawData = new_raw_off;
     new_sec->Characteristics   = IMAGE_SCN_CNT_CODE
                               | IMAGE_SCN_MEM_EXECUTE
-                              | IMAGE_SCN_MEM_READ
-                              | IMAGE_SCN_MEM_WRITE;
+                              | IMAGE_SCN_MEM_READ;
 
     /* 14. 拷贝 stub.bin 到新节，追加 callbacks 数组（TLS_PROXY 模式） */
     memcpy(out + new_raw_off, stub, stub_size);
@@ -1241,7 +1243,7 @@ int main(int argc, char* argv[]) {
                (unsigned long long)target_base);
     }
     if (tls_info.has_callbacks) {
-        /* 在 .lock 末尾追加新 callbacks 数组：[stub_tls_callback_VA, NULL]
+        /* 在 .text2 末尾追加新 callbacks 数组：[stub_tls_callback_VA, NULL]
          * Windows loader 会遍历此数组调用每个 callback。
          * stub_tls_callback 在 DLL_PROCESS_ATTACH 时解密 .text + 调原 callbacks。
          * 数组以 NULL 结尾，所以原 callbacks 不会被 loader 二次调用
@@ -1257,7 +1259,7 @@ int main(int argc, char* argv[]) {
             cb_array[0] = (uint32_t)stub_tls_cb_va;
             cb_array[1] = 0;
         }
-        printf("[+] Wrote new callbacks array at .lock+0x%zX: [0x%llX, NULL] (%zu-bit)\n",
+        printf("[+] Wrote new callbacks array at .text2+0x%zX: [0x%llX, NULL] (%zu-bit)\n",
                cb_array_offset_in_lock, (unsigned long long)stub_tls_cb_va,
                cb_align * 8);
     }
@@ -1267,7 +1269,7 @@ int main(int argc, char* argv[]) {
     OH_FILE()->NumberOfSections++;
     OH(SizeOfImage) = new_va + new_vsize_aligned;
     OH(AddressOfEntryPoint) = new_va;
-    OH(CheckSum) = 0;
+    /* CheckSum 留空，step 17 写文件前用 CheckSumMappedFile 重算 */
 
     /* ASLR 处理（v3 条件化）：
      * - x86（无论是否 TLS_PROXY）：强制禁用 ASLR。原因：x86 stub 用绝对地址
@@ -1279,7 +1281,7 @@ int main(int argc, char* argv[]) {
      *   解密 .text 后不重应用 reloc（x86 不设 STUB_FLAG_ASLR），所以 .text
      *   里的绝对地址回到 preferred ImageBase 基准，与实际加载基址一致。正确。
      * - x64 + TLS_PROXY：禁用 ASLR。原因：新 callbacks 数组中的
-     *   stub_tls_callback_VA 是绝对 VA，.lock 节无 reloc 条目覆盖。
+     *   stub_tls_callback_VA 是绝对 VA，.text2 节无 reloc 条目覆盖。
      * - x64 + 非 TLS_PROXY + ASLR：保留 ASLR，stub 解密 .text 后重新应用
      *   relocations（仅 patch .text 范围，避免双重 reloc）。
      *   STUB_FLAG_ASLR 已在 stub_data.flags 中设置。 */
@@ -1310,7 +1312,7 @@ int main(int argc, char* argv[]) {
     /* 15b. CFG (Control Flow Guard) 处理：
      *   原 PE 若启用 CFG（DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF），
      *   loader 在调用 EP 时会用 CFG dispatch 校验目标地址是否在 GFIDS 表中。
-     *   我们把 EP 改为 .lock 节中的 stub_entry，不在 GFIDS 表里，
+     *   我们把 EP 改为 .text2 节中的 stub_entry，不在 GFIDS 表里，
      *   → 触发 STATUS_STACK_BUFFER_OVERRUN (0xC0000409)。
      *   修复：清 GUARD_CF 位，让 loader 不对 EP 做 CFG dispatch 校验。
      *   副作用：原 PE 中 CFG 保护的间接调用目标不再被 loader 校验；
@@ -1355,6 +1357,25 @@ int main(int argc, char* argv[]) {
                (unsigned long)aoc_raw, cb_align * 8);
     }
 
+    /* 16.5 重算 PE CheckSum（消除"CheckSum 清零"packer 特征）
+     *   CheckSumMappedFile 读取 buffer 中的 OptionalHeader.CheckSum（当前为 0）
+     *   计算实际 CheckSum 并写入 OptionalHeader.CheckSum。
+     *   对 EXE 不强制校验，但非零降低 packer detector 启发式可疑度。
+     *   HeaderSum 是文件原有 CheckSum（这里就是 0），CheckSum 是新算的值。
+     *   FileLength 必须 <= 4GB（DWORD），out_size 远小于此。 */
+    OH(CheckSum) = 0;  /* 清零当前值，让 CheckSumMappedFile 从 0 开始算 */
+    {
+        DWORD header_sum = 0, new_cs = 0;
+        if (CheckSumMappedFile(out, (DWORD)out_size, &header_sum, &new_cs)) {
+            OH(CheckSum) = new_cs;
+            DBG("[+] PE CheckSum recalculated: 0 -> 0x%08lX (header_sum=0x%08lX)\n",
+                (unsigned long)new_cs, (unsigned long)header_sum);
+        } else {
+            printf("[!] CheckSumMappedFile failed (err=%lu), CheckSum left 0\n",
+                   GetLastError());
+        }
+    }
+
     /* 17. 写输出文件 */
     if (write_file(out_path, out, out_size) != 0) {
         printf("[-] Failed to write %s\n", out_path);
@@ -1367,8 +1388,8 @@ int main(int argc, char* argv[]) {
            (unsigned long)OH(AddressOfEntryPoint),
            (unsigned long long)oep_rva);
     printf("[+] SizeOfImage = 0x%lX\n", (unsigned long)OH(SizeOfImage));
-    printf("[+] Sections   = %u (added .lock)\n", OH_FILE()->NumberOfSections);
-    printf("[+] Password   : %ls\n", sd->password);
+    printf("[+] Sections   = %u (added .text2)\n", OH_FILE()->NumberOfSections);
+    printf("[+] Password   : (stored as SHA-256 hash)\n");
     printf("[+] Run        : %s\n", out_path);
 
     free(stub);

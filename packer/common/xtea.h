@@ -8,7 +8,7 @@
  *   - reflective/loader.c:276-301     (同上)
  *
  * 设计：
- *   - #ifdef WINLOCK_PIC 区分 PIC 模式（stub 用，函数进 .lock.text 节）
+ *   - #ifdef WINLOCK_PIC 区分 PIC 模式（stub 用，函数进 .text2.text 节）
  *     和 host 模式（builder/loader 用，普通 static inline）
  *   - PIC 模式用 section + noinline 属性（不带 used，避免未调用的 encrypt
  *     函数被强制 emit 到 stub 二进制中导致体积膨胀）
@@ -25,23 +25,23 @@
 #include <stddef.h>
 #include "config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
 
-/* PIC stub 模式：函数进 .lock.text 节；host 模式：普通 static inline。
+/* PIC stub 模式：函数进 .text2.text 节；host 模式：普通 static inline。
  * 注意：不带 used 属性 —— 未调用的 encrypt 函数不应被 emit 到 stub 二进制。
  *
  * MSVC 与 GCC 的节名约定不同（见 winlock_compat.h）：
- *   - GCC:   __attribute__((section(".lock.text")))   → 节名 .lock.text
- *   - MSVC:  #pragma code_seg(".lock$text")           → 节名 .lock$text
- * 链接时 GCC 用 stub.ld KEEP(*(.lock.text))，MSVC 用 /MERGE:.lock$text=.lock
+ *   - GCC:   __attribute__((section(".text2.text")))   → 节名 .text2.text
+ *   - MSVC:  #pragma code_seg(".text2$text")           → 节名 .text2$text
+ * 链接时 GCC 用 stub.ld KEEP(*(.text2.text))，MSVC 用 /MERGE:.text2$text=.text2
  */
 #ifdef WINLOCK_PIC
   #ifdef _MSC_VER
     /* MSVC: 与 winlock_compat.h 的 WINLOCK_SECTION_TEXT 一致，无 used 概念
      * /OPT:REF 会自动移除未引用函数（如 stub 不用的 xtea_encrypt_*） */
-    #define WINLOCK_XTEA_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
+    #define WINLOCK_XTEA_FN __pragma(code_seg(".text2$text")) __declspec(noinline)
   #else
     /* GCC: section + noinline 不带 used，--gc-sections 移除未调用函数
      * 加 unused 属性：stub 只用解密不用加密，避免 unused-function 警告 */
-    #define WINLOCK_XTEA_FN __attribute__((section(".lock.text"), noinline, unused))
+    #define WINLOCK_XTEA_FN __attribute__((section(".text2.text"), noinline, unused))
   #endif
 #else
   #define WINLOCK_XTEA_FN

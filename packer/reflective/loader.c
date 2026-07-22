@@ -1,5 +1,5 @@
 /*
- * winlock/reflective/loader.c - 反射式 stub 主体（MVP v1 明文模式）
+ * winlock/reflective/loader.c - 反射式 stub 主体（v2 XTEA 加密模式）
  *
  * 设计原则（按 REFLECTIVE_DESIGN.md 阶段 1 MVP）：
  *   - 开发优先：用 Win32 API + CRT，允许 printf 调试
@@ -63,7 +63,7 @@
 #include "../common/pe_meta.h"  /* REFLECTIVE_SECTION_NAME */
 #include "../common/winlock_compat.h"
 /* 复用 common/sha256.h 的纯 C SHA-256 + UTF-16LE->UTF-8 + 常量时间比较
- * 不定义 WINLOCK_PIC，作为普通 host 函数（loader.c 用 CRT 编译，无 .lock 节）*/
+ * 不定义 WINLOCK_PIC，作为普通 host 函数（loader.c 用 CRT 编译，无 .text2 节）*/
 #include "../common/sha256.h"
 #include "../common/peb_walk.h"
 
@@ -99,6 +99,36 @@ int memcmp(const void* a, const void* b, size_t n) {
     return 0;
 }
 #endif /* _MSC_VER */
+
+/* ---- 假 IAT 引用（降低 packer 检测可疑度）
+ *   链接器看到这些引用会把 shell32/ole32/comctl32 加入 IAT，
+ *   让 stub 的 IAT 看起来像正常 GUI 程序（有 shell/ole/comctl 依赖）。
+ *   dummy 函数永远不会被实际调用（volatile gate 保证编译器不优化掉引用），
+ *   不影响运行时行为。
+ *   原 stub IAT 只有 kernel32+user32 两个 DLL，对 GUI 程序来说太"干净"，
+ *   容易被 packer detector 标记为可疑。
+ *
+ *   直接声明函数原型（不包含 shellapi.h/objbase.h/commctrl.h），
+ *   避免引入 v5/v6 actctx 依赖和宏定义污染。 */
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "comctl32.lib")
+
+/* shell32/ole32/comctl32 函数原型（仅取地址，不实际调用） */
+_declspec(dllimport) HINSTANCE WINAPI ShellExecuteW(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
+_declspec(dllimport) HRESULT WINAPI CoInitialize(LPVOID);
+_declspec(dllimport) void WINAPI InitCommonControls(void);
+
+__declspec(noinline) static void dummy_iat_padding(void) {
+    /* 取函数地址存入 volatile 变量，防止编译器优化掉引用 */
+    volatile PVOID p1 = (PVOID)ShellExecuteW;     /* shell32.dll */
+    volatile PVOID p2 = (PVOID)CoInitialize;       /* ole32.dll */
+    volatile PVOID p3 = (PVOID)InitCommonControls; /* comctl32.dll */
+    (void)p1; (void)p2; (void)p3;
+}
+
+/* volatile gate：编译器无法证明值为 0，不会优化掉 if 分支 */
+static volatile int g_dummy_iat_gate = 0;
 
 /* ---- 架构相关类型别名 ----
  * 让下面代码用统一的 IMAGE_NT_HEADERS_X / thunk_t 等符号，
@@ -553,41 +583,22 @@ static void reserve_preferred_base_region(void) {
     /* 2. 解析 payload 头，校验 magic */
     reflective_payload_t* hdr = (reflective_payload_t*)payload_sec;
     if (hdr->magic != REFLECTIVE_PAYLOAD_MAGIC) return;
-    /* 只处理 v1/v2，其他版本不抢 */
-    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION
-        && hdr->version != REFLECTIVE_PAYLOAD_VERSION_V2) return;
+    /* 只处理 v2，其他版本不抢 */
+    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION) return;
 
-    /* 3. 解析 payload_data 里的 PE 头，读取 preferred_base 和 SizeOfImage
-     *    注意：v2 加密模式下 payload_data 是密文，但 PE 头的 DOS+NT headers
-     *    在加密时是明文（builder 只加密 payload_data 的 body，不加密 PE 头）。
-     *    实际上 v2 模式加密整个 payload_data，这里读到的 NT headers 是密文，
-     *    可能解析失败。但 v2 模式下 hdr->image_base 字段保存了原 PE 的 ImageBase，
-     *    可以直接用。 */
-    uint64_t preferred_base;
-    SIZE_T size_of_image;
-    if (hdr->version == REFLECTIVE_PAYLOAD_VERSION_V2 && (hdr->flags & RFLAG_ENCRYPTED)) {
-        /* v2 加密模式：用 payload 头里的字段（builder 写入）
-         * PE 头是密文无法读取，但 builder 已把 SizeOfImage 写入 payload 头 */
-        preferred_base = hdr->image_base;
-        size_of_image = hdr->size_of_image;
-        /* 如果 size_of_image 无效（老版 builder 没写），用保守值 */
-        if (size_of_image == 0 || size_of_image > 64 * 1024 * 1024) {
-            size_of_image = 2 * 1024 * 1024;  /* 2MB，覆盖大多数 PE */
-        }
-        /* 如果 image_base 不是常见值，跳过（避免浪费地址空间） */
-        if (preferred_base != 0x400000 && preferred_base != 0x10000
-            && preferred_base != 0x140000000 && preferred_base != 0x180000000) {
-            return;
-        }
-    } else {
-        /* v1 明文模式或 v2 未加密：从 payload_data 的 PE 头读 */
-        uint8_t* payload_data = payload_sec + sizeof(reflective_payload_t);
-        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)payload_data;
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-        IMAGE_NT_HEADERS_X* nt = (IMAGE_NT_HEADERS_X*)(payload_data + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-        preferred_base = nt->OptionalHeader.ImageBase;
-        size_of_image = nt->OptionalHeader.SizeOfImage;
+    /* 3. 用 payload 头里的字段读 preferred_base 和 SizeOfImage
+     *    v2 强制加密：payload_data 是密文，PE 头无法直接读取，
+     *    builder 已把 ImageBase / SizeOfImage 写入 payload 头。 */
+    uint64_t preferred_base = hdr->image_base;
+    SIZE_T size_of_image = hdr->size_of_image;
+    /* 如果 size_of_image 无效（防御性），用保守值 */
+    if (size_of_image == 0 || size_of_image > 64 * 1024 * 1024) {
+        size_of_image = 2 * 1024 * 1024;  /* 2MB，覆盖大多数 PE */
+    }
+    /* 如果 image_base 不是常见值，跳过（避免浪费地址空间） */
+    if (preferred_base != 0x400000 && preferred_base != 0x10000
+        && preferred_base != 0x140000000 && preferred_base != 0x180000000) {
+        return;
     }
 
     /* 4. 抢占 preferred_base 处的 size_of_image 大小 */
@@ -710,22 +721,10 @@ static size_t build_dialog(uint8_t* buf) {
  * 必须是全局因为 dlg_proc 签名固定，无法通过 LPARAM 传（用闭包更简洁但 C 不支持）*/
 static reflective_payload_t* g_pwd_hdr = NULL;
 
-/* 密码校验：
- *   - RFLAG_HASH 设置：SHA-256(utf8(input) + salt) == hdr->pwd_hash
- *   - RFLAG_HASH 未设置：明文 wchar_t 对比 hdr->password（避免 -O2 下 SHA-256 不一致）
+/* 密码校验：SHA-256(utf8(input) + salt) == hdr->pwd_hash
+ * v2: 强制 hash 校验（不再支持明文模式）
  * 返回 1 匹配，0 不匹配 */
 static int verify_password(const wchar_t* input, const reflective_payload_t* hdr) {
-    if (!(hdr->flags & RFLAG_HASH)) {
-        /* 明文模式：直接对比 wchar_t 字符串（不能用 wcscmp，/NODEFAULTLIB 下无 CRT）*/
-        const wchar_t* pwd = hdr->password;
-        size_t i;
-        for (i = 0; i < 31; i++) {
-            if (input[i] != pwd[i]) return 0;
-            if (input[i] == 0) return 1;  /* 同时结束，匹配 */
-        }
-        return (input[31] == 0 && pwd[31] == 0) ? 1 : 0;
-    }
-
     /* hash 模式：SHA-256(utf8(input) + salt) == hdr->pwd_hash */
     uint8_t utf8[256];
     size_t utf8_len = utf16le_to_utf8(input, utf8, sizeof(utf8) - 16);
@@ -800,17 +799,11 @@ static int prompt_password(reflective_payload_t* hdr) {
     return 0;  /* never reach */
 }
 
-/* 解密 payload_data：根据 hdr->flags 走 v2 流程
+/* 解密 payload_data：v2 强制加密模式
  *   返回 1 成功（已原地解密 payload_data，可继续 map_image）
  *   返回 0 失败（已 ExitProcess，不会真返回 0） */
 static int decrypt_payload_if_needed(reflective_payload_t* hdr,
                                       uint8_t* payload_data, size_t payload_size) {
-    if (!(hdr->flags & RFLAG_ENCRYPTED)) {
-        /* v1 明文：无需解密 */
-        DBG("payload: v1 plaintext, no decryption needed\n");
-        return 1;
-    }
-
     DBG("payload: v2 encrypted, prompting for password...\n");
 
     /* 测试模式：跳过弹框，直接用硬编码 L"test123" 校验
@@ -1973,7 +1966,7 @@ static int activate_manifest_from_image(uint8_t* img) {
 
 /* ---- 反射式映射主流程 ---- */
 static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
-    (void)hdr;  /* MVP v1 不用 header 字段（v2 加密版会用到）*/
+    (void)hdr;  /* payload_data 已由 decrypt_payload_if_needed 解密，此处直接读 PE 头 */
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)payload_data;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
         DBG("map: bad DOS magic 0x%04x\n", dos->e_magic);
@@ -2476,6 +2469,11 @@ void WINAPI loader_main(void) {
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;  /* stub 不处理命令行参数 */
 #endif
+    /* 假 IAT 引用：volatile gate 保证编译器不优化掉 dummy_iat_padding 调用，
+     * 让链接器把 shell32/ole32/comctl32 加入 IAT。
+     * g_dummy_iat_gate 初始值为 0，条件永远为假，dummy 函数永远不会执行。 */
+    if (g_dummy_iat_gate) dummy_iat_padding();
+
     /* 最早抢占 preferred_base 区域，防止 process heap 扩展挡住加载
      * 必须在 log_init/AddVectoredExceptionHandler 等任何可能触发 heap
      * 扩展的 API 之前调用。find_payload_section 只用 GetModuleHandleW，
@@ -2492,7 +2490,7 @@ int main(int argc, char* argv[]) {
     /* 安装 VEH 捕获 OEP 后的崩溃（调试用） */
     AddVectoredExceptionHandler(1 /*第一个调用*/, refl_veh);
 
-    DBG("=== WinLock Reflective Loader MVP v1 ===\n");
+    DBG("=== WinLock Reflective Loader v2 (XTEA + SHA-256) ===\n");
     DBG("stub image base = %p\n", (void*)GetModuleHandleW(NULL));
 
     /* 1. 定位 .payload 节 */
@@ -2518,11 +2516,10 @@ int main(int argc, char* argv[]) {
             (unsigned long long)REFLECTIVE_PAYLOAD_MAGIC);
         LOADER_EXIT(1);
     }
-    /* 同时接受 v1（明文）和 v2（XTEA 加密 + SHA-256 密码校验） */
-    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION
-        && hdr->version != REFLECTIVE_PAYLOAD_VERSION_V2) {
-        DBG("FATAL: unsupported payload version %u (expected v1=%u or v2=%u)\n",
-            hdr->version, REFLECTIVE_PAYLOAD_VERSION, REFLECTIVE_PAYLOAD_VERSION_V2);
+    /* v2: 只接受 v2（XTEA 加密 + SHA-256 密码校验） */
+    if (hdr->version != REFLECTIVE_PAYLOAD_VERSION) {
+        DBG("FATAL: unsupported payload version %u (expected v2=%u)\n",
+            hdr->version, REFLECTIVE_PAYLOAD_VERSION);
         LOADER_EXIT(1);
     }
     DBG("payload header: version=%u flags=0x%04x original_size=%llu stored_size=%llu\n",

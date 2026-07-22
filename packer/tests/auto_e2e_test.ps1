@@ -335,9 +335,9 @@ function Pack-Sample {
 }
 
 # ---- 端到端 identity 校验（改动 9，审查 A7）----
-# 加壳后用 inspect_stub.py 读 packed.exe 的 .lock 节里的 stub_data_t，
+# 加壳后用 inspect_stub.py 读 packed.exe 的 .text2 节里的 stub_data_t，
 # 与 dist/stub_*.bin 的 identity 对比，确认加壳产物用的是预期的 stub
-# 只对 inplace 模式生效（reflective 产物无 .lock 节）
+# 只对 inplace 模式生效（reflective 产物无 .text2 节）
 # warn-only：不一致只警告，不 fail（避免 inspect_stub.py 解析失败阻断 e2e）
 function Verify-PackedIdentity {
     param(
@@ -350,7 +350,7 @@ function Verify-PackedIdentity {
     $inspectScript = Join-Path $packerRoot "cmake\inspect_stub.py"
     if (-not (Test-Path $inspectScript)) { return $true }
 
-    # 先读 packed.exe 的 identity（从 .lock 节），用其中的 stub_arch 选对应的 stub.bin
+    # 先读 packed.exe 的 identity（从 .text2 节），用其中的 stub_arch 选对应的 stub.bin
     # 不再用文件名猜架构：hellomingw32.exe 等样本名不含 x86 但实际是 x86 程序
     $packedInfo = & $pythonExe $inspectScript $PackedExe --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
     if (-not $packedInfo) {
@@ -368,7 +368,7 @@ function Verify-PackedIdentity {
         return $true
     }
 
-    # 对比关键字段（不含 stub_size：builder 在 .lock 末尾追加 callbacks 数组会扩展节大小）
+    # 对比关键字段（不含 stub_size：builder 在 .text2 末尾追加 callbacks 数组会扩展节大小）
     $fieldsToCompare = @("stub_arch", "stub_toolchain", "stub_bin_ver",
                          "stub_build_time", "stub_source_crc", "stub_githash")
     $allMatch = $true
@@ -381,7 +381,7 @@ function Verify-PackedIdentity {
         }
     }
     if ($allMatch) {
-        Write-Host "      [identity OK] packed.exe .lock 节与 stub.bin 身份一致" -ForegroundColor DarkGray
+        Write-Host "      [identity OK] packed.exe .text2 节与 stub.bin 身份一致" -ForegroundColor DarkGray
     }
     return $allMatch
 }
@@ -436,7 +436,7 @@ function Test-One {
     Write-Host "      产物: $outPath ($((Get-Item $outPath).Length) bytes)" -ForegroundColor DarkGray
 
     # 端到端 identity 校验（改动 9，审查 A7）
-    # 只对 inplace 模式：用 inspect_stub.py 读 packed.exe 的 .lock 节，与 stub.bin 对比
+    # 只对 inplace 模式：用 inspect_stub.py 读 packed.exe 的 .text2 节，与 stub.bin 对比
     Verify-PackedIdentity -PackedExe $outPath -Mode $Mode | Out-Null
 
     # 2. 运行

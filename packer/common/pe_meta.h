@@ -5,14 +5,15 @@
  *
  * 节名常量（≤8字节，PE 节名限制）
  * .payload→.rdata2 已实施（降低 DIE "compressed section" 启发式）
- * .lock→.text2 待实施（涉及 stub 架构改动，暂不动）
+ * .lock→.text2 已实施（伪装为额外代码节，降低 packer 特征）
  */
 #ifndef PE_META_H
 #define PE_META_H
 
-/* Inplace 加壳新增节名（已存在于 config.h，用 ifndef 避免重复定义） */
+/* Inplace 加壳新增节名（已存在于 config.h，用 ifndef 避免重复定义）
+ *   伪装为 .text2（看起来像额外代码节），原名 .lock 是 packer 强特征 */
 #ifndef WINLOCK_SECTION_NAME
-#define WINLOCK_SECTION_NAME  ".lock\0\0\0"
+#define WINLOCK_SECTION_NAME  ".text2\0\0"
 #endif
 
 /* Reflective 加壳 payload 节名

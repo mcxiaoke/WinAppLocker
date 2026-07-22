@@ -25,7 +25,7 @@
 add_executable(builder_reflective
     ${WINLOCK_ROOT}/reflective/builder_reflective.c
 )
-target_link_libraries(builder_reflective PRIVATE advapi32)
+target_link_libraries(builder_reflective PRIVATE advapi32 imagehlp)
 target_compile_options(builder_reflective PRIVATE
     $<$<COMPILE_LANGUAGE:C>:/O2>
     $<$<COMPILE_LANGUAGE:C>:/W3>
@@ -88,7 +88,7 @@ else()
     )
 endif()
 
-target_link_libraries(stub_reflective_${ARCH} PRIVATE user32 kernel32)
+target_link_libraries(stub_reflective_${ARCH} PRIVATE user32 kernel32 shell32 ole32 comctl32)
 
-# stub_reflective_${ARCH}.exe 即是最终产物（与 inplace 不同：reflective 不需要提取 .lock 节，
+# stub_reflective_${ARCH}.exe 即是最终产物（与 inplace 不同：reflective 不需要提取 .text2 节，
 # builder_reflective 直接读 stub 的整个 PE 文件）

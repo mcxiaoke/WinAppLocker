@@ -12,9 +12,9 @@
  *   7. 跳原 OEP（PEB.ImageBaseAddress + oep_rva）
  *
  * PIC 保证：
- *   - 所有静态数据用 __attribute__((section(".lock.*"))) 放入 .lock 输出节
+ *   - 所有静态数据用 __attribute__((section(".text2.*"))) 放入 .text2 输出节
  *   - x64 small code model 默认 RIP-relative 访问全局，本身就是 PIC
- *   - 链接脚本 stub.ld 保证 stub_entry 在 .lock 节起始处
+ *   - 链接脚本 stub.ld 保证 stub_entry 在 .text2 节起始处
  *   - 不调用任何外部函数（无 IAT 依赖）
  */
 
@@ -49,7 +49,7 @@
  * #pragma function(memset, memcpy) 强制编译器对这两个函数使用函数调用
  * （不用 intrinsic），让我们提供的本地实现被实际调用。
  *
- * 函数本身用 WINLOCK_SECTION_TEXT 放进 .lock$text 节，保持 PIC 自包含。
+ * 函数本身用 WINLOCK_SECTION_TEXT 放进 .text2$text 节，保持 PIC 自包含。
  *
  * GCC 不需要：-fno-builtin 已禁用 builtin 识别，循环保持为循环。
  * ============================================================ */
@@ -98,7 +98,7 @@ typedef void (WINAPI *TLS_CALLBACK)(PVOID, DWORD, PVOID);
 #define WINLOCK_DLL_PROCESS_DETACH 0
 
 /* ============================================================
- * .lock.data 节：所有静态数据
+ * .text2.data 节：所有静态数据
  *   stub_data + 字符串常量 + 运行时函数指针表
  * ============================================================ */
 
@@ -107,7 +107,7 @@ WINLOCK_SECTION_DATA
 volatile stub_data_t stub_data = {
     .magic         = STUB_DATA_MAGIC,
     .version       = STUB_DATA_VERSION,
-    .flags         = 0,                    /* builder 设 1 表示用 hash */
+    .flags         = 0,                    /* builder 设置 TEST/TLS_PROXY/ASLR/ANTIDEBUG */
     .max_retries   = STUB_DEFAULT_MAX_RETRIES,
     .reserved16    = 0,
     .oep_rva       = 0,
@@ -119,7 +119,6 @@ volatile stub_data_t stub_data = {
                       WINLOCK_XTEA_KEY2, WINLOCK_XTEA_KEY3 },
     .salt          = { 0 },
     .pwd_hash      = { 0 },
-    .password      = WINLOCK_DEFAULT_PASSWORD,
     .image_base    = 0,
     .reloc_rva     = 0,
     .reloc_size    = 0,
@@ -151,8 +150,8 @@ static volatile struct {
     FnMessageBoxW             MessageBoxW;
 } fn = { 0 };
 
-/* 字符串常量（必须显式放在 .lock.rdata 节，避免被 .rdata 丢弃）
- * 注意：const 与 non-const 不能混在同一个 section，所以单独用 .lock.rdata
+/* 字符串常量（必须显式放在 .text2.rdata 节，避免被 .rdata 丢弃）
+ * 注意：const 与 non-const 不能混在同一个 section，所以单独用 .text2.rdata
  *
  * P1-1 后：API 名 / 模块名已 hash 化，明文字符串删除。
  * 仅保留 UI 文本（标题/按钮/提示）和 LoadLibraryA 参数 "user32.dll"。
@@ -175,7 +174,7 @@ WINLOCK_SECTION_RDATA
 static const char STR_USER32_A[]                 = "user32.dll";
 
 /* ============================================================
- * .lock.text 节：辅助函数
+ * .text2.text 节：辅助函数
  * ============================================================ */
 
 /* 窄字符串长度 */
@@ -192,16 +191,6 @@ static size_t my_wstrlen(const wchar_t* s) {
     size_t n = 0;
     while (s[n]) n++;
     return n;
-}
-
-/* 宽字符串相等比较 */
-WINLOCK_SECTION_TEXT
-static int wstr_eq(const wchar_t* a, const wchar_t* b) {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
-    }
-    return *a == *b;
 }
 
 /* 大小写不敏感的宽字符比较（用于模块名） */
@@ -402,30 +391,24 @@ static size_t build_dialog(uint8_t* buf) {
 
 /* ============================================================
  * 对话框过程
- * 通过 .lock.data 全局 fn 访问 user32 函数
- * 通过 .lock.data 全局 stub_data 读取密码（v2: SHA-256 hash）
+ * 通过 .text2.data 全局 fn 访问 user32 函数
+ * 通过 .text2.data 全局 stub_data 读取密码（SHA-256 hash 校验）
  * ============================================================ */
 WINLOCK_SECTION_TEXT
 static int verify_password(const wchar_t* input) {
-    if (stub_data.flags & 0x1) {
-        /* v2: hash 模式
-         *   SHA-256(utf8(input) + salt) == pwd_hash
-         */
-        uint8_t utf8[256];
-        size_t utf8_len = utf16le_to_utf8(input, utf8, sizeof(utf8) - 16);
+    /* v6: 强制 SHA-256 hash 校验（不再支持明文模式）
+     *   SHA-256(utf8(input) + salt) == pwd_hash */
+    uint8_t utf8[256];
+    size_t utf8_len = utf16le_to_utf8(input, utf8, sizeof(utf8) - 16);
 
-        sha256_ctx ctx;
-        sha256_init(&ctx);
-        sha256_update(&ctx, utf8, utf8_len);
-        sha256_update(&ctx, (const uint8_t*)stub_data.salt, 16);
-        uint8_t digest[32];
-        sha256_final(&ctx, digest);
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, utf8, utf8_len);
+    sha256_update(&ctx, (const uint8_t*)stub_data.salt, 16);
+    uint8_t digest[32];
+    sha256_final(&ctx, digest);
 
-        return bytes_eq_const(digest, (const uint8_t*)stub_data.pwd_hash, 32);
-    } else {
-        /* v1 兼容：明文比较 */
-        return wstr_eq(input, (const wchar_t*)stub_data.password);
-    }
+    return bytes_eq_const(digest, (const uint8_t*)stub_data.pwd_hash, 32);
 }
 
 WINLOCK_SECTION_TEXT
@@ -798,8 +781,8 @@ static int prompt_password(void) {
 
 /* ============================================================
  * stub 入口
- *   链接脚本保证 stub_entry 在 .lock 节起始（offset 0）
- *   builder 设置 AddressOfEntryPoint = .lock_RVA + 0
+ *   链接脚本保证 stub_entry 在 .text2 节起始（offset 0）
+ *   builder 设置 AddressOfEntryPoint = .text2_RVA + 0
  *
  *   两种工作模式：
  *   - 直接模式（默认）：stub_entry 完成密码校验 + 解密 + 跳 OEP
@@ -812,15 +795,32 @@ void stub_entry(void) {
     /* 1. PEB walk 找 kernel32（windows 启动时已加载）
      *    P1-1: 用 hash 替代明文模块名，避免 strings 暴露 "kernel32.dll" */
     PVOID k32 = find_module_by_hash(HASH_MOD_KERNEL32_DLL);
-    if (!k32) goto fail;
+    if (!k32) goto fail_raw;
 
-    /* 2. 解析 kernel32 关键函数（P1-1: hash 替代明文 API 名） */
+    /* 1.5 临时解析 VirtualProtect / ExitProcess（fn 表还在 ERC 页，不能写）
+     *   .text2 节属性为 ERC（无 W），fn 表在 .text2$data 子节，运行时需要写。
+     *   先用 PEB walk 直接获取 VirtualProtect 指针（存在栈上，栈有 W 权限），
+     *   调 VirtualProtect 把 fn 表所在页改为 RWX，才能写 fn 表。
+     *   用 PAGE_EXECUTE_READWRITE 而非 PAGE_READWRITE：fn 表所在页可能包含
+     *   .text2 节代码（stub_entry 等），改 RW 会去掉 E 导致代码无法执行。
+     *   运行时权限翻转不影响静态分析（PE 节表仍是 ERC，无 W+X 特征）。 */
+    FnVirtualProtect pVP = (FnVirtualProtect)find_export_by_hash(k32, HASH_VIRTUALPROTECT);
+    FnExitProcess    pEP = (FnExitProcess)find_export_by_hash(k32, HASH_EXITPROCESS);
+    if (!pVP || !pEP) goto fail_raw;
+
+    DWORD old_prot = 0;
+    if (!pVP((LPVOID)&fn, sizeof(fn), PAGE_EXECUTE_READWRITE, &old_prot)) {
+        /* VirtualProtect 失败，fn 表不可写，无法继续 */
+        pEP(2);
+    }
+
+    /* 2. 解析 kernel32 关键函数（P1-1: hash 替代明文 API 名）
+     *   fn 表现在可写（step 1.5 改为 RWX） */
     fn.GetProcAddress = (FnGetProcAddress)find_export_by_hash(k32, HASH_GETPROCADDRESS);
     fn.LoadLibraryA  = (FnLoadLibraryA)   find_export_by_hash(k32, HASH_LOADLIBRARYA);
-    fn.VirtualProtect = (FnVirtualProtect) find_export_by_hash(k32, HASH_VIRTUALPROTECT);
-    fn.ExitProcess   = (FnExitProcess)     find_export_by_hash(k32, HASH_EXITPROCESS);
-    if (!fn.GetProcAddress || !fn.LoadLibraryA
-        || !fn.VirtualProtect || !fn.ExitProcess)
+    fn.VirtualProtect = pVP;              /* 复用 step 1.5 已解析的 */
+    fn.ExitProcess   = pEP;               /* 复用 step 1.5 已解析的 */
+    if (!fn.GetProcAddress || !fn.LoadLibraryA)
         goto fail;
 
     /* 2a. PEB 反调试（P1-2）：检测到调试器立即退出，不让调试器有机会 dump IAT
@@ -880,6 +880,11 @@ void stub_entry(void) {
 fail:
     fn.ExitProcess(2);
     while (1) { /* never reach */ }
+
+fail_raw:
+    /* fn 表未初始化（step 1.5 之前失败），不能调 fn.ExitProcess。
+     * 直接卡死让 Windows loader 终止进程（异常退出）。 */
+    while (1) { /* never reach */ }
 }
 
 /* ============================================================
@@ -895,7 +900,7 @@ fail:
  *
  *   流程：
  *   - builder 检测到原 PE 有 TLS callbacks 时启用 TLS_PROXY 模式：
- *     1. 在 .lock 节内创建新 TLS directory + callbacks 数组 [stub_tls_callback, NULL]
+ *     1. 在 .text2 节内创建新 TLS directory + callbacks 数组 [stub_tls_callback, NULL]
  *     2. DataDirectory[9] 指向新 TLS directory
  *     3. Windows loader 在 EP 之前调用 stub_tls_callback(DLL_PROCESS_ATTACH)
  *   - stub_tls_callback 直接返回（空实现），不做任何事
@@ -919,22 +924,22 @@ static volatile int g_tls_decrypted = 0;
  * stub_tls_callback + g_stub_tls_cb_marker 的定义（MinGW 路径）
  *
  * MSVC 路径：marker + function 由 stub_asm_${ARCH}.asm 提供，
- *           放进同一个 .lock$tlscb SEGMENT (READ EXECUTE)。
+ *           放进同一个 .text2$tlscb SEGMENT (READ EXECUTE)。
  *           原因：MSVC link.exe 不合并不同 flag 的 $ 子节
- *           (.lock$tlscbm 是 const data 0x40000040，
- *            .lock$tlscb 是 code 0x60000020)，
+ *           (.text2$tlscbm 是 const data 0x40000040，
+ *            .text2$tlscb 是 code 0x60000020)，
  *           导致 marker 和 function 分到不同输出节，
  *           builder.c 的 find_stub_tls_cb_offset 假设 function = magic + 16 失效。
  *
  * MinGW 路径：marker + function 用 C 定义，stub.ld 的 KEEP() + SUBALIGN(16)
- *           保证 marker 和 function 在 .lock 节内连续相邻。
+ *           保证 marker 和 function 在 .text2 节内连续相邻。
  * ============================================================ */
 #ifndef _MSC_VER
 /* stub_tls_callback 的定位魔数：builder 在 stub.bin 中搜索此 8 字节，
  * 紧随其后的就是 stub_tls_callback 函数入口。
  *
- * 放在独立 section .lock.tlscbm 中（const 数据不能与函数同 section），
- * stub.ld 把 .lock.tlscbm 紧接在 .lock.text 之后、.lock.tlscb 之前。
+ * 放在独立 section .text2.tlscbm 中（const 数据不能与函数同 section），
+ * stub.ld 把 .text2.tlscbm 紧接在 .text2.text 之后、.text2.tlscb 之前。
  *
  * 用 16 字节数组（magic + zero pad）：因为 stub.ld 的 SUBALIGN(16) 强制
  * 每个子节 16 字节对齐，marker 后必然有填充。让 marker 自身占满 16 字节，
@@ -942,7 +947,7 @@ static volatile int g_tls_decrypted = 0;
 WINLOCK_SECTION_TLSCBM
 static const uint64_t g_stub_tls_cb_marker[2] = { STUB_TLS_CB_MAGIC, 0 };
 
-/* TLS callback 必须有特定签名，且放在 .lock.tlscb 节（代码节）
+/* TLS callback 必须有特定签名，且放在 .text2.tlscb 节（代码节）
  * Windows loader 通过 IMAGE_TLS_DIRECTORY.AddressOfCallBacks 调用 */
 WINLOCK_SECTION_TLSCB
 void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {

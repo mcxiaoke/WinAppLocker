@@ -10,13 +10,15 @@
 #define WINLOCK_COMPAT_H
 
 #ifdef _MSC_VER
-  /* MSVC: 用 __pragma 包裹式宏（可在宏内使用 #pragma） */
-  #define WINLOCK_SECTION_TEXT    __pragma(code_seg(".lock$text")) __declspec(noinline)
-  #define WINLOCK_SECTION_DATA    __pragma(data_seg(".lock$data")) __declspec(align(16))
-  #define WINLOCK_SECTION_RDATA   __pragma(const_seg(".lock$rdata"))
-  #define WINLOCK_SECTION_ENTRY   __pragma(code_seg(".lock$entry")) __declspec(noinline)
-  #define WINLOCK_SECTION_TLSCBM  __pragma(const_seg(".lock$tlscbm")) __declspec(align(16))
-  #define WINLOCK_SECTION_TLSCB   __pragma(code_seg(".lock$tlscb")) __declspec(noinline)
+  /* MSVC: 用 __pragma 包裹式宏（可在宏内使用 #pragma）
+   *   节名用 .text2$X 子节，link.exe 按 $ 分组合并到 .text2 节。
+   *   原名 .lock$X 是 packer 强特征，改为 .text2$X 降低启发式可疑度。 */
+  #define WINLOCK_SECTION_TEXT    __pragma(code_seg(".text2$text")) __declspec(noinline)
+  #define WINLOCK_SECTION_DATA    __pragma(data_seg(".text2$data")) __declspec(align(16))
+  #define WINLOCK_SECTION_RDATA   __pragma(const_seg(".text2$rdata"))
+  #define WINLOCK_SECTION_ENTRY   __pragma(code_seg(".text2$entry")) __declspec(noinline)
+  #define WINLOCK_SECTION_TLSCBM  __pragma(const_seg(".text2$tlscbm")) __declspec(align(16))
+  #define WINLOCK_SECTION_TLSCB   __pragma(code_seg(".text2$tlscb")) __declspec(noinline)
   #define WINLOCK_SECTION_CRT_XLB __pragma(section(".CRT$XLB", read)) __declspec(allocate(".CRT$XLB"))
   /* TLS callback 数组边界（XLA=起始 NULL, XLZ=结束 NULL），让链接器合并 .CRT$XLA<XLB<XLZ */
   #define WINLOCK_SECTION_CRT_XLA __pragma(section(".CRT$XLA", read)) __declspec(allocate(".CRT$XLA"))
@@ -31,13 +33,15 @@
   #include <intrin.h>
   #define WINLOCK_SFENCE()        _mm_sfence()
 #else
-  /* GCC: 保持原样，与原始 __attribute__ 写法一致 */
-  #define WINLOCK_SECTION_TEXT    __attribute__((section(".lock.text"), used, noinline))
-  #define WINLOCK_SECTION_DATA    __attribute__((section(".lock.data"), used, aligned(16)))
-  #define WINLOCK_SECTION_RDATA   __attribute__((section(".lock.rdata"), used, aligned(2)))
-  #define WINLOCK_SECTION_ENTRY   __attribute__((section(".lock.entry"), used, noinline))
-  #define WINLOCK_SECTION_TLSCBM  __attribute__((section(".lock.tlscbm"), used, aligned(16)))
-  #define WINLOCK_SECTION_TLSCB   __attribute__((section(".lock.tlscb"), used, noinline))
+  /* GCC: 保持原样，与原始 __attribute__ 写法一致
+   *   节名用 .text2.X，stub.ld 用 KEEP(*(.text2.*)) 保留。
+   *   原名 .lock.X 是 packer 强特征，改为 .text2.X 降低启发式可疑度。 */
+  #define WINLOCK_SECTION_TEXT    __attribute__((section(".text2.text"), used, noinline))
+  #define WINLOCK_SECTION_DATA    __attribute__((section(".text2.data"), used, aligned(16)))
+  #define WINLOCK_SECTION_RDATA   __attribute__((section(".text2.rdata"), used, aligned(2)))
+  #define WINLOCK_SECTION_ENTRY   __attribute__((section(".text2.entry"), used, noinline))
+  #define WINLOCK_SECTION_TLSCBM  __attribute__((section(".text2.tlscbm"), used, aligned(16)))
+  #define WINLOCK_SECTION_TLSCB   __attribute__((section(".text2.tlscb"), used, noinline))
   #define WINLOCK_SECTION_CRT_XLB __attribute__((section(".CRT$XLB"), used))
   /* TLS callback 数组边界（XLA=起始 NULL, XLZ=结束 NULL），让链接器合并 .CRT$XLA<XLB<XLZ */
   #define WINLOCK_SECTION_CRT_XLA __attribute__((section(".CRT$XLA"), used))

@@ -5,7 +5,7 @@
  * 已经过 host 模式测试验证与系统 sha256sum.exe 输出完全一致。
  *
  * 这个头文件被多处复用：
- *   1. stub.c (PIC stub) - 通过 WINLOCK_PIC 宏在 .lock$text 节
+ *   1. stub.c (PIC stub) - 通过 WINLOCK_PIC 宏在 .text2$text 节
  *   2. loader.c (reflective loader) - 不定义 WINLOCK_PIC，普通 host 函数
  *   3. tests/stub_sha256_test.c (普通 host 程序) - 不带 section 属性
  *
@@ -22,15 +22,15 @@
 #include <stddef.h>
 
 /* 函数节区属性：三模式切换
- *   - MSVC PIC 模式：函数进 .lock$text 节（阶段 3+ 使用）
- *   - GCC PIC 模式：函数进 .lock.text 节（当前 stub 用）
+ *   - MSVC PIC 模式：函数进 .text2$text 节（阶段 3+ 使用）
+ *   - GCC PIC 模式：函数进 .text2.text 节（当前 stub 用）
  *   - host 模式：普通函数（builder/loader/test 用） */
 #if defined(WINLOCK_PIC) && defined(_MSC_VER)
-  /* MSVC PIC 模式：函数进 .lock$text 节 */
-  #define WINLOCK_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
+  /* MSVC PIC 模式：函数进 .text2$text 节 */
+  #define WINLOCK_FN __pragma(code_seg(".text2$text")) __declspec(noinline)
 #elif defined(WINLOCK_PIC)
-  /* GCC PIC 模式：函数进 .lock.text 节，关闭优化防 optimizer bug */
-  #define WINLOCK_FN __attribute__((section(".lock.text"), used, noinline, optimize("O0")))
+  /* GCC PIC 模式：函数进 .text2.text 节，关闭优化防 optimizer bug */
+  #define WINLOCK_FN __attribute__((section(".text2.text"), used, noinline, optimize("O0")))
 #else
   /* host 模式：普通函数 */
   #define WINLOCK_FN
@@ -63,16 +63,16 @@ typedef struct {
  *       移到文件作用域对 GCC 输出字节无影响（static const 仍按节区放置）。
  *
  * 节名约定（见 winlock_compat.h）：
- *   - MSVC:  #pragma const_seg(".lock$rdata") 切到 .lock$rdata 节
- *           （链接时按 COFF $ 分组合并到 .lock 节）
- *   - GCC:   __attribute__((section(".lock.rdata"))) 直接放节上
- *           （stub.ld 用 KEEP(*(.lock.rdata)) 保留）
+ *   - MSVC:  #pragma const_seg(".text2$rdata") 切到 .text2$rdata 节
+ *           （链接时按 COFF $ 分组合并到 .text2 节）
+ *   - GCC:   __attribute__((section(".text2.rdata"))) 直接放节上
+ *           （stub.ld 用 KEEP(*(.text2.rdata)) 保留）
  *
  * 注意：K[] 数组值来自 Brad Conte 的实现，已通过 host 模式
  *       与 sha256sum.exe 对比验证。 */
 #if defined(WINLOCK_PIC) && defined(_MSC_VER)
-  /* MSVC PIC：切到 .lock$rdata 节，声明后切回默认 .rdata */
-  #pragma const_seg(".lock$rdata")
+  /* MSVC PIC：切到 .text2$rdata 节，声明后切回默认 .rdata */
+  #pragma const_seg(".text2$rdata")
   static const uint32_t SHA256_K[64] = {
       0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
       0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -86,7 +86,7 @@ typedef struct {
   #pragma const_seg()
 #elif defined(WINLOCK_PIC)
   /* GCC PIC：__attribute__ 修饰变量节区，无需 #pragma */
-  static const uint32_t SHA256_K[64] __attribute__((section(".lock.rdata"), used, aligned(16))) = {
+  static const uint32_t SHA256_K[64] __attribute__((section(".text2.rdata"), used, aligned(16))) = {
       0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
       0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
       0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
