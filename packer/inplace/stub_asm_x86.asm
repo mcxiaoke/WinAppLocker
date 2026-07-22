@@ -38,4 +38,43 @@ _jump_to_oep_x86 ENDP
 
 locktext ENDS
 
+; ============================================================
+; stub_tls_callback + g_stub_tls_cb_marker（MSVC 特有方案）
+;
+; 问题：MSVC link.exe 不合并不同 flag 的 $ 子节
+;   - .lock$tlscbm 是 const data (flags 0x40000040, read-only)
+;   - .lock$tlscb 是 code (flags 0x60000020, read+execute)
+;   导致 marker 和 function 分到不同 .lock 输出节，
+;   builder.c 的 find_stub_tls_cb_offset 假设 function = magic + 16 失效。
+;
+; 解决：用 .asm 把 marker 和 function 放进同一个 .lock$tlscb SEGMENT
+;   (READ EXECUTE)，保证 marker + 16 = function 的布局。
+;   MinGW 仍用 stub.c 中的 C 定义 + stub.ld 的 KEEP() 保证顺序。
+;
+; 注意：
+;   - marker 必须在 8 字节对齐处（builder.c 按 8 字节对齐搜索 magic）
+;   - stub_tls_callback 是空实现，所有工作推到 stub_entry 完成
+;   - x86 WINAPI(stdcall) 3 个 DWORD 参数 = 12 字节，用 RET 12 清栈
+;   - x86 stdcall decoration: _name@N，符号名为 _stub_tls_callback@12
+;   - stub_tls_callback 必须用 /INCLUDE:_stub_tls_callback@12 强制保留
+;     （未被 stub.c 引用，/OPT:REF 会移除）
+; ============================================================
+locktlscb SEGMENT READ EXECUTE ALIAS('.lock$tlscb')
+
+; g_stub_tls_cb_marker: 8 字节 magic + 8 字节 zero pad = 16 字节
+; STUB_TLS_CB_MAGIC = 0x424C4C4143534C54ULL ("TLSCALLB" 小端)
+PUBLIC _g_stub_tls_cb_marker
+_g_stub_tls_cb_marker DQ 0424C4C4143534C54h
+                      DQ 0
+
+; stub_tls_callback 函数入口（紧跟 marker+16）
+; 空实现：直接返回（所有工作推到 stub_entry 完成）
+; x86 WINAPI(stdcall): 3 个 DWORD 参数 = 12 字节，被调用方清栈用 RET 12
+PUBLIC _stub_tls_callback@12
+_stub_tls_callback@12 PROC
+    ret 12
+_stub_tls_callback@12 ENDP
+
+locktlscb ENDS
+
 END

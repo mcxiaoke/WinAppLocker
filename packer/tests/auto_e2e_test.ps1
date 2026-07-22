@@ -223,9 +223,12 @@ function Send-PasswordToDialog {
 # TestMode: -t 模式下预期 stdout / 窗口
 # PasswordMode: -p 模式下预期 stdout / 窗口
 $testSamples = @(
-    @{ Name="hellocli.exe";     Type="CUI"; TestExpect="Hello World!"; PwdExpect="Hello World!" },
     @{ Name="hellomingw.exe";   Type="CUI"; TestExpect="Hello, MinGW"; PwdExpect="Hello, MinGW" },
+    @{ Name="hellomingw32.exe";    Type="CUI"; TestExpect="Hello, MINGW32!";  PwdExpect="Hello, MINGW32!" },
     @{ Name="helloucrt.exe";    Type="CUI"; TestExpect="Hello, UCRT";  PwdExpect="Hello, UCRT" },
+    @{ Name="helloclivsx86.exe";    Type="CUI"; TestExpect="Hello VSx86!";  PwdExpect="Hello VSx86!" },
+    @{ Name="helloclivsx64.exe";    Type="CUI"; TestExpect="Hello VSx64!";  PwdExpect="Hello VSx64!" },
+
     @{ Name="helloguix86.exe";  Type="GUI"; TestExpect="window";       PwdExpect="window" },
     @{ Name="helloguix64.exe";  Type="GUI"; TestExpect="window";       PwdExpect="window" },
     @{ Name="hellomfcx86.exe";  Type="GUI"; TestExpect="window";       PwdExpect="window" },
@@ -297,7 +300,7 @@ function Pack-Sample {
     } else {
         $srcExe = Join-Path $samples $SampleName
     }
-    if (-not (Test-Path $srcExe)) { return @{ ok=$false; rc=-1; out="sample not found" } }
+    if (-not (Test-Path $srcExe)) { return @{ ok=$false; rc=-1; out="sample not found: $srcExe" } }
 
     # 清理旧输出文件：上次测试可能残留进程占用 exe 文件
     # 先杀同名进程，再删除文件，避免 "Permission denied" 导致 PACK_FAIL
@@ -347,18 +350,21 @@ function Verify-PackedIdentity {
     $inspectScript = Join-Path $packerRoot "cmake\inspect_stub.py"
     if (-not (Test-Path $inspectScript)) { return $true }
 
-    # 判断输入 PE 架构选对应的 stub.bin
-    # 简化：用文件名约定（x86 样本名含 x86，否则 x64）
-    $sampleArch = if ($PackedExe -match "x86") { "x86" } else { "x64" }
+    # 先读 packed.exe 的 identity（从 .lock 节），用其中的 stub_arch 选对应的 stub.bin
+    # 不再用文件名猜架构：hellomingw32.exe 等样本名不含 x86 但实际是 x86 程序
+    $packedInfo = & $pythonExe $inspectScript $PackedExe --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
+    if (-not $packedInfo) {
+        # inspect_stub.py 失败（如 PE 解析失败），不阻断测试
+        return $true
+    }
+    # stub_arch: 1=x86, 2=x64（config.h STUB_ARCH_X86/X64）
+    $sampleArch = if ($packedInfo.stub_arch -eq 1) { "x86" } else { "x64" }
     $stubBin = Join-Path $dist "stub_inplace_$sampleArch.bin"
     if (-not (Test-Path $stubBin)) { return $true }
 
     # 读 stub.bin 的 identity
     $stubInfo = & $pythonExe $inspectScript $stubBin --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
-    # 读 packed.exe 的 identity（从 .lock 节）
-    $packedInfo = & $pythonExe $inspectScript $PackedExe --format=json --winlock-root $packerRoot 2>$null | ConvertFrom-Json
-    if (-not $stubInfo -or -not $packedInfo) {
-        # inspect_stub.py 失败（如 PE 解析失败），不阻断测试
+    if (-not $stubInfo) {
         return $true
     }
 
@@ -420,8 +426,12 @@ function Test-One {
     $isTest = ($PasswordMode -eq "test")
     $pack = Pack-Sample -Mode $Mode -SampleName $sampleName -OutPath $outPath -Password $testPwd -TestMode:$isTest -SamplePath $Sample.SamplePath
     if (-not $pack.ok) {
-        Write-Host "[FAIL] 加壳失败 (rc=$($pack.rc))" -ForegroundColor Red
-        return @{ tag=$tag; sample=$sampleName; result="PACK_FAIL"; detail="rc=$($pack.rc)" }
+        # 打印详细失败原因：pack.out 可能是 "sample not found" 或 builder 的 stderr/stdout
+        # 不再只显示 rc，避免 "文件找不到" 被误报为 "加壳失败"
+        $reason = $pack.out
+        if (-not $reason) { $reason = "rc=$($pack.rc) (无输出)" }
+        Write-Host "[FAIL] 加壳失败: $reason" -ForegroundColor Red
+        return @{ tag=$tag; sample=$sampleName; result="PACK_FAIL"; detail=$reason }
     }
     Write-Host "      产物: $outPath ($((Get-Item $outPath).Length) bytes)" -ForegroundColor DarkGray
 
@@ -468,14 +478,15 @@ function Test-One {
                 Write-Host "[PASS] exit=0" -ForegroundColor Green
                 return @{ tag=$tag; sample=$sampleName; result="PASS"; detail="exit=$exitCode" }
             } else {
-                Write-Host "[FAIL] exit=$exitCode" -ForegroundColor Red
-                return @{ tag=$tag; sample=$sampleName; result="CRASH"; detail="exit=$exitCode" }
+                # 打印 stdout（可能含崩溃前的输出）便于诊断
+                Write-Host "[FAIL] exit=$exitCode stdout='$stdout'" -ForegroundColor Red
+                return @{ tag=$tag; sample=$sampleName; result="CRASH"; detail="exit=$exitCode out='$stdout'" }
             }
         } elseif ($stdout -match $expect) {
             Write-Host "[PASS] 输出匹配" -ForegroundColor Green
             return @{ tag=$tag; sample=$sampleName; result="PASS"; detail="exit=$exitCode out='$stdout'" }
         } else {
-            Write-Host "[FAIL] 输出不匹配, 期望: '$expect'" -ForegroundColor Red
+            Write-Host "[FAIL] 输出不匹配, 期望: '$expect' 实际: '$stdout'" -ForegroundColor Red
             return @{ tag=$tag; sample=$sampleName; result="OUT_FAIL"; detail="exit=$exitCode out='$stdout'" }
         }
     } else {

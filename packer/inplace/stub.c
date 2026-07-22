@@ -915,6 +915,21 @@ fail:
 WINLOCK_SECTION_DATA
 static volatile int g_tls_decrypted = 0;
 
+/* ============================================================
+ * stub_tls_callback + g_stub_tls_cb_marker 的定义（MinGW 路径）
+ *
+ * MSVC 路径：marker + function 由 stub_asm_${ARCH}.asm 提供，
+ *           放进同一个 .lock$tlscb SEGMENT (READ EXECUTE)。
+ *           原因：MSVC link.exe 不合并不同 flag 的 $ 子节
+ *           (.lock$tlscbm 是 const data 0x40000040，
+ *            .lock$tlscb 是 code 0x60000020)，
+ *           导致 marker 和 function 分到不同输出节，
+ *           builder.c 的 find_stub_tls_cb_offset 假设 function = magic + 16 失效。
+ *
+ * MinGW 路径：marker + function 用 C 定义，stub.ld 的 KEEP() + SUBALIGN(16)
+ *           保证 marker 和 function 在 .lock 节内连续相邻。
+ * ============================================================ */
+#ifndef _MSC_VER
 /* stub_tls_callback 的定位魔数：builder 在 stub.bin 中搜索此 8 字节，
  * 紧随其后的就是 stub_tls_callback 函数入口。
  *
@@ -947,3 +962,4 @@ void WINAPI stub_tls_callback(PVOID hModule, DWORD reason, PVOID reserved) {
     (void)reserved;
     return;
 }
+#endif /* !_MSC_VER */

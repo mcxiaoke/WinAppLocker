@@ -70,6 +70,12 @@ target_compile_options(stub_inplace_${ARCH} PRIVATE
 #   /BASE:0x10000    - 镜像基址（避免撞输入 PE 的 0x400000 或 0x140000000）
 #   /DYNAMICBASE:NO  - 关闭 ASLR（stub 用绝对地址，需固定基址）
 #   /OPT:REF /OPT:ICF - 去除未引用函数 + 合并相同 COMDAT
+#   /INCLUDE:stub_tls_callback - 强制保留 stub_tls_callback
+#     原因：stub_tls_callback 由 stub_asm_${ARCH}.asm 提供，未被 stub.c 直接引用
+#     （Windows loader 通过 TLS callbacks 数组调用，存地址不存符号），
+#     /OPT:REF 会移除未引用符号，导致 stub.bin 缺失 stub_tls_callback 代码。
+#     /INCLUDE 强制保留该符号及其所在 .lock$tlscb 节（含 g_stub_tls_cb_marker）。
+#     x86 stdcall decoration: _stub_tls_callback@12（3 个 DWORD 参数 = 12 字节）
 #
 # x86 额外 /FIXED:NO：
 #   保留 .reloc 节（builder 加壳 x86 PE 时需读它做预 patch）。
@@ -84,6 +90,7 @@ if(ARCH STREQUAL "x86")
         /FIXED:NO
         /OPT:REF
         /OPT:ICF
+        /INCLUDE:_stub_tls_callback@12
     )
 else()
     target_link_options(stub_inplace_${ARCH} PRIVATE
@@ -94,6 +101,7 @@ else()
         /DYNAMICBASE:NO
         /OPT:REF
         /OPT:ICF
+        /INCLUDE:stub_tls_callback
     )
 endif()
 
