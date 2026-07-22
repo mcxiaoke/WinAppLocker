@@ -39,8 +39,9 @@
      * /OPT:REF 会自动移除未引用函数（如 stub 不用的 xtea_encrypt_*） */
     #define WINLOCK_XTEA_FN __pragma(code_seg(".lock$text")) __declspec(noinline)
   #else
-    /* GCC: section + noinline 不带 used，--gc-sections 移除未调用函数 */
-    #define WINLOCK_XTEA_FN __attribute__((section(".lock.text"), noinline))
+    /* GCC: section + noinline 不带 used，--gc-sections 移除未调用函数
+     * 加 unused 属性：stub 只用解密不用加密，避免 unused-function 警告 */
+    #define WINLOCK_XTEA_FN __attribute__((section(".lock.text"), noinline, unused))
   #endif
 #else
   #define WINLOCK_XTEA_FN

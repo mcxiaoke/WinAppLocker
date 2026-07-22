@@ -37,12 +37,16 @@ include_directories(${WINLOCK_ROOT}/common)
 # 全局 MSVC 编译选项
 # /utf-8           源码与执行字符集均按 UTF-8 处理
 # /Zc:preprocessor 启用一致预处理器
-# /MT              静态 CRT（仅 builder 用，stub/loader 用 PIC 选项覆盖）
 add_compile_options(
     $<$<COMPILE_LANGUAGE:C>:/utf-8>
     $<$<COMPILE_LANGUAGE:C>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:C>:/MT>
 )
+# 用 CMAKE_MSVC_RUNTIME_LIBRARY 替代 /MT 命令行选项
+# 避免 D9025 警告（CMake Release 默认 /MD 与全局 /MT 冲突）
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+# 清空 CMake Release 默认的 /O2，由各 target 自行指定 /O1 或 /O2
+# 避免 stub target 的 /O1 与全局 /O2 冲突的 D9025 警告
+string(REPLACE "/O2" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 add_compile_definitions(
     _CRT_SECURE_NO_WARNINGS
     _CRT_NONSTDC_NO_DEPRECATION

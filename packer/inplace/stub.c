@@ -23,9 +23,11 @@
 #ifndef _MSC_VER
 /* GCC-only: 为 windows.h 提供 __faststorefence 的替代实现
  * MinGW 的 -mno-sse2 编译模式下 sfence 是 SSE2 指令，需手动包装
- * MSVC 用 _mm_sfence()（intrin.h 已在 winlock_compat.h 中引入） */
-static __inline__ void __winlock_sfence(void) { WINLOCK_SFENCE(); }
-#define __builtin_ia32_sfence() __winlock_sfence()
+ * MSVC 用 _mm_sfence()（intrin.h 已在 winlock_compat.h 中引入）
+ *
+ * 直接定义 __builtin_ia32_sfence 为内联汇编，避免中间 static 函数
+ * 触发 MinGW intrin.h 的 'static but used in inline function' 警告 */
+#define __builtin_ia32_sfence() __asm__ __volatile__("sfence" ::: "memory")
 #endif
 #include <windows.h>
 #include "../common/config.h"

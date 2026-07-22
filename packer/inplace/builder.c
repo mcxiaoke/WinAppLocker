@@ -893,7 +893,7 @@ int main(int argc, char* argv[]) {
         /* --stub-dir 优先：{stub_dir}/stub_inplace_{x64|x86}.bin */
         snprintf(stub_dir_path, sizeof(stub_dir_path), "%s/stub_inplace_%s.bin",
                  stub_dir, g_is_x64 ? "x64" : "x86");
-        stub_candidates[n_candidates++] = strdup(stub_dir_path);
+        stub_candidates[n_candidates++] = _strdup(stub_dir_path);
     }
     /* 当前目录：./stub_inplace_{x64|x86}.bin */
     stub_candidates[n_candidates++] = g_is_x64
@@ -930,7 +930,7 @@ int main(int argc, char* argv[]) {
         char exe_dir_path[512];
         if (stub_dir) {
             snprintf(exe_dir_path, sizeof(exe_dir_path), "%s/stub_inplace_x86.exe", stub_dir);
-            exe_candidates[n_exe++] = strdup(exe_dir_path);
+            exe_candidates[n_exe++] = _strdup(exe_dir_path);
         }
         exe_candidates[n_exe++] = "stub_inplace_x86.exe";
         for (int i = 0; i < n_exe && !stub_exe; i++) {
@@ -1122,13 +1122,15 @@ int main(int argc, char* argv[]) {
         total_lock_size = stub_size;  /* 不需要追加 callbacks 数组 */
     }
 
-    /* new_raw_off = max(last_raw_end, in_size_without_overlay) aligned up */
+    /* new_raw_off = max(last_raw_end, in_size_without_overlay) aligned up
+     * 注意：~(align-1) 必须用 size_t 计算，避免 DWORD 的 ~ 高 32 位为零
+     * 导致 C4319 警告和对齐计算错误 */
     DWORD pe_data_end = overlay_off + (DWORD)overlay_size;  /* == in_size if no overlay */
-    DWORD new_raw_off = (pe_data_end + file_align - 1) & ~(file_align - 1);
-    DWORD new_raw_size = (DWORD)((total_lock_size + file_align - 1) & ~(file_align - 1));
-    DWORD new_va = (last_va_end + sec_align - 1) & ~(sec_align - 1);
+    DWORD new_raw_off = (DWORD)((pe_data_end + file_align - 1) & ~(size_t)(file_align - 1));
+    DWORD new_raw_size = (DWORD)((total_lock_size + file_align - 1) & ~(size_t)(file_align - 1));
+    DWORD new_va = (DWORD)((last_va_end + sec_align - 1) & ~(size_t)(sec_align - 1));
     DWORD new_vsize = (DWORD)total_lock_size;
-    DWORD new_vsize_aligned = (new_vsize + sec_align - 1) & ~(sec_align - 1);
+    DWORD new_vsize_aligned = (DWORD)((new_vsize + sec_align - 1) & ~(size_t)(sec_align - 1));
 
     /* 计算 stub_tls_callback VA（仅 TLS_PROXY 模式需要）*/
     uint64_t stub_tls_cb_va = 0;

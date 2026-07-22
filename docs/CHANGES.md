@@ -1,5 +1,33 @@
 # 变更记录
 
+## 2026-07-22 19:20 修复所有编译警告（clean build 零警告）
+
+清理 MSVC + MinGW 的全部编译警告，clean build 现在零警告。
+
+### 修复列表
+
+| 警告 | 根因 | 修复 |
+|------|------|------|
+| `D9025 /MD→/MT` | CMake Release 默认 `/MD` + 全局 `/MT` 重写 | CMakeLists.txt: 用 `CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded"` 替代 `/MT` |
+| `D9025 /O2→/O1` | CMake Release 默认 `/O2` + stub target `/O1` 重写 | CMakeLists.txt: `string(REPLACE "/O2" "" CMAKE_C_FLAGS_RELEASE ...)` |
+| `C4319 ~零扩展` | `~(DWORD)(align-1)` 转 size_t 高 32 位为零 | builder_reflective.c + builder.c: `~(size_t)(align-1)` |
+| `C4996 strdup` | MSVC 弃用 POSIX 名 | builder.c: `strdup` → `_strdup` |
+| MinGW `__winlock_sfence static but used in inline` | MinGW intrin.h 的 `_mm_sfence` 是非 static inline 引用 static 函数 | stub.c: 移除中间 static 函数，直接 `#define __builtin_ia32_sfence() __asm__ volatile("sfence")` |
+| MinGW `xtea_encrypt_buf unused` | stub 只用解密不用加密，static 函数未调用 | xtea.h: GCC 分支 WINLOCK_XTEA_FN 加 `unused` 属性 |
+
+### 修改文件
+
+- [packer/CMakeLists.txt](file:///C:/Home/Projects/applocker/packer/CMakeLists.txt) — CMAKE_MSVC_RUNTIME_LIBRARY + 清空默认 /O2
+- [packer/inplace/builder.c](file:///C:/Home/Projects/applocker/packer/inplace/builder.c) — _strdup + ~(size_t)
+- [packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c) — ~(size_t)
+- [packer/inplace/stub.c](file:///C:/Home/Projects/applocker/packer/inplace/stub.c) — 内联汇编替代 static 函数
+- [packer/common/xtea.h](file:///C:/Home/Projects/applocker/packer/common/xtea.h) — GCC 加 unused 属性
+
+### 验证
+
+- `build.ps1 -Clean` 零警告零错误
+- e2e 测试 36/36 全部通过
+
 ## 2026-07-22 18:10 reflective 节名伪装（降低 DIE 启发式检测）
 
 实施 docs/MSVC_PORTING_PLAN.md 中计划已久的 `.payload → .rdata2` 改名，

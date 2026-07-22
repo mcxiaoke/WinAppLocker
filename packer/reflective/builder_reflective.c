@@ -768,12 +768,14 @@ int main(int argc, char* argv[]) {
     }
     if (out_size > last_raw_end) last_raw_end = (DWORD)out_size;
 
-    /* 12. 计算新 .payload 节的位置（基于最终的节布局） */
-    DWORD new_va           = (last_va_end + s_sec_align - 1) & ~(s_sec_align - 1);
+    /* 12. 计算新 .payload 节的位置（基于最终的节布局）
+     * 注意：~(align-1) 必须用 size_t 计算，避免 DWORD 的 ~ 高 32 位为零
+     * 导致 C4319 警告和对齐计算错误 */
+    DWORD new_va           = (DWORD)((last_va_end + s_sec_align - 1) & ~(size_t)(s_sec_align - 1));
     DWORD new_vsize        = (DWORD)total_payload_size;
-    DWORD new_vsize_aligned= (new_vsize + s_sec_align - 1) & ~(s_sec_align - 1);
-    DWORD new_raw_off      = (last_raw_end + s_file_align - 1) & ~(s_file_align - 1);
-    DWORD new_raw_size     = (DWORD)((total_payload_size + s_file_align - 1) & ~(s_file_align - 1));
+    DWORD new_vsize_aligned= (DWORD)((new_vsize + s_sec_align - 1) & ~(size_t)(s_sec_align - 1));
+    DWORD new_raw_off      = (DWORD)((last_raw_end + s_file_align - 1) & ~(size_t)(s_file_align - 1));
+    DWORD new_raw_size     = (DWORD)((total_payload_size + s_file_align - 1) & ~(size_t)(s_file_align - 1));
 
     printf("[+] New .payload section: VA=0x%lx VSize=0x%lx RawOff=0x%lx RawSize=0x%lx\n",
            (unsigned long)new_va, (unsigned long)new_vsize,
