@@ -282,26 +282,30 @@ static PVOID find_export(PVOID mod, const char* name) {
 
 /* ---- 对话框模板构造工具 ----
  *
- * 重要：必须用 put_dword/put_word 逐字段写入，不能用 DLGTEMPLATE / DLGITEMTEMPLATE
- * 结构体指针直接赋值。
+ * Q2: MSVC 路径用 DLGTEMPLATE/DLGITEMTEMPLATE 结构体直填（自然生成立即数 mov，
+ *     不引用常量池）；MinGW 路径保留 put_dword/put_word 逐字段写入 hack。
  *
- * 原因：MinGW x86 -O2 会把连续 8 字节字段赋值（style+dwExtendedStyle / x+y+cx+cy）
- * 合并成一条 movq 指令，常量被放到 .rdata 常量池。stub.ld 的 /DISCARD/ 丢弃 .rdata，
- * 运行时 movq 从无效地址读到垃圾值 → DialogBoxIndirectParamW 返回 -1。
- *
+ * MinGW hack 原因：MinGW x86 -O2 会把连续 8 字节字段赋值（style+dwExtendedStyle /
+ * x+y+cx+cy）合并成一条 movq 指令，常量被放到 .rdata 常量池。stub.ld 的 /DISCARD/
+ * 丢弃 .rdata，运行时 movq 从无效地址读到垃圾值 → DialogBoxIndirectParamW 返回 -1。
  * 逐字段写入（每次 4 字节或 2 字节）让编译器生成立即数 mov，不引用常量池。
  * 详见 docs/CHANGES.md 中 bugfix 分支的 fix(build_dialog) 记录。
  */
-WINLOCK_SECTION_TEXT
-static uint8_t* put_word(uint8_t* p, uint16_t w) {
-    *(uint16_t*)p = w;
-    return p + 2;
-}
-
+#ifndef _MSC_VER
+/* ---- MinGW 路径：put_dword 逐字段写入 hack（避免 -O2 常量池合并）---- */
 WINLOCK_SECTION_TEXT
 static uint8_t* put_dword(uint8_t* p, uint32_t dw) {
     *(uint32_t*)p = dw;
     return p + 4;
+}
+#endif /* _MSC_VER */
+
+/* put_word / put_wstr / align_dword 两条路径共用（MSVC 结构体直填时
+ * 仍需 put_word 写 menu/class/marker/atom 等 WORD 字段）*/
+WINLOCK_SECTION_TEXT
+static uint8_t* put_word(uint8_t* p, uint16_t w) {
+    *(uint16_t*)p = w;
+    return p + 2;
 }
 
 WINLOCK_SECTION_TEXT
@@ -321,15 +325,77 @@ static uint8_t* align_dword(uint8_t* p, uint8_t* start) {
 }
 
 /* 在栈缓冲区上构建密码对话框 DLGTEMPLATE
- * 全部用 put_dword/put_word 逐字段写入，避免 GCC -O2 把常量合并到 .rdata 常量池。
- * sizeof(DLGTEMPLATE/DLGITEMTEMPLATE) 在不同编译器/对齐下可能为 18 或 20，
- * 逐字段写入也消除了对 sizeof 的依赖。 */
+ *
+ * MSVC 路径：用 DLGTEMPLATE / DLGITEMTEMPLATE 结构体直填（编译器自然生成
+ *            立即数 mov，不会引用常量池），代码更清晰。
+ * MinGW 路径：用 put_dword/put_word 逐字段写入，避免 -O2 常量池合并问题。
+ * 两条路径生成的字节序列完全一致。 */
 WINLOCK_SECTION_TEXT
 WINLOCK_OPTIMIZE_OFF
 static size_t build_dialog(uint8_t* buf) {
     uint8_t* start = buf;
     uint8_t* p = buf;
 
+#ifdef _MSC_VER
+    /* ---- MSVC 路径：结构体直填 ---- */
+    DLGTEMPLATE* tmpl = (DLGTEMPLATE*)p;
+    tmpl->style = WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+                | DS_CENTER | DS_MODALFRAME;
+    tmpl->dwExtendedStyle = 0;
+    tmpl->cdit = 3;
+    tmpl->x = 0; tmpl->y = 0; tmpl->cx = 200; tmpl->cy = 60;
+    p += sizeof(DLGTEMPLATE);
+    p = put_word(p, 0);                       /* no menu    */
+    p = put_word(p, 0);                       /* default class */
+    p = put_wstr(p, STR_TITLE);               /* title      */
+
+    /* EDIT (password input) — DLGITEMTEMPLATE 必须 DWORD 对齐 */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
+                    | ES_AUTOHSCROLL | ES_PASSWORD;
+        item->dwExtendedStyle = 0;
+        item->x = 10; item->y = 10; item->cx = 180; item->cy = 14;
+        item->id = IDC_PWD_EDIT;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);              /* class marker */
+        p = put_word(p, 0x0081);              /* Edit atom    */
+        p = put_word(p, 0);                   /* no text      */
+        p = put_word(p, 0);                   /* no cd        */
+    }
+
+    /* OK button */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON;
+        item->dwExtendedStyle = 0;
+        item->x = 60;  item->y = 32; item->cx = 50; item->cy = 14;
+        item->id = IDOK;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);              /* class marker */
+        p = put_word(p, 0x0080);              /* Button atom  */
+        p = put_wstr(p, STR_OK);
+        p = put_word(p, 0);                   /* cd */
+    }
+
+    /* Cancel button */
+    p = align_dword(p, start);
+    {
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        item->dwExtendedStyle = 0;
+        item->x = 120; item->y = 32; item->cx = 50; item->cy = 14;
+        item->id = IDCANCEL;
+        p += sizeof(DLGITEMTEMPLATE);
+        p = put_word(p, 0xFFFF);              /* class marker */
+        p = put_word(p, 0x0080);              /* Button atom  */
+        p = put_wstr(p, STR_CANCEL);
+        p = put_word(p, 0);                   /* cd */
+    }
+#else
+    /* ---- MinGW 路径：put_dword/put_word 逐字段写入（避免 -O2 常量池合并）---- */
     /* DLGTEMPLATE (18 字节: DWORD style, DWORD ext, WORD cdit, 4xSHORT xy/cx/cy) */
     p = put_dword(p, WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
                      | DS_CENTER | DS_MODALFRAME);  /* style */
@@ -385,6 +451,7 @@ static size_t build_dialog(uint8_t* buf) {
     p = put_word(p, 0x0080);                        /* Button atom  */
     p = put_wstr(p, STR_CANCEL);
     p = put_word(p, 0);                             /* cd */
+#endif /* _MSC_VER */
 
     return (size_t)(p - start);
 }

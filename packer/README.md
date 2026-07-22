@@ -1,7 +1,7 @@
 # WinLock 模块
 
 WinLock 是 applocker 项目的 **原生 PE 加壳模块**（C + 内联汇编），提供两种加壳方案：
-- **in-place**：原地修改 PE，新增 `.lock` 节，加密 `.text` 节，运行时内存解密
+- **in-place**：原地修改 PE，新增 `.text2` 节，加密 `.text` 节，运行时内存解密
 - **reflective**：原 PE 作为 payload 附加在 stub 后，运行时内存反射加载
 
 完整项目总览见根目录 [../README.md](../README.md)，本文档只讲 packer/ 的开发与测试。
@@ -19,6 +19,10 @@ packer/
 ├── build.ps1      # 构建入口（MSVC x64 + x86 + MinGW inplace stub）
 └── CMakeLists.txt # CMake 顶层
 ```
+
+> **构建工具职责**：`build.ps1` 是唯一推荐入口，自动处理 vcvarsall 调用、x64/x86 双架构
+> 构建、MinGW stub 覆盖、stub 身份字段注入、产物汇集到 dist/。`CMakeLists.txt` 是底层
+> 构建脚本（被 build.ps1 调用），`Makefile.mingw` 已 DEPRECATED（仅保留参考）。
 
 > 实现细节（stub_data 字段、TLS proxy 机制、节布局、PIC 约束等）见 [docs/](docs/)，
 > 代码结构随时在变，README 不赘述。

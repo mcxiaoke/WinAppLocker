@@ -58,6 +58,9 @@
 static int g_debug = 0;
 #define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
 
+/* 输入 PE 文件大小上限（防 OOM，审查 A15） */
+#define INPUT_FILE_SIZE_MAX  (512L * 1024 * 1024)  /* 512MB */
+
 /* ---- XTEA 加密（共享实现，host 模式：普通 static inline） ---- */
 #include "../common/xtea.h"
 
@@ -75,7 +78,7 @@ static uint8_t* read_file(const char* path, size_t* out_size) {
         return NULL;
     }
     /* 文件大小上限 512MB，防 OOM（审查 A15）*/
-    if (sz > 512L * 1024 * 1024) {
+    if (sz > INPUT_FILE_SIZE_MAX) {
         fprintf(stderr, "[-] 文件过大（%ld bytes > 512MB 上限）: %s\n", sz, path);
         fclose(f);
         return NULL;
@@ -648,6 +651,13 @@ int main(int argc, char* argv[]) {
     DBG("[*] Architecture: %s (Machine=0x%04X)\n",
            g_is_x64 ? "x64 (PE32+)" : "x86 (PE32)", machine);
 
+    /* N4: 保存输入 PE 的 ImageBase 到局部变量，避免后续依赖 g_nt 全局状态。
+     * sd->image_base 必须是输入 PE 的原始基址（用于 stub 运行时重定位），
+     * 但 main() 后续会在 1184 行重新设置 g_nt 指向 out 缓冲区，
+     * 此时 OH_IMG_BASE() 返回 out 的基址而非输入 PE 的基址。
+     * 显式保存避免调用顺序变化导致的隐性 bug。 */
+    const uint64_t input_image_base = OH_IMG_BASE();
+
     IMAGE_FILE_HEADER* file_hdr = OH_FILE();
     if (file_hdr->Characteristics & IMAGE_FILE_DLL) {
         printf("[-] DLL not supported (use EXE)\n");
@@ -1039,8 +1049,9 @@ int main(int argc, char* argv[]) {
     sd->xtea_key[3]   = key[3];
     memcpy(sd->salt, salt, 16);
     memcpy(sd->pwd_hash, pwd_hash, 32);
-    /* v3 字段：重定位信息（始终填充，stub 根据 STUB_FLAG_ASLR 决定是否使用）*/
-    sd->image_base = OH_IMG_BASE();
+    /* v3 字段：重定位信息（始终填充，stub 根据 STUB_FLAG_ASLR 决定是否使用）
+     * N4: 用 input_image_base 显式传入输入 PE 基址，不依赖 g_nt 当前指向 */
+    sd->image_base = input_image_base;
     {
         IMAGE_DATA_DIRECTORY* reloc_dir = OH_DATA_DIR(IMAGE_DIRECTORY_ENTRY_BASERELOC);
         sd->reloc_rva  = reloc_dir->VirtualAddress;

@@ -2,27 +2,52 @@
 # msvc_setup.cmake - MSVC 工具链路径 + binutils 查找封装
 #
 # 职责：
-#   1. 记录 vcvars64.bat 路径（文档/调试用，VS 生成器自动检测 MSVC）
+#   1. 自动探测 Visual Studio 安装路径（vswhere），推导 vcvars64.bat
 #   2. 查找 w64devkit / msys2 mingw32 的 binutils（objcopy / nm）
 #      这些工具与编译器无关，后续阶段 stub 提取 .text2 节仍需要
 #   3. 查找 Python3（用于 cmake/extract_lock_section.py 提取 .text2 节）
 #
 # 设计原则：
-#   - 路径作为 CACHE 变量，用户可用 -DW64DEVKIT_BIN=... 覆盖
+#   - VS 路径用 vswhere 自动探测，不再写死绝对路径
+#   - binutils 路径作为 CACHE 变量，用户可用 -DW64DEVKIT_BIN=... 覆盖
 #   - x64 binutils（w64devkit）必需；x86 binutils（msys2 mingw32）可选
 #   - 找不到工具时给出明确错误提示
 # ============================================================
 
-# ---- vcvars64.bat 路径（仅记录，VS 生成器不需要手动调用） ----
-# 用 Ninja 生成器或命令行 cl.exe 时需要先调用 vcvars64.bat 设置环境
-set(WINLOCK_VCVARS64
-    "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/Build/vcvars64.bat"
+# ---- 自动探测 Visual Studio 安装路径（vswhere） ----
+# vswhere 是 VS 自带的标准工具，固定在以下路径：
+#   C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe
+# 用 -latest 取最新安装，-property installationPath 输出根目录
+# 探测失败时 fallback 到默认 Community 版路径（向后兼容）
+set(WINLOCK_VSWHERE
+    "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe")
+
+if(EXISTS "${WINLOCK_VSWHERE}")
+    execute_process(
+        COMMAND "${WINLOCK_VSWHERE}" -latest -property installationPath
+        OUTPUT_VARIABLE WINLOCK_VS_INSTALL_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+
+# 推导 vcvars64.bat 路径：${VS_INSTALL}/VC/Auxiliary/Build/vcvars64.bat
+if(WINLOCK_VS_INSTALL_PATH)
+    set(_vcvars64_default "${WINLOCK_VS_INSTALL_PATH}/VC/Auxiliary/Build/vcvars64.bat")
+else()
+    # fallback：默认 Community 版路径（老版本兼容）
+    set(_vcvars64_default
+        "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/Build/vcvars64.bat")
+endif()
+
+# CACHE 变量：用户可用 -DWINLOCK_VCVARS64=... 覆盖
+set(WINLOCK_VCVARS64 "${_vcvars64_default}"
     CACHE FILEPATH "Path to vcvars64.bat (for Ninja generator or manual cl.exe)")
 
 if(NOT EXISTS "${WINLOCK_VCVARS64}")
     message(WARNING "vcvars64.bat not found at: ${WINLOCK_VCVARS64}\n"
                     "  If using Ninja generator, ensure vcvars64.bat is called first.\n"
-                    "  If using Visual Studio generator, this warning can be ignored.")
+                    "  If using Visual Studio generator, this warning can be ignored.\n"
+                    "  Override with -DWINLOCK_VCVARS64=<path>")
 endif()
 
 # ---- 查找 Python3（用于 cmake/extract_lock_section.py 提取多 .text2 节） ----

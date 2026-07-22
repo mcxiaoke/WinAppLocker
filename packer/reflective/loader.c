@@ -195,6 +195,27 @@ static size_t my_strnlen(const char* s, size_t maxlen) {
     return n;
 }
 
+/* ---- 常量定义（N6: 取代散落的魔法数字） ----
+ * 统一在此声明，避免代码各处出现 0x40010006 / 64*1024*1024 等裸数字 */
+
+/* VEH 过滤的"非严重"异常码（这些异常属于正常调试输出，不应触发崩溃日志） */
+#define VE_CODE_DBG_PRINT      0x40010006  /* DBG_PRINTEXCEPTION_C：OutputDebugString 触发 */
+#define VE_CODE_SET_THREADNAME 0x406D1388  /* MS_VC_EXCEPTION：SetThreadName 触发 */
+#define VE_CODE_CPP_EXCEPTION  0xE06D7363  /* C++ 异常（'msc' ASCII） */
+
+/* SizeOfImage 合理性校验：超过此值视为损坏，用兜底值替代 */
+#define SIZE_OF_IMAGE_MAX      (64 * 1024 * 1024)  /* 64MB */
+#define SIZE_OF_IMAGE_FALLBACK (2 * 1024 * 1024)   /* 2MB 兜底，覆盖大多数 PE */
+
+/* 用户态合法地址区间（用于 image_base 合法性校验） */
+#define USER_ADDR_MIN         0x10000ULL
+#define USER_ADDR_MAX         0x7FFFFFFFFFFF0000ULL
+
+/* 调试用：默认 PE 加载基址区间（仅 VEH 栈扫描时标记模块名用）
+ * 现代 ASLR PE 实际基址会变化，这里仅用于 DontSleep 等固定基址样本的诊断 */
+#define DBG_DEFAULT_IMG_BASE  0x400000ULL
+#define DBG_DEFAULT_IMG_END   0x500000ULL
+
 /* ---- 调试开关 ----
  * MVP 阶段开启 RDEBUG，日志写到 reflective_loader.log（与 EXE 同目录）
  * 同时通过 OutputDebugStringA 输出（可用 DebugView 观察）
@@ -593,12 +614,12 @@ static void reserve_preferred_base_region(void) {
     uint64_t preferred_base = hdr->image_base;
     SIZE_T size_of_image = hdr->size_of_image;
     /* 如果 size_of_image 无效（防御性），用保守值 */
-    if (size_of_image == 0 || size_of_image > 64 * 1024 * 1024) {
-        size_of_image = 2 * 1024 * 1024;  /* 2MB，覆盖大多数 PE */
+    if (size_of_image == 0 || size_of_image > SIZE_OF_IMAGE_MAX) {
+        size_of_image = SIZE_OF_IMAGE_FALLBACK;
     }
     /* image_base 合法性校验：必须在用户态合法区间，且 4KB 对齐
      * 不再硬编码几个魔法值白名单，直接信任 builder 写入的值 */
-    if (preferred_base < 0x10000 || preferred_base > 0x7FFFFFFFFFFF0000ULL) {
+    if (preferred_base < USER_ADDR_MIN || preferred_base > USER_ADDR_MAX) {
         return;
     }
 
@@ -2283,12 +2304,12 @@ static uint8_t* map_image(reflective_payload_t* hdr, uint8_t* payload_data) {
 static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     /* 过滤掉非严重异常 */
-    if (code == 0x40010006) return EXCEPTION_CONTINUE_SEARCH;  /* OutputDebugString */
-    if (code == 0x406D1388) return EXCEPTION_CONTINUE_SEARCH;  /* SetThreadName */
+    if (code == VE_CODE_DBG_PRINT) return EXCEPTION_CONTINUE_SEARCH;      /* OutputDebugString */
+    if (code == VE_CODE_SET_THREADNAME) return EXCEPTION_CONTINUE_SEARCH; /* SetThreadName */
 
     /* C++ 异常只记录前 3 次（避免日志爆炸） */
     static int cpp_exc_count = 0;
-    if (code == 0xE06D7363) {
+    if (code == VE_CODE_CPP_EXCEPTION) {
         if (cpp_exc_count < 3) {
             cpp_exc_count++;
         } else {
@@ -2357,15 +2378,15 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
         if (rip == 0) break;
         /* 标记地址所在模块 */
         const char* mod = "?";
-        if (rip >= 0x400000 && rip < 0x500000) {
-            mod = "IMG";  /* DontSleep image */
-        } else if (rip >= 0x500000 && rip < 0x10000000) {
+        if (rip >= DBG_DEFAULT_IMG_BASE && rip < DBG_DEFAULT_IMG_END) {
+            mod = "IMG";  /* 默认基址区间内的模块 */
+        } else if (rip >= DBG_DEFAULT_IMG_END && rip < 0x10000000) {
             mod = "?";
         }
         DBG_RAW("  [%d] %s rip=0x%llx rsp=0x%llx",
                 depth, mod, (unsigned long long)rip, (unsigned long long)rsp);
-        if (rip >= 0x400000 && rip < 0x500000) {
-            DBG_RAW(" (RVA=0x%llx)", (unsigned long long)(rip - 0x400000));
+        if (rip >= DBG_DEFAULT_IMG_BASE && rip < DBG_DEFAULT_IMG_END) {
+            DBG_RAW(" (RVA=0x%llx)", (unsigned long long)(rip - DBG_DEFAULT_IMG_BASE));
         }
         DBG_RAW("\n");
 
@@ -2399,9 +2420,9 @@ static LONG WINAPI refl_veh(PEXCEPTION_POINTERS ep) {
     DBG_RAW("[VEH] stack dump (x86, raw scan):\n");
     for (int i = 0; i < 32; i++) {
         uint32_t v = sp[i];
-        if (v >= 0x400000 && v < 0x500000) {
+        if (v >= DBG_DEFAULT_IMG_BASE && v < DBG_DEFAULT_IMG_END) {
             DBG_RAW("  [esp+0x%02x] 0x%08x (IMG RVA=0x%x)\n",
-                    i*4, v, v - 0x400000);
+                    i*4, v, (uint32_t)(v - DBG_DEFAULT_IMG_BASE));
         }
     }
     }

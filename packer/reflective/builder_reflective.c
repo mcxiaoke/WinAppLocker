@@ -40,6 +40,9 @@
 static int g_debug = 1;
 #define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
 
+/* 输入 PE 文件大小上限（防 OOM，审查 A15） */
+#define INPUT_FILE_SIZE_MAX  (512L * 1024 * 1024)  /* 512MB */
+
 /* ---- 文件 IO ---- */
 
 static uint8_t* read_file(const char* path, size_t* out_size) {
@@ -54,7 +57,7 @@ static uint8_t* read_file(const char* path, size_t* out_size) {
         return NULL;
     }
     /* 文件大小上限 512MB，防 OOM（审查 A15）*/
-    if (sz > 512L * 1024 * 1024) {
+    if (sz > INPUT_FILE_SIZE_MAX) {
         fprintf(stderr, "[-] 文件过大（%ld bytes > 512MB 上限）: %s\n", sz, path);
         fclose(f);
         return NULL;

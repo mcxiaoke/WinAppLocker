@@ -60,10 +60,26 @@ if (-not $pythonExe) { $pythonExe = (Get-Command python3 -ErrorAction SilentlyCo
 if (-not $pythonExe) { throw "Python 不在 PATH，无法运行 patch_stub_identity.py 等 POST_BUILD 脚本" }
 Write-Host "    Python: $pythonExe" -ForegroundColor DarkGray
 
-# ---- vcvarsall.bat 路径 ----
-$vcvarsall = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat"
+# ---- vcvarsall.bat 路径（自动探测 Visual Studio 安装路径） ----
+# 优先用 vswhere.exe（VS 自带标准工具）自动探测最新 VS 安装路径，
+# 探测失败时 fallback 到默认 Community 版路径。
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsInstallPath = $null
+if (Test-Path $vswhere) {
+    $vsInstallPath = & $vswhere -latest -property installationPath 2>$null
+    if ($vsInstallPath) {
+        $vsInstallPath = $vsInstallPath.Trim()
+        Write-Host "    VS 安装路径（vswhere 探测）: $vsInstallPath" -ForegroundColor DarkGray
+    }
+}
+if (-not $vsInstallPath) {
+    # fallback：默认 Community 版路径
+    $vsInstallPath = "C:\Program Files\Microsoft Visual Studio\18\Community"
+    Write-Warning "vswhere 探测失败，fallback 到默认路径: $vsInstallPath"
+}
+$vcvarsall = Join-Path $vsInstallPath "VC\Auxiliary\Build\vcvarsall.bat"
 if (-not (Test-Path $vcvarsall)) {
-    throw "vcvarsall.bat 不存在: $vcvarsall（请确认 Visual Studio 2026 安装路径）"
+    throw "vcvarsall.bat 不存在: $vcvarsall（请确认 Visual Studio 安装路径，或用 -DWINLOCK_VCVARS64 覆盖）"
 }
 
 # 辅助函数：调用 vcvarsall.bat 注入环境变量到当前 PowerShell session
