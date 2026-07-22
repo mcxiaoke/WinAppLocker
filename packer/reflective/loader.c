@@ -60,6 +60,7 @@
 
 #include "payload.h"
 #include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS / IDC_PWD_EDIT */
+#include "../common/pe_meta.h"  /* REFLECTIVE_SECTION_NAME */
 #include "../common/winlock_compat.h"
 /* 复用 common/sha256.h 的纯 C SHA-256 + UTF-16LE->UTF-8 + 常量时间比较
  * 不定义 WINLOCK_PIC，作为普通 host 函数（loader.c 用 CRT 编译，无 .lock 节）*/
@@ -511,7 +512,7 @@ static uint8_t* find_payload_section(uint32_t* out_size) {
     if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if (memcmp(sec[i].Name, ".payload", 8) == 0) {
+        if (memcmp(sec[i].Name, REFLECTIVE_SECTION_NAME, 8) == 0) {
             if (out_size) *out_size = sec[i].Misc.VirtualSize;
             return base + sec[i].VirtualAddress;
         }

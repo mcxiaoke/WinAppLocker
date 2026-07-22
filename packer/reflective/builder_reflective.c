@@ -33,6 +33,7 @@
 
 #include "payload.h"
 #include "../common/config.h"   /* XTEA_DELTA / XTEA_ROUNDS */
+#include "../common/pe_meta.h"  /* REFLECTIVE_SECTION_NAME */
 
 static int g_debug = 1;
 #define DBG(fmt, ...) do { if (g_debug) printf(fmt, ##__VA_ARGS__); } while (0)
@@ -562,10 +563,10 @@ int main(int argc, char* argv[]) {
         s_sec           = IMAGE_FIRST_SECTION(s_nt32);
     }
 
-    /* 检查 stub 是否已有 .payload 节（避免重复加壳）*/
+    /* 检查 stub 是否已有 payload 节（避免重复加壳）*/
     for (WORD i = 0; i < s_n_sec; i++) {
-        if (memcmp(s_sec[i].Name, ".payload", 8) == 0) {
-            printf("[-] Stub already has .payload section (already packed?)\n");
+        if (memcmp(s_sec[i].Name, REFLECTIVE_SECTION_NAME, 8) == 0) {
+            printf("[-] Stub already has payload section (already packed?)\n");
             free(stub); free(payload); free(in_pe);
             return 1;
         }
@@ -806,10 +807,10 @@ int main(int argc, char* argv[]) {
     o_nt64 = (IMAGE_NT_HEADERS64*)(out + o_dos->e_lfanew);
     o_sec = stub_is_x64 ? IMAGE_FIRST_SECTION(o_nt64) : IMAGE_FIRST_SECTION(o_nt32);
 
-    /* 15. 添加 .payload 节头 */
+    /* 15. 添加 payload 节头 */
     IMAGE_SECTION_HEADER* new_sec = &o_sec[o_n_sec];
     memset(new_sec, 0, sizeof(*new_sec));
-    memcpy(new_sec->Name, ".payload", 8);
+    memcpy(new_sec->Name, REFLECTIVE_SECTION_NAME, 8);
     new_sec->VirtualAddress    = new_va;
     new_sec->Misc.VirtualSize  = new_vsize;
     new_sec->SizeOfRawData     = new_raw_size;

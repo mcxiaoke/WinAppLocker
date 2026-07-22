@@ -1,5 +1,36 @@
 # 变更记录
 
+## 2026-07-22 18:10 reflective 节名伪装（降低 DIE 启发式检测）
+
+实施 docs/MSVC_PORTING_PLAN.md 中计划已久的 `.payload → .rdata2` 改名，
+降低 DIE (Detect It Easy) 的 `Packer: Generic [Section #6 (".payload") compressed]` 启发式。
+
+### 修改
+
+[packer/common/pe_meta.h](file:///C:/Home/Projects/applocker/packer/common/pe_meta.h)：
+- `REFLECTIVE_SECTION_NAME` 从 `".payload\0"` 改为 `".rdata2\0"`
+- `.rdata2` 看起来像扩展只读数据节，不像 packer 特征
+
+[packer/reflective/builder_reflective.c](file:///C:/Home/Projects/applocker/packer/reflective/builder_reflective.c)：
+- 添加 `#include "../common/pe_meta.h"`
+- 硬编码 `".payload"` → `REFLECTIVE_SECTION_NAME`（节名设置和重复加壳检查）
+
+[packer/reflective/loader.c](file:///C:/Home/Projects/applocker/packer/reflective/loader.c)：
+- 添加 `#include "../common/pe_meta.h"`
+- 硬编码 `".payload"` → `REFLECTIVE_SECTION_NAME`（节名查找）
+
+### 验证
+
+- Clean build 成功
+- e2e 测试 36/36 全部通过
+- 节名确认：`[6] .rdata2 Char=0x40000040`（原 `.payload`）
+
+### DIE 警告现状
+
+- ✅ reflective `Section #6 (".payload") compressed` → 应消除（节名不再是可疑的 .payload）
+- ⚠️ reflective `Strange overlay` + `High entropy` 仍存在（.rsrc+overlay 附加 + XTEA 加密固有特征）
+- ⚠️ inplace 所有警告仍存在（.lock 节名/RWX 未改，涉及 stub 架构改动，暂不动）
+
 ## 2026-07-22 17:30 reflective loader 修复 DontSleep Error 窗口（.rsrc + overlay 附加方案）
 
 在 `packer-bugfix` 分支上修复 e2e 测试 `reflective_password DontSleep.exe ERROR_WINDOW`。
