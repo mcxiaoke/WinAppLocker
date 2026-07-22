@@ -141,7 +141,7 @@ $metaFiles = @(
     @{
         Path = "$stubOutDir\stub_gui.exe.meta.json"
         Json = @{
-            name = "applocker-gui"
+            name = "gui"
             kind = "tempfile"
             subsystem = "gui"
             description = "AppLocker GUI stub (tempfile mode, password dialog)"
@@ -151,7 +151,7 @@ $metaFiles = @(
     @{
         Path = "$stubOutDir\stub_console.exe.meta.json"
         Json = @{
-            name = "applocker-console"
+            name = "cli"
             kind = "tempfile"
             subsystem = "console"
             description = "AppLocker Console stub (tempfile mode, stdin password)"
@@ -161,7 +161,7 @@ $metaFiles = @(
     @{
         Path = "$stubOutDir\stub_test.exe.meta.json"
         Json = @{
-            name = "applocker-test"
+            name = "test"
             kind = "tempfile"
             subsystem = "test"
             description = "AppLocker Test stub (hardcoded password test1234, for testing only)"
@@ -171,7 +171,7 @@ $metaFiles = @(
     @{
         Path = "$stubOutDir\builder_inplace.exe.meta.json"
         Json = @{
-            name = "winlock"
+            name = "inplace"
             kind = "inplace-builder"
             subsystem = "gui"
             description = "WinLock in-place packer (GUI dialog, no plaintext tempfile, XTEA + SHA-256)"
@@ -188,10 +188,10 @@ $metaFiles = @(
     @{
         Path = "$stubOutDir\builder_reflective.exe.meta.json"
         Json = @{
-            name = "winlock-reflective"
+            name = "reflective"
             kind = "reflective-builder"
             subsystem = "gui"
-            description = "WinLock reflective packer (memory load, supports x86/x64/.NET, plaintext v1)"
+            description = "WinLock reflective packer (memory load, supports x86/x64, XTEA + SHA-256)"
             version = "1.0.0"
             # components 文件名与分发文件名一致
             # builder_reflective.exe 运行时 --stub 指向此目录的 stub_reflective_xXX.exe

@@ -1,12 +1,12 @@
 # WinAppLocker .NET 自动化测试脚本
 # 支持两种模式：
 #   1. 临时文件模式（默认）：用 stub_test（内置密码 test1234）做 round-trip 测试
-#   2. WinLock in-place 模式（-WinLock）：用 winlock_builder.exe -t 测试模式，
+#   2. WinLock in-place 模式（-WinLock）：用 builder_inplace.exe -t 测试模式，
 #      密码硬编码为 "test123"，stub 跳过弹框直接解密 .text 节
 #
 # 用法：
 #   .\tests\auto_test.ps1                 # 默认：所有样本走临时文件模式
-#   .\tests\auto_test.ps1 -WinLock        # 所有样本走 WinLock 模式（不支持 .NET / Console / DLL）
+#   .\tests\auto_test.ps1 -WinLock        # 所有样本走 WinLock 模式（不支持 .NET / DLL）
 #   .\tests\auto_test.ps1 -Samples "a.exe,b.exe"
 #   .\tests\auto_test.ps1 -Info           # 对每个样本打包后用 --info 检查打包结果
 #   .\tests\auto_test.ps1 -WaitGui <秒>   # GUI 程序等待 N 秒后检查进程再杀掉（默认 3）
@@ -52,7 +52,7 @@ $samplesDir = Resolve-Path "$root\..\temp\samples"
 # 默认测试样本：
 #   - CLI 程序：hellocli / hellomingw / helloucrt / sha256sum（可通过 stdout 验证）
 #   - GUI 程序：helloguix64 / helloguix86 / hellowinforms（通过进程存活验证）
-# hellowinforms 是 .NET WinForms，WinLock 模式不支持（会被 packer 拒绝并报错）
+# hellowinforms 是 .NET WinForms，inplace 模式不支持（会被 packer 拒绝并报错）
 if ($Samples) {
     $sampleList = $Samples -split ','
 } else {
@@ -127,9 +127,9 @@ foreach ($sample in $sampleList) {
 
     # 1. 加密
     if ($WinLock) {
-        Write-Host "  [1] Pack with --stub-name winlock --test..." -NoNewline
+        Write-Host "  [1] Pack with --stub-name inplace --test..." -NoNewline
         # --test 让 builder 用 -t 测试模式：stub 跳过弹框，密码硬编码 test123
-        $packArgs = @("--pack","-i",$workSrc,"-o",$lockedPath,"-p",$password,"--stub-name","winlock","--test")
+        $packArgs = @("--pack","-i",$workSrc,"-o",$lockedPath,"-p",$password,"--stub-name","inplace","--test")
     } else {
         Write-Host "  [1] Pack with --stub Test..." -NoNewline
         $packArgs = @("--pack","-i",$workSrc,"-o",$lockedPath,"-p",$password,"--stub","Test")
@@ -138,14 +138,12 @@ foreach ($sample in $sampleList) {
     $errLog = "$env:TEMP\wal_pack_err.txt"
     $proc = Start-Process -FilePath $packer -ArgumentList $packArgs -RedirectStandardInput $nullIn -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -Wait -NoNewWindow
     if ($proc.ExitCode -ne 0 -or -not (Test-Path $lockedPath)) {
-        # WinLock 模式下某些样本预期不支持：
-        #   - Console 程序（hellocli/hellomingw/helloucrt/sha256sum）→ "WinLock 模式当前仅支持 GUI 程序"
-        #   - .NET 程序（hellowinforms）→ "WinLock 模式不支持 .NET CLR 托管 PE"
-        # 这些是预期失败，标 SKIP 而不是 FAIL
+        # inplace 模式下 .NET 程序预期不支持：
+        #   - .NET 程序（hellowinforms）→ "inplace 模式不支持 .NET CLR 托管 PE"
+        # 这是预期失败，标 SKIP 而不是 FAIL
         $errContent = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
-        if ($WinLock -and ($errContent -match "WinLock 模式当前仅支持 GUI" -or $errContent -match "WinLock 模式不支持 .NET")) {
-            $reason = if ($errContent -match "不支持 .NET") { "不支持 .NET" } else { "仅支持 GUI" }
-            Write-Host " SKIP (WinLock $reason)" -ForegroundColor Yellow
+        if ($WinLock -and $errContent -match "inplace 模式不支持 .NET") {
+            Write-Host " SKIP (inplace 不支持 .NET)" -ForegroundColor Yellow
             $skipCount++
         } else {
             Write-Host " FAIL (pack exit=$($proc.ExitCode))" -ForegroundColor Red

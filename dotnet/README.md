@@ -49,7 +49,7 @@ WinAppLocker.exe --pack -i <input> -o <output> -p <password> [options]
 | `-o, --output <path>` | 输出 EXE 路径 |
 | `-p, --password <pass>` | 密码（至少 4 字符） |
 | `--stub <Auto\|Gui\|Console\|Test>` | 旧 stub 偏好（按子系统选 tempfile 模式） |
-| `--stub-name <name>` | 指定 stub manifest 名称（`winlock` / `applocker-gui` / `applocker-console` / `applocker-test`），优先级高于 `--stub` |
+| `--stub-name <name>` | 指定 stub manifest 名称（`inplace` / `reflective` / `gui` / `cli` / `test`），优先级高于 `--stub` |
 | `--iterations <N>` | PBKDF2 迭代次数（默认 200000，仅 tempfile 模式） |
 | `--test` | WinLock 测试模式：builder 用 `-t`，stub 跳过密码弹框，密码硬编码为 `test123` |
 | `--pe-info <path>` | 显示 PE 信息（架构、子系统、.NET、ASLR/DEP/CFG 等） |
@@ -63,21 +63,21 @@ WinAppLocker.exe --pack -i <input> -o <output> -p <password> [options]
 
 1. **用户指定优先**：若 `--stub-name` 非空，且该 stub 满足 `IsAvailable`（主文件 + components 全部存在）和 `SupportsMachine`（架构匹配）→ 直接用
 2. **按子系统自动匹配**：根据原 EXE 的 `OptionalHeader.Subsystem`：
-   - `Windows Cui`（Console 程序）→ `applocker-console`
-   - `Windows Gui`（GUI 程序）或其他 → `applocker-gui`
+   - `Windows Cui`（Console 程序）→ `cli`
+   - `Windows Gui`（GUI 程序）或其他 → `gui`
 3. **退而求其次**：返回任意 `IsAvailable && SupportsMachine` 的 stub
 
-**WinLock 不会被自动选中**，必须显式指定（`--stub-name winlock` 或 GUI 下拉框选 winlock）。
+**inplace / reflective 不会被自动选中**，必须显式指定（`--stub-name inplace` 或 GUI 下拉框选）。
 
-WinLock 输入 PE 限制：
+inplace / reflective 输入 PE 限制：
 
-| 输入 PE 特征 | WinLock 是否可用 | 原因 |
+| 输入 PE 特征 | inplace / reflective 是否可用 | 原因 |
 |------|------|------|
-| .NET CLR 托管 | ❌ | XTEA 加密 `.text` 节会破坏 CLR metadata |
-| Console 子系统 | ❌ | WinLock stub 用 `DialogBoxIndirectParamW` 弹 GUI 密码框 |
+| .NET CLR 托管 | ❌ | CLR 假设主模块由 OS loader 加载，反射式/inplace 无法初始化 CLR |
 | DLL | ❌ | builder 只处理 EXE |
-| ARM64 / ARM | ❌ | `winlock_stub_*.bin` 仅支持 amd64 / i386 |
-| x64 / x86 原生 GUI EXE | ✅ | 正常加壳 |
+| ARM64 / ARM | ❌ | stub 仅支持 amd64 / i386 |
+| Console 子系统 | ✅ | 正常加壳（stub 继承原 PE 子系统） |
+| x64 / x86 原生 EXE | ✅ | 正常加壳 |
 
 ## stub 元数据（`.meta.json`）
 
@@ -85,20 +85,20 @@ WinLock 输入 PE 限制：
 
 ```json
 {
-  "name": "winlock",
+  "name": "inplace",
   "kind": "inplace-builder",
   "subsystem": "gui",
   "description": "WinLock in-place packer (XTEA + SHA-256)",
   "version": "2.0.0",
   "components": {
-    "stub_x64": "winlock_stub_x64.bin",
-    "stub_x86": "winlock_stub_x86.bin"
+    "stub_x64": "stub_inplace_x64.bin",
+    "stub_x86": "stub_inplace_x86.bin"
   },
   "supported_machines": ["amd64", "i386"]
 }
 ```
 
-- `kind`：`tempfile`（临时文件模式）或 `inplace-builder`（WinLock in-place 模式）
+- `kind`：`tempfile`（临时文件模式）或 `inplace-builder` 或 `reflective-builder`
 - `subsystem`：`gui` / `console` / `test`
 - `components`：仅 inplace-builder 用，列出依赖的 stub 文件
 - `supported_machines`：仅 inplace-builder 用，`amd64` / `i386`；tempfile stub 不填则视为 AnyCPU

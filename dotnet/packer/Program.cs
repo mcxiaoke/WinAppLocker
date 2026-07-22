@@ -113,12 +113,12 @@ namespace WinAppLocker.Packer
             Console.WriteLine("      --stub <Auto|Gui|Console|Test>");
             Console.WriteLine("                            旧 stub 偏好（按子系统选 tempfile 模式）");
             Console.WriteLine("      --stub-name <name>    指定 stub manifest 名称（优先级高于 --stub）");
-            Console.WriteLine("                            如 applocker-gui / applocker-console / winlock 等");
+            Console.WriteLine("                            如 gui / cli / test / inplace / reflective 等");
             Console.WriteLine("                            用 --list-stubs 查看可用 stub");
             Console.WriteLine("      --list-stubs          列出 stub/ 目录下所有可用 stub");
             Console.WriteLine("      --iterations <N>      PBKDF2 迭代次数（默认 200000）");
             Console.WriteLine("      --test                WinLock 测试模式：builder 用 -t，stub 跳过密码弹框");
-            Console.WriteLine("                            用硬编码密码 test123 解密（仅 --stub-name winlock 有效）");
+            Console.WriteLine("                            用硬编码密码 test123 解密（仅 --stub-name inplace 有效）");
         }
 
         private static int RunCliPack(string[] args)

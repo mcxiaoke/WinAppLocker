@@ -41,13 +41,14 @@ namespace WinAppLocker.Packer {
         }
 
         private void MainForm_Load(object sender, EventArgs e) {
-            lblPackerVersion.Text = $"Packer v{VersionInfo.Version}  git: {VersionInfo.GitHash}  build: {VersionInfo.BuildTime}";
+            // 第一行：packer 版本 + git hash + 构建时间
+            lblPackerVersion.Text = $"Packer v{VersionInfo.Version}  |  git: {VersionInfo.GitHash}  |  build: {VersionInfo.BuildTime}";
 
             // 动态加载 stub 列表
             LoadStubList();
 
-            // 显示每个已加载 stub 的版本信息（替代旧的硬编码 3 个 label）
-            UpdateStubVersionLabels();
+            // 后续行：每个 stub 一行，显示名称/版本/架构/可用性
+            UpdateStubInfo();
         }
 
         /// <summary>从 stub/ 目录加载所有 .meta.json，填充 ComboBox</summary>
@@ -66,10 +67,6 @@ namespace WinAppLocker.Packer {
                 string label = $"{s.Name} - {s.Description}";
                 if (!s.IsAvailable)
                     label += " (缺失文件)";
-                else if (s.Kind == StubKind.InplaceBuilder)
-                    label += " (兼容性较低)";
-                else if (s.Kind == StubKind.ReflectiveBuilder)
-                    label += " (内存加载，支持 Console/x86)";
                 cbStubPreference.Items.Add(new StubListItem(s, label));
             }
             cbStubPreference.SelectedIndex = 0;
@@ -77,62 +74,42 @@ namespace WinAppLocker.Packer {
             AppLogger.Info($"已加载 stub 列表: 共 {_availableStubs.Count} 个（可用 {_availableStubs.Count(s => s.IsAvailable)}，缺失 {_availableStubs.Count(s => !s.IsAvailable)}），目录: {stubDir}");
         }
 
-        /// <summary>更新版本信息 label：显示所有可用 stub 的版本</summary>
-        private void UpdateStubVersionLabels()
+        /// <summary>
+        /// 更新底部 stub 信息面板：每个 stub 一行，显示 名称/版本/架构/类型/可用性。
+        /// 第一行（packer 版本）由 MainForm_Load 直接写入 lblPackerVersion。
+        /// </summary>
+        private void UpdateStubInfo()
         {
-            // 旧的 3 个 label 改为只显示汇总信息（避免界面太长）
-            var available = _availableStubs.Where(s => s.IsAvailable).ToList();
-            var missing = _availableStubs.Where(s => !s.IsAvailable).ToList();
-
-            if (_availableStubs.Count == 0)
+            if (_availableStubs == null || _availableStubs.Count == 0)
             {
-                lblStubGuiVersion.Text = "[无可用 stub]";
-                lblStubGuiVersion.ForeColor = System.Drawing.Color.Red;
-                lblStubConsoleVersion.Text = "  请检查 stub/ 目录是否存在";
-                lblStubConsoleVersion.ForeColor = System.Drawing.Color.Red;
-                lblStubTestVersion.Text = $"  期望路径: {StubLoader.FindStubDir()}";
-                lblStubTestVersion.ForeColor = System.Drawing.Color.Gray;
+                lblStubInfo.Text = $"[无可用 stub，请检查 stub/ 目录: {StubLoader.FindStubDir()}]";
+                lblStubInfo.ForeColor = System.Drawing.Color.Red;
                 return;
             }
 
-            // 列出可用的 stub 名称
-            lblStubGuiVersion.Text = $"可用 stub（{available.Count}）: " +
-                string.Join(", ", available.Select(s => s.Name));
-            lblStubGuiVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
+            var lines = new List<string>();
+            foreach (var s in _availableStubs)
+            {
+                // 架构支持：amd64→x64, i386→x86, 空表示任意架构
+                string arch;
+                if (s.SupportedMachines == null || s.SupportedMachines.Count == 0)
+                    arch = "any";
+                else
+                    arch = string.Join("+", s.SupportedMachines.Select(m =>
+                        m == "amd64" ? "x64" : m == "i386" ? "x86" : m));
 
-            if (missing.Count > 0)
-            {
-                lblStubConsoleVersion.Text = $"缺失 stub（{missing.Count}）: " +
-                    string.Join(", ", missing.Select(s => $"{s.Name}({string.Join(",", s.MissingComponents)})"));
-                lblStubConsoleVersion.ForeColor = System.Drawing.Color.OrangeRed;
-            }
-            else
-            {
-                lblStubConsoleVersion.Text = "  所有 stub 文件完整";
-                lblStubConsoleVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
+                // 可用性标记
+                string status = s.IsAvailable
+                    ? "✓"
+                    : $"✗ 缺失: {string.Join(",", s.MissingComponents)}";
+
+                lines.Add($"  {s.Name}  v{s.Version}  [{arch}]  {s.KindStr}  {status}");
             }
 
-            // 显示 tempfile stub 的版本号（取第一个 tempfile 类型的）
-            var tempfileStub = available.FirstOrDefault(s => s.Kind == StubKind.Tempfile);
-            if (tempfileStub != null)
-            {
-                try
-                {
-                    byte[] stubBytes = File.ReadAllBytes(tempfileStub.MainFilePath);
-                    string ver = StubLoader.ReadStubVersion(stubBytes);
-                    lblStubTestVersion.Text = ver != null ? $"  {tempfileStub.Name} 版本: {ver}" : $"  {tempfileStub.Name} (版本未读取)";
-                }
-                catch
-                {
-                    lblStubTestVersion.Text = $"  {tempfileStub.Name} (读取版本失败)";
-                }
-                lblStubTestVersion.ForeColor = System.Drawing.Color.DarkSlateGray;
-            }
-            else
-            {
-                lblStubTestVersion.Text = "  (无 tempfile stub)";
-                lblStubTestVersion.ForeColor = System.Drawing.Color.Gray;
-            }
+            lblStubInfo.Text = string.Join("\n", lines);
+            // 有缺失则整体用警告色，否则默认色
+            bool anyMissing = _availableStubs.Any(s => !s.IsAvailable);
+            lblStubInfo.ForeColor = anyMissing ? System.Drawing.Color.OrangeRed : System.Drawing.Color.DarkSlateGray;
         }
 
         private void btnBrowseInput_Click(object sender, EventArgs e) {
@@ -186,8 +163,7 @@ namespace WinAppLocker.Packer {
         ///   - isBlocking：true 表示不兼容应禁用加密按钮
         ///
         /// 规则（参照 PackCore.Pack 的拒绝逻辑）：
-        ///   - InplaceBuilder (WinLock)：不支持 .NET，不支持 Console 子系统
-        ///   - ReflectiveBuilder：不支持 .NET（CLR 假设主模块由 OS loader 加载）
+        ///   - InplaceBuilder / ReflectiveBuilder：仅不支持 .NET（C builder 也只检查 .NET CLR）
         ///   - Tempfile：无限制（.NET / Console 都支持）
         /// </summary>
         private (string Warning, bool Blocking) GetStubCompatibilityWarning(StubKind kind, PeInfo peInfo)
@@ -197,19 +173,12 @@ namespace WinAppLocker.Packer {
             if (kind == StubKind.InplaceBuilder)
             {
                 if (peInfo.IsDotNet)
-                    return ("⚠ WinLock 不支持 .NET 程序，请改用临时文件模式", true);
-                if (!peInfo.IsGui)
-                    return ("⚠ WinLock 仅支持 GUI 程序，请改用临时文件或反射式模式", true);
-                if (peInfo.IsChromiumLike)
-                    return ("⚠ WinLock 不支持 Chromium 系浏览器（Chrome/Edge/Doubao），请改用临时文件模式", true);
+                    return ("⚠ inplace 不支持 .NET 程序，请改用临时文件模式", true);
             }
             else if (kind == StubKind.ReflectiveBuilder)
             {
                 if (peInfo.IsDotNet)
-                    return ("⚠ 反射式加载不支持 .NET 程序（CLR 假设主模块由 OS loader 加载）", true);
-                if (peInfo.IsChromiumLike)
-                    return ("⚠ 反射式加载不支持 Chromium 系浏览器（Chrome/Edge/Doubao，依赖版本化子目录 DLL），请改用临时文件模式", true);
-                // 反射式支持 Console 和 x86，无其它限制
+                    return ("⚠ reflective 不支持 .NET 程序（CLR 假设主模块由 OS loader 加载）", true);
             }
             return (null, false);
         }

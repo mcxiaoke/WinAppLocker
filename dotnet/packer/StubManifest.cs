@@ -42,7 +42,7 @@ namespace WinAppLocker.Packer
     /// </summary>
     public class StubManifest
     {
-        /// <summary>唯一标识，packer 内部引用用（如 "winlock"、"applocker-gui"）</summary>
+        /// <summary>唯一标识，packer 内部引用用（如 "inplace"、"gui"）</summary>
         [JsonPropertyName("name")]
         public string Name { get; set; }
 
